@@ -40,3 +40,27 @@ def test_rate_limit_wait_reads_google_retry_delay():
 
     details = "[{'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '48s'}]"
     assert _rate_limit_wait("You exceeded your current quota " + details, {}, daily=True) == 48.0
+
+
+def test_all_providers_go_through_vpn_by_default(monkeypatch):
+    import config
+    import llm
+
+    assert config.LLM_PROXY_FOR == ["all"]
+    monkeypatch.setattr(config, "LLM_PROXY", "http://127.0.0.1:10809")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "g")
+    monkeypatch.setattr(config, "GROQ_API_KEY", "q")
+    chain = llm.build_providers()
+    assert {p.name for p in chain} >= {"gemini", "groq"}
+    assert all(p.proxy == "http://127.0.0.1:10809" for p in chain)
+
+
+def test_builtin_vpn_proxy_is_skipped_when_xray_is_not_running(monkeypatch):
+    import config
+    import llm
+
+    monkeypatch.setattr(config, "VPN_PROXY_URL", "http://127.0.0.1:10809")
+    item = Provider(name="groq", url="u", api_key="k", model="m", proxy="http://127.0.0.1:10809")
+    assert llm.proxy_for(item) is None  # Xray не запущен — напрямую, а не в закрытый порт
+    own = Provider(name="groq", url="u", api_key="k", model="m", proxy="http://user:pw@proxy.example:3128")
+    assert llm.proxy_for(own) == own.proxy

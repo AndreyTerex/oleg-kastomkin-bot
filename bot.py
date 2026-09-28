@@ -16,7 +16,7 @@ from utils import WARNING, respond
 
 log = logging.getLogger("scrimbot")
 
-EXTENSIONS = ("cogs.roles", "cogs.scrim", "cogs.stats", "cogs.lobby", "cogs.extras", "cogs.chat")
+EXTENSIONS = ("cogs.roles", "cogs.scrim", "cogs.stats", "cogs.lobby", "cogs.extras", "cogs.chat", "cogs.vpn_admin")
 
 
 class ScrimBot(commands.Bot):
@@ -37,10 +37,16 @@ class ScrimBot(commands.Bot):
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
         )
 
+    async def login(self, token: str) -> None:
+        # VPN поднимаем до входа в Discord: через него ходят и Discord, и нейросети.
+        await VPN_CLIENT.start()
+        if config.VPN_FOR_DISCORD and VPN_CLIENT.ready:
+            self.http.proxy = config.VPN_PROXY_URL
+            log.info("Discord подключается через VPN")
+        await super().login(token)
+
     async def setup_hook(self) -> None:
         self.tree.on_error = self.on_tree_error
-        # VPN поднимаем до модулей: Олег сразу ходит к Gemini через него.
-        await VPN_CLIENT.start()
 
         for extension in EXTENSIONS:
             await self.load_extension(extension)

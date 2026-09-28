@@ -81,23 +81,49 @@ GEMINI_MODELS: list[str] = [
 ]
 
 # VPN для нейросетей, закрытых из России (см. vpn.py): подписка и/или ключи vless://, trojan://, vmess://.
-# Бот сам запускает Xray как локальный прокси и ходит через него только к провайдерам из LLM_PROXY_FOR.
+# Бот сам запускает Xray как локальный прокси и ходит через него к нейросетям (LLM_PROXY_FOR) и к Discord.
 VPN_SUBSCRIPTION: str = os.getenv("VPN_SUBSCRIPTION", "").strip()
 VPN_URL: str = os.getenv("VPN_URL", "").strip()
 # Необязательно: брать только серверы, в названии которых есть это (регулярное выражение), например «DE|NL|Finland».
 VPN_FILTER: str = os.getenv("VPN_FILTER", "").strip()
 VPN_PORT: int = _env_int("VPN_PORT", 10809)
+# Страны ВЫХОДА, через которые не ходим: там Gemini и другие нейросети не работают.
+VPN_EXCLUDE_COUNTRIES: list[str] = [
+    code.strip().upper()
+    for code in os.getenv("VPN_EXCLUDE_COUNTRIES", "RU,BY,CN,HK,MO,IR,KP,CU,SY").split(",")
+    if code.strip()
+]
+# Фрагментация TLS ClientHello против DPI: auto — пробовать без неё, а если сервер не отвечает — с ней.
+VPN_FRAGMENT: str = (os.getenv("VPN_FRAGMENT", "auto").strip().lower() or "auto")
+if VPN_FRAGMENT not in ("auto", "on", "off"):
+    VPN_FRAGMENT = "auto"
+# Как часто проверять текущий сервер (минуты; один лёгкий запрос) и как часто перепроверять ВСЕ серверы (часы).
+# Полная проверка идёт и сразу, если текущий сервер перестал отвечать.
+VPN_RECHECK_MINUTES: int = max(1, _env_int("VPN_RECHECK_MINUTES", 12))
+try:
+    VPN_FULL_CHECK_HOURS: float = max(0.25, float(os.getenv("VPN_FULL_CHECK_HOURS", "3")))
+except ValueError:
+    VPN_FULL_CHECK_HOURS = 3.0
+# Насколько новый сервер должен быть быстрее текущего, чтобы переключиться (0.3 = на 30%).
+try:
+    VPN_SWITCH_THRESHOLD: float = min(0.9, max(0.0, float(os.getenv("VPN_SWITCH_THRESHOLD", "0.3"))))
+except ValueError:
+    VPN_SWITCH_THRESHOLD = 0.3
+# Сколько серверов проверять одновременно и сколько секунд ждать ответа от каждого.
+VPN_PROBE_CONCURRENCY: int = max(1, _env_int("VPN_PROBE_CONCURRENCY", 8))
+VPN_PROBE_TIMEOUT: int = max(3, _env_int("VPN_PROBE_TIMEOUT", 8))
 XRAY_BIN: str = os.getenv("XRAY_BIN", "xray").strip() or "xray"
 
 # Google не пускает к Gemini из России («User location is not supported»). Если есть HTTP-прокси за рубежом,
 # укажите его: http://логин:пароль@адрес:порт. С VPN_SUBSCRIPTION / VPN_URL прокси подставляется сам.
-# Через прокси ходят только провайдеры из LLM_PROXY_FOR.
-LLM_PROXY: str = os.getenv("LLM_PROXY", "").strip() or (
-    f"http://127.0.0.1:{VPN_PORT}" if (VPN_SUBSCRIPTION or VPN_URL) else ""
-)
+# Через прокси ходят провайдеры из LLM_PROXY_FOR (по умолчанию all — все нейросети).
+VPN_PROXY_URL: str = f"http://127.0.0.1:{VPN_PORT}" if (VPN_SUBSCRIPTION or VPN_URL) else ""
+LLM_PROXY: str = os.getenv("LLM_PROXY", "").strip() or VPN_PROXY_URL
 LLM_PROXY_FOR: list[str] = [
-    name.strip().lower() for name in os.getenv("LLM_PROXY_FOR", "gemini").split(",") if name.strip()
+    name.strip().lower() for name in os.getenv("LLM_PROXY_FOR", "all").split(",") if name.strip()
 ]
+# Discord тоже через VPN (если он задан). VPN_FOR_DISCORD=0 — Discord напрямую.
+VPN_FOR_DISCORD: bool = os.getenv("VPN_FOR_DISCORD", "1").strip().lower() not in ("0", "false", "no", "off", "нет")
 
 # Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Первым — Gemini (самые сильные
 # бесплатные модели), за ним Groq с большим лимитом (около 1000 ответов в день), остальные — в запасе.
