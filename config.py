@@ -134,6 +134,15 @@ LLM_OVERLOAD_RETRIES: int = max(0, _env_int("LLM_OVERLOAD_RETRIES", 3))
 LLM_PROXY_FOR: list[str] = [
     name.strip().lower() for name in os.getenv("LLM_PROXY_FOR", "all").split(",") if name.strip()
 ]
+# Нейросети, которые из России работают только через VPN: пока VPN сломан, их не спрашивают напрямую
+# (иначе отказ по региону отключил бы их на 15 минут), а пропускают до починки VPN.
+LLM_VPN_ONLY: list[str] = [
+    name.strip().lower() for name in os.getenv("LLM_VPN_ONLY", "gemini").split(",") if name.strip()
+]
+# Выбирая VPN-сервер, проверять, что через него отвечает Gemini (а не «страна не поддерживается»).
+VPN_CHECK_GEMINI: bool = bool(GEMINI_API_KEY) and ("all" in LLM_PROXY_FOR or "gemini" in LLM_PROXY_FOR) and (
+    os.getenv("VPN_CHECK_GEMINI", "1").strip().lower() not in ("0", "false", "no", "off", "нет")
+)
 # Discord через VPN (VPN_FOR_DISCORD=1). По умолчанию напрямую: через нестабильный VPN-сервер соединение
 # с Discord рвалось, и нажатия кнопок в это время пропадали («Приложение не ответило вовремя»).
 VPN_FOR_DISCORD: bool = os.getenv("VPN_FOR_DISCORD", "0").strip().lower() not in ("0", "false", "no", "off", "нет")

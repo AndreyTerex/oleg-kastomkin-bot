@@ -46,6 +46,10 @@ from vpn_links import Server, parse_subscription, usable
 log = logging.getLogger("scrimbot.vpn")
 
 PROBE_URL = "https://www.gstatic.com/generate_204"
+# Список моделей Gemini: проверяет, пускает ли Google с этого сервера, и не тратит лимит генераций.
+GEMINI_CHECK_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"
+# Сколько кандидатов подряд проверять на Gemini за одну перепроверку.
+GEMINI_CHECK_TRIES = 8
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 # Так подписку отдают списком ключей: многие сервисы для «незнакомых» клиентов отвечают YAML для Clash.
 SUBSCRIPTION_USER_AGENT = "v2rayN/7.0"
@@ -103,9 +107,20 @@ class ProbeResult:
     latency_ms: float | None = None
     country: str | None = None
     fragment: bool = False
+    # Gemini через этот сервер ответил «страна не поддерживается» — сервер не годится.
+    gemini_blocked: bool = False
 
     def usable(self, excluded: set[str]) -> bool:
-        return self.ok and bool(self.country) and self.country not in excluded
+        return self.ok and bool(self.country) and self.country not in excluded and not self.gemini_blocked
+
+
+def gemini_verdict(status: int, text: str) -> bool | None:
+    """Ответ Gemini на проверку: 200 — пускает, «location is not supported» — нет, иное — непонятно."""
+    if status == 200:
+        return True
+    if "location is not supported" in (text or "").lower():
+        return False
+    return None
 
 
 def parse_trace(text: str) -> str | None:
@@ -553,6 +568,11 @@ class VPN:
     # --- перепроверка
 
     @property
+    def broken(self) -> bool:
+        """Xray запущен, но сервер только что уронил соединение — ждём, пока проверка найдёт рабочий."""
+        return self.ready and time.time() < self.broken_until
+
+    @property
     def healthy(self) -> bool:
         """Через прокси можно ходить: Xray запущен и недавно не ронял соединения."""
         return self.ready and time.time() >= self.broken_until
@@ -620,6 +640,61 @@ class VPN:
         log.debug("VPN: «%s» в порядке (%s, %.0f мс)", result.name, result.country, result.latency_ms or 0)
         return True
 
+    async def gemini_answers(self, result: ProbeResult) -> bool | None:
+        """Пускает ли Gemini через этот сервер: True — да, False — «страна не поддерживается», None — не понять."""
+        server = self.servers.get(result.fingerprint)
+        if server is None:
+            return None
+        port = config.VPN_PORT + 1
+        data = probe_config([(server, result.fragment)], port)
+        path = _write_config(data, ".gemini.json")
+        process = await asyncio.create_subprocess_exec(
+            config.XRAY_BIN, "run", "-c", str(path),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            env=XRAY_ENV, preexec_fn=_lower_priority,
+        )
+        try:
+            if not await _ports_open([port]):
+                return None
+            timeout = aiohttp.ClientTimeout(total=config.VPN_PROBE_TIMEOUT + 4)
+            # Ключ — в заголовке, а не в адресе: адрес может попасть в текст ошибки и в лог.
+            headers = {"x-goog-api-key": config.GEMINI_API_KEY}
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(GEMINI_CHECK_URL, headers=headers, proxy=f"http://127.0.0.1:{port}") as response:
+                    text = await response.text()
+            return gemini_verdict(response.status, text)
+        except (aiohttp.ClientError, TimeoutError, OSError):
+            return None
+        finally:
+            await _stop(process)
+            path.unlink(missing_ok=True)
+
+    async def _choose_with_gemini(self, current: str | None, results: dict[str, ProbeResult], now: float):
+        """Выбор сервера; если Олег ходит через VPN к Gemini — только того, через который Gemini отвечает."""
+        choose_args = (self.excluded, config.VPN_SWITCH_THRESHOLD, config.VPN_SWITCH_MIN_GAIN_MS)
+        choice = choose(current, results, *choose_args)
+        if not config.VPN_CHECK_GEMINI:
+            return choice
+        first = choice
+        for _ in range(GEMINI_CHECK_TRIES):
+            if choice is None:
+                break
+            verdict = await self.gemini_answers(choice)
+            if verdict is True:
+                return choice
+            if verdict is False:
+                log.info("VPN: через «%s» (%s) Gemini не пускает — пропускаю сервер", choice.name, choice.country)
+                choice.gemini_blocked = True
+                self.state.data["blacklist"][choice.fingerprint] = now
+            else:
+                choice.ok = False  # не ответил на проверку — в этот раз не берём
+            choice = choose(current, results, *choose_args)
+        # Проверка не удалась ни разу (сеть, неверный ключ) — не оставляем бота без VPN из-за неё.
+        if first is not None and not first.gemini_blocked and choice is None:
+            first.ok = True
+            return first
+        return choice
+
     async def recheck(self, full: bool = True) -> dict | None:
         """full=False — сначала лёгкая проверка текущего сервера; полная — только если он не отвечает."""
         async with self.lock:
@@ -647,9 +722,7 @@ class VPN:
                 if retry:
                     results.update(await self.probe(retry))
             self.state.record(results, now)
-            choice = choose(
-                current, results, self.excluded, config.VPN_SWITCH_THRESHOLD, config.VPN_SWITCH_MIN_GAIN_MS
-            )
+            choice = await self._choose_with_gemini(current, results, now)
             working = sum(1 for result in results.values() if result.usable(self.excluded))
             wrong_country = sum(
                 1 for result in results.values() if result.ok and result.country in self.excluded

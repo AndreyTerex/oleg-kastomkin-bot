@@ -266,6 +266,9 @@ class LLMClient:
                 continue
             if self._blocked_until.get(provider.label, 0) > time.time():
                 continue
+            if provider.name in config.LLM_VPN_ONLY and provider.proxy == config.VPN_PROXY_URL and VPN_CLIENT.broken:
+                # Напрямую из России не пустят, а отказ по региону отключил бы модель надолго — ждём VPN.
+                continue
             # Перегруженную «редкую» модель не переспрашиваем: неудачный запрос тоже съедает её суточный лимит,
             # а следующая модель Gemini в цепочке — со своим лимитом, это и есть повтор.
             retries = 0 if provider.scarce else config.LLM_OVERLOAD_RETRIES

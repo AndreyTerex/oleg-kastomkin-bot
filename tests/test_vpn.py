@@ -366,3 +366,41 @@ def test_connection_failure_marks_vpn_broken_until_a_good_check(monkeypatch, tmp
     assert not client.healthy and client.wakeup.is_set()
     client.broken_until = 0.0  # так делает удачная проверка или смена сервера
     assert client.healthy
+
+
+def test_gemini_verdict():
+    assert vpn.gemini_verdict(200, "{}") is True
+    blocked = '{"error": {"code": 400, "message": "User location is not supported for the API use."}}'
+    assert vpn.gemini_verdict(400, blocked) is False
+    assert vpn.gemini_verdict(403, "API key not valid") is None
+
+
+def _gemini_client(monkeypatch, tmp_path, verdicts):
+    monkeypatch.setattr(vpn.config, "VPN_CHECK_GEMINI", True)
+    monkeypatch.setattr(vpn.config, "VPN_EXCLUDE_COUNTRIES", ["RU"])
+    client = vpn.VPN()
+    client.state = vpn.VpnState(tmp_path / "vpn.json")
+    client.state.load()
+    asked = []
+
+    async def answers(result):
+        asked.append(result.fingerprint)
+        return verdicts[result.fingerprint]
+
+    monkeypatch.setattr(client, "gemini_answers", answers)
+    return client, asked
+
+
+def test_server_where_gemini_refuses_is_skipped(monkeypatch, tmp_path):
+    client, asked = _gemini_client(monkeypatch, tmp_path, {"fast": False, "mid": True, "slow": True})
+    results = {"fast": result("fast", 50, "FI"), "mid": result("mid", 80), "slow": result("slow", 200)}
+    choice = asyncio.run(client._choose_with_gemini(None, results, 1000.0))
+    assert choice.fingerprint == "mid" and asked == ["fast", "mid"]
+    assert results["fast"].gemini_blocked and "fast" in client.state.data["blacklist"]
+
+
+def test_gemini_check_failing_everywhere_does_not_leave_bot_without_vpn(monkeypatch, tmp_path):
+    client, asked = _gemini_client(monkeypatch, tmp_path, {"a": None, "b": None})
+    results = {"a": result("a", 50), "b": result("b", 80)}
+    choice = asyncio.run(client._choose_with_gemini(None, results, 1000.0))
+    assert choice.fingerprint == "a" and asked == ["a", "b"]  # сеть/ключ подвели — берём лучший по скорости
