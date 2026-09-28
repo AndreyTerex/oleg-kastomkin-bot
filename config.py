@@ -121,6 +121,10 @@ VPN_PROXY_URL: str = f"http://127.0.0.1:{VPN_PORT}" if (VPN_SUBSCRIPTION or VPN_
 LLM_PROXY: str = os.getenv("LLM_PROXY", "").strip() or VPN_PROXY_URL
 # Сколько раз за запрос переспрашивать перегруженную модель (HTTP 503) перед переходом к следующей.
 LLM_OVERLOAD_RETRIES: int = max(0, _env_int("LLM_OVERLOAD_RETRIES", 3))
+# Модели этих провайдеров спрашиваются одновременно — берём ответ той, что ответит первой.
+LLM_RACE: list[str] = [
+    name.strip().lower() for name in os.getenv("LLM_RACE", "gemini").split(",") if name.strip()
+]
 LLM_PROXY_FOR: list[str] = [
     name.strip().lower() for name in os.getenv("LLM_PROXY_FOR", "all").split(",") if name.strip()
 ]

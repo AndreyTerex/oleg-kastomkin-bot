@@ -117,3 +117,74 @@ def test_overloaded_gemini_is_asked_again_before_falling_back(monkeypatch):
     client._session = _FakeSession([busy, busy, busy, busy, _ok("ответ groq")])
     reply = asyncio.run(client.complete("s", "u"))
     assert client._session.calls == ["flash"] * 4 + ["oss"] and reply.text == "ответ groq"
+
+
+class _RaceSession:
+    """Каждая модель отвечает по своему сценарию; «hang» — висит, пока запрос не отменят."""
+
+    closed = False
+
+    def __init__(self, scripts):
+        self.scripts, self.calls, self.cancelled = scripts, [], []
+
+    def post(self, url, **kwargs):
+        model = kwargs["json"]["model"]
+        self.calls.append(model)
+        step = self.scripts[model].pop(0)
+        session = self
+
+        class _Pending:
+            async def __aenter__(self):
+                if step == "hang":
+                    import asyncio
+
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        session.cancelled.append(model)
+                        raise
+                return _FakeResponse(*step)
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Pending()
+
+
+def test_gemini_models_race_and_the_fastest_answer_wins(monkeypatch):
+    import asyncio
+
+    import config
+    import llm
+
+    async def no_sleep(delay):
+        return None
+
+    monkeypatch.setattr(config, "LLM_OVERLOAD_RETRIES", 3)
+    busy = (503, {"error": {"message": "high demand"}})
+    client = llm.LLMClient([provider("gemini", "pro"), provider("gemini", "lite"), provider("groq", "oss")])
+    client._session = _RaceSession({"pro": ["hang"], "lite": [busy, _ok("ответ lite")], "oss": []})
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(llm.asyncio, "sleep", lambda delay: real_sleep(0))
+
+    reply = asyncio.run(client.complete("s", "u"))
+    assert reply.text == "ответ lite" and reply.model == "gemini:lite"
+    assert client._session.cancelled == ["pro"]  # медленную модель отменили, Groq не понадобился
+    assert "oss" not in client._session.calls
+
+
+def test_race_falls_back_to_next_provider_when_all_gemini_are_busy(monkeypatch):
+    import asyncio
+
+    import config
+    import llm
+
+    monkeypatch.setattr(config, "LLM_OVERLOAD_RETRIES", 2)
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(llm.asyncio, "sleep", lambda delay: real_sleep(0))
+    busy = (503, {"error": {"message": "high demand"}})
+    client = llm.LLMClient([provider("gemini", "pro"), provider("gemini", "lite"), provider("groq", "oss")])
+    client._session = _RaceSession({"pro": [busy] * 3, "lite": [busy] * 3, "oss": [_ok("ответ groq")]})
+    reply = asyncio.run(client.complete("s", "u"))
+    assert reply.text == "ответ groq"
+    assert client._session.calls.count("pro") == 3 and client._session.calls.count("lite") == 3
