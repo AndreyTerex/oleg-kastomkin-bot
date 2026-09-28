@@ -254,6 +254,56 @@ def test_broken_vpn_sends_next_models_direct(monkeypatch):
     assert fake.reports == [{"connection": True}]
 
 
+def test_slow_answer_through_vpn_also_marks_it_broken(monkeypatch):
+    import asyncio
+
+    import config
+    import llm
+
+    vpn_url = "http://127.0.0.1:10809"
+    monkeypatch.setattr(config, "VPN_PROXY_URL", vpn_url)
+
+    class FakeVpn:
+        healthy, broken, reports = True, False, []
+
+        def report_failure(self, **kwargs):
+            self.reports.append(kwargs)
+            self.healthy, self.broken = False, True
+
+    fake = FakeVpn()
+    monkeypatch.setattr(llm, "VPN_CLIENT", fake)
+
+    class Session:
+        closed = False
+        proxies = []
+
+        def post(self, url, **kwargs):
+            self.proxies.append(kwargs["proxy"])
+            proxy = kwargs["proxy"]
+
+            class Pending:
+                async def __aenter__(self_inner):
+                    if proxy:
+                        raise TimeoutError()
+                    return _FakeResponse(*_ok("zai напрямую"))
+
+                async def __aexit__(self_inner, *exc):
+                    return False
+
+            return Pending()
+
+    chain = [
+        Provider(name="gemini", url="u", api_key="k", model="gemini-3.8-flash", proxy=vpn_url, scarce=True),
+        Provider(name="gemini", url="u", api_key="k", model="gemini-3.7-flash", proxy=vpn_url, scarce=True),
+        Provider(name="zai", url="u", api_key="k", model="glm-4.7-flash", proxy=vpn_url),
+    ]
+    client = llm.LLMClient(chain)
+    client._session = Session()
+    reply = asyncio.run(client.complete("s", "u"))
+    # Одна Gemini протупила через VPN — вторую не ждём, Z.ai отвечает напрямую.
+    assert reply.model == "zai:glm-4.7-flash" and client._session.proxies == [vpn_url, None]
+
+
 def test_puter_joins_the_chain_only_with_a_token(monkeypatch):
     import config
     import llm
