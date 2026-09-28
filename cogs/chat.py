@@ -32,6 +32,7 @@ from discord.ext import commands
 
 import config
 import persona
+import llm_actions
 import lobby_requests
 import role_requests
 from llm import LLMClient, LLMUnavailable, build_providers
@@ -387,6 +388,13 @@ class Chat(commands.Cog):
                     persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
                     validate=lambda text: choose(text) is not None,
                 )
+            # Модель поняла просьбу, которую пропустил код: выполняет бот, со своими проверками прав.
+            action = llm_actions.parse(parse_json(reply.text)) if called else None
+            if action is not None and await self.run_action(message, action):
+                state.last_spoke = time.time()
+                state.answers.append(state.last_spoke)
+                log.info("Олег выполнил по подсказке модели: %s (%s)", action, reply.model)
+                return
             text, state.last_tail = tidy_tail(clean_reply(choose(reply.text) or ""), state.last_tail)
             if not text:
                 if allow_skip:
@@ -474,7 +482,9 @@ class Chat(commands.Cog):
         if openings:
             task_parts.append(persona.AVOID_OPENINGS.format(openings=", ".join(f"«{o}…»" for o in sorted(openings))))
         task_parts.append(persona.VARIANTS)
-        if not called:
+        if called:
+            task_parts.append(persona.ACTIONS)
+        else:
             task_parts.append(persona.SKIP_OPTION)
         if mood is not None:
             task_parts.insert(0, persona.MOOD_LINE.format(name=mood[0], description=mood[1]))
@@ -549,26 +559,63 @@ class Chat(commands.Cog):
             request = lobby_requests.parse(message, self.bot.user, others)
         if request is None:
             return False
+        await self.move_in_lobby(message, request.targets, request.status)
+        return True
+
+    async def run_action(self, message: discord.Message, action: llm_actions.Action) -> bool:
+        """Действие, которое предложила модель. False — не вышло понять кого, пусть Олег просто ответит."""
+        guild = message.guild
+        mentions = [m for m in message.mentions if isinstance(m, discord.Member) and m.id != self.bot.user.id]
+        lobby_cog = self.bot.get_cog("Lobby")
+        found = lobby_cog.latest_open_record(guild) if lobby_cog else None
+        record = found[1] if found else {}
+        participants = lobby_cog.members_from_ids(
+            guild, (record.get("in") or []) + (record.get("sub") or []) + (record.get("out") or [])
+        ) if lobby_cog else []
+        others = [m for m in guild.members if not m.bot and m not in participants]
+        targets = llm_actions.resolve(action.who, message.author, mentions, participants + others)
+        targets = [t for t in targets if not t.bot]
+        if not targets:
+            return False
+
+        if action.type == llm_actions.LOBBY:
+            await self.move_in_lobby(message, targets, llm_actions.LOBBY_TARGETS[action.to])
+            return True
+        if action.type == llm_actions.LANE:
+            roles = [role for key in action.lanes if (role := guild.get_role(config.LANE_BY_KEY[key].role_id))]
+            if not roles:
+                return False
+            request = role_requests.RoleRequest(action=action.op, roles=roles, targets=targets, lanes_only=True)
+            await self.say(message, await self.apply_roles(message, request))
+            return True
+        return False
+
+    async def move_in_lobby(self, message: discord.Message, targets: list[discord.Member], how: str) -> None:
+        """Переносит людей в ближайшем сборе по просьбе из чата. Права проверяет код, а не модель:
+        себя — кто угодно, других — только организатор сбора."""
+        lobby_cog = self.bot.get_cog("Lobby")
+        guild = message.guild
+        found = lobby_cog.latest_open_record(guild) if lobby_cog else None
         if found is None:
             await self.say(message, persona.LOBBY_NONE)
-            return True
-        if not request.targets:
+            return
+        if not targets:
             await self.say(message, persona.LOBBY_WHO)
-            return True
-        author = message.author
-        if any(t.id != author.id for t in request.targets) and not lobby_cog.is_organizer_member(author, record):
-            await self.say(message, persona.LOBBY_FORBIDDEN)
-            return True
-
+            return
         message_id, record = found
+        author = message.author
+        if any(t.id != author.id for t in targets) and not lobby_cog.is_organizer_member(author, record):
+            await self.say(message, persona.LOBBY_FORBIDDEN)
+            return
+
         status = {
             lobby_requests.STATUS_IN: "in", lobby_requests.STATUS_SUB: "sub", lobby_requests.REMOVE: None,
-        }[request.status]
-        changed, overflow, promoted = lobby_cog.apply_move(guild, record, [t.id for t in request.targets], status)
+        }[how]
+        changed, overflow, promoted = lobby_cog.apply_move(guild, record, [t.id for t in targets], status)
         await lobby_cog.save()
         await lobby_cog.refresh_post(message_id, record)
 
-        names = {member.id: member.display_name for member in request.targets}
+        names = {member.id: member.display_name for member in targets}
         parts = []
         if changed:
             template = {"in": persona.LOBBY_TO_IN, "sub": persona.LOBBY_TO_SUB, None: persona.LOBBY_REMOVED}[status]
@@ -585,7 +632,6 @@ class Chat(commands.Cog):
         except discord.HTTPException:
             log.exception("Не удалось ответить на просьбу про состав")
         log.info("Состав сбора %s по просьбе %s: %s → %s", message_id, author, list(names.values()), status)
-        return True
 
     async def handle_roles(self, message: discord.Message) -> bool:
         request = role_requests.parse(message, self.bot.user)
