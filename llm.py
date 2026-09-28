@@ -84,7 +84,7 @@ class LLMUnavailable(Exception):
 
 
 def build_providers() -> list[Provider]:
-    """Порядок: TokenHarbor → OpenRouter → Hugging Face → Mistral → Groq. Сначала смешнее, дальше запаснее."""
+    """Цепочка провайдеров в порядке LLM_ORDER (по умолчанию Mistral → Groq → остальные)."""
     providers: list[Provider] = []
     for model in config.TOKENHARBOR_MODELS:
         providers.append(Provider(
@@ -133,7 +133,13 @@ def build_providers() -> list[Provider]:
             options=options,
             max_tokens_field="max_completion_tokens",
         ))
-    return [provider for provider in providers if provider.api_key]
+    return order_providers([provider for provider in providers if provider.api_key], config.LLM_ORDER)
+
+
+def order_providers(providers: list[Provider], order: list[str]) -> list[Provider]:
+    """Сортирует по LLM_ORDER; порядок моделей внутри провайдера сохраняется, неназванные — в конце."""
+    rank = {name: index for index, name in enumerate(order)}
+    return sorted(providers, key=lambda provider: rank.get(provider.name, len(rank)))
 
 
 def _rate_limit_wait(message: str, headers, daily: bool) -> float:
