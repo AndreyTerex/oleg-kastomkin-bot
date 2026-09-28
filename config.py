@@ -117,6 +117,8 @@ try:
     VPN_SWITCH_THRESHOLD: float = min(0.9, max(0.0, float(os.getenv("VPN_SWITCH_THRESHOLD", "0.3"))))
 except ValueError:
     VPN_SWITCH_THRESHOLD = 0.3
+# …и минимум на столько миллисекунд: смена сервера на секунды рвёт соединение с Discord.
+VPN_SWITCH_MIN_GAIN_MS: int = max(0, _env_int("VPN_SWITCH_MIN_GAIN_MS", 150))
 # Сколько серверов проверять одновременно и сколько секунд ждать ответа от каждого.
 VPN_PROBE_CONCURRENCY: int = max(1, _env_int("VPN_PROBE_CONCURRENCY", 8))
 VPN_PROBE_TIMEOUT: int = max(3, _env_int("VPN_PROBE_TIMEOUT", 8))

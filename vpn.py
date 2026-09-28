@@ -113,15 +113,18 @@ def parse_trace(text: str) -> str | None:
 
 def choose(
     current: str | None, results: dict[str, ProbeResult], excluded: set[str], threshold: float,
+    min_gain_ms: float = 0.0,
 ) -> ProbeResult | None:
-    """Какой сервер держать. Текущий оставляем, пока он работает и новый не быстрее на threshold (0.3 = 30%)."""
+    """Какой сервер держать. Текущий оставляем, пока он работает и новый не быстрее на threshold (0.3 = 30%)
+    и хотя бы на min_gain_ms: смена сервера перезапускает Xray и на секунды рвёт соединение с Discord."""
     candidates = [result for result in results.values() if result.usable(excluded)]
     if not candidates:
         return None
     best = min(candidates, key=lambda result: result.latency_ms or float("inf"))
     kept = results.get(current) if current else None
     if kept is not None and kept.usable(excluded):
-        if best.fingerprint != kept.fingerprint and (best.latency_ms or 0) <= (kept.latency_ms or 0) * (1 - threshold):
+        new, old = best.latency_ms or 0, kept.latency_ms or 0
+        if best.fingerprint != kept.fingerprint and new <= old * (1 - threshold) and old - new >= min_gain_ms:
             return best
         return kept
     return best
@@ -625,7 +628,9 @@ class VPN:
                 if retry:
                     results.update(await self.probe(retry))
             self.state.record(results, now)
-            choice = choose(current, results, self.excluded, config.VPN_SWITCH_THRESHOLD)
+            choice = choose(
+                current, results, self.excluded, config.VPN_SWITCH_THRESHOLD, config.VPN_SWITCH_MIN_GAIN_MS
+            )
             working = sum(1 for result in results.values() if result.usable(self.excluded))
             wrong_country = sum(
                 1 for result in results.values() if result.ok and result.country in self.excluded
