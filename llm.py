@@ -14,6 +14,7 @@ from typing import Callable
 import aiohttp
 
 import config
+from vpn import VPN_CLIENT
 
 log = logging.getLogger("scrimbot.llm")
 
@@ -153,10 +154,18 @@ def build_providers() -> list[Provider]:
         ))
     if config.LLM_PROXY:
         providers = [
-            replace(provider, proxy=config.LLM_PROXY) if provider.name in config.LLM_PROXY_FOR else provider
+            replace(provider, proxy=config.LLM_PROXY)
+            if provider.name in config.LLM_PROXY_FOR or "all" in config.LLM_PROXY_FOR else provider
             for provider in providers
         ]
     return order_providers([provider for provider in providers if provider.api_key], config.LLM_ORDER)
+
+
+def proxy_for(provider: Provider) -> str | None:
+    """Прокси запроса. Встроенный VPN не запущен (например, нет Xray вне Docker) — идём напрямую."""
+    if provider.proxy and provider.proxy == config.VPN_PROXY_URL and not VPN_CLIENT.ready:
+        return None
+    return provider.proxy
 
 
 def order_providers(providers: list[Provider], order: list[str]) -> list[Provider]:
@@ -230,7 +239,7 @@ class LLMClient:
             headers = {"Authorization": f"Bearer {provider.api_key}", "X-Title": "Oleg Kastomkin"}
             try:
                 async with self._session.post(
-                    provider.url, json=body, headers=headers, proxy=provider.proxy,
+                    provider.url, json=body, headers=headers, proxy=proxy_for(provider),
                     timeout=aiohttp.ClientTimeout(total=provider.timeout),
                 ) as response:
                     payload = await response.json(content_type=None)
@@ -270,6 +279,9 @@ class LLMClient:
                         )
                         continue
                     if is_region_block(response.status, str(payload)):
+                        if provider.proxy:
+                            # Сервер VPN выходит в стране, куда нейросеть не пускает, — VPN выберет другой.
+                            VPN_CLIENT.report_failure(region=True)
                         # Все модели этого провайдера недоступны из этой страны — отключаем их разом.
                         # Через VPN пауза короткая: Xray может переключиться на сервер в другой стране.
                         pause = VPN_REGION_PAUSE if provider.proxy else REGION_PAUSE
@@ -297,6 +309,9 @@ class LLMClient:
                         log.warning("%s ответил ошибкой: %s %s", provider.label, response.status, str(payload)[:300])
                         continue
             except (aiohttp.ClientError, TimeoutError, ValueError) as error:
+                if provider.proxy and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
+                    # Прокси не довёз запрос — пусть VPN сразу перепроверит серверы.
+                    VPN_CLIENT.report_failure()
                 pause = TIMEOUT_PAUSE if isinstance(error, TimeoutError) else ERROR_PAUSE
                 self._blocked_until[provider.label] = time.time() + pause
                 self._blocked_daily[provider.label] = False
