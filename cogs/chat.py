@@ -954,6 +954,7 @@ class Chat(commands.Cog):
             await interaction.followup.send(random.choice(persona.SLEEPY_LINES))
             return
         text = clean_reply(pick_variant(reply.text) or "", soft_limit=ROAST_SOFT_LIMIT, hard_limit=ROAST_LIMIT)
+        text = strip_leading_name(text, target)
         if not text:
             await interaction.followup.send("Слов нет. Буквально — модель промолчала 🙃")
             return
@@ -1206,6 +1207,22 @@ def replied_author(message: discord.Message, me: discord.abc.User) -> str | None
 def acceptable_reply(text: str) -> bool:
     """Бракуем мат (в чате ругаются, и модели это повторяют) и корейские буквы с иероглифами."""
     return not FOREIGN_SCRIPT.search(text) and not PROFANITY.search(text)
+
+
+def strip_leading_name(text: str, member) -> str:
+    """«Токс, ты …» → «ты …»: перед прожаркой уже стоит упоминание, второе обращение звучит как сбой."""
+    names = {member.display_name, getattr(member, "global_name", None) or "", member.name}
+    variants = set()
+    for name in filter(None, names):
+        variants.add(name)
+        # «Костяныч (Токс)» → модель часто берёт часть в скобках или до них
+        variants.update(part.strip() for part in re.split(r"[()\[\]|/]", name) if len(part.strip()) >= 2)
+    for name in sorted(variants, key=len, reverse=True):
+        match = re.match(rf"@?{re.escape(name)}\s*[,!:—-]\s*", text, flags=re.IGNORECASE)
+        if match:
+            rest = text[match.end():]
+            return rest[:1].lower() + rest[1:] if rest[:1].isupper() and not rest[:2].isupper() else rest
+    return text
 
 
 def clean_reply(text: str, *, soft_limit: int = REPLY_SOFT_LIMIT, hard_limit: int = REPLY_LIMIT) -> str:
