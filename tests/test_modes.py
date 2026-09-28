@@ -78,3 +78,47 @@ def test_deal_champions_mirror_gives_same_champion_per_lane(make_member):
     for i in range(5):
         assert dealt[i] == dealt[i + 5]
     assert len(Counter(dealt[i][0].id for i in range(5))) == 5
+
+
+def test_skill_teams_balances_ratings(make_member):
+    players = [make_member(i) for i in range(10)]
+    # Равно делится, только если сильные (0.9) в разных командах: 0.9 + 4×0.5 = 2.9 с каждой стороны.
+    ratings = {i: (0.9 if i < 2 else 0.5) for i in range(10)}
+    for _ in range(50):
+        teams = modes.skill_teams(players, lambda member: ratings[member.id])
+        assert sorted(len(team) for team in teams) == [5, 5]
+        sums = [sum(ratings[m.id] for m in team) for team in teams]
+        assert abs(sums[0] - sums[1]) <= modes.SKILL_TOLERANCE + 1e-9
+        assert all(sum(1 for m in team if m.id < 2) == 1 for team in teams)
+
+
+def test_skill_teams_large_roster_uses_snake(make_member):
+    players = [make_member(i) for i in range(16)]
+    teams = modes.skill_teams(players, lambda member: member.id / 16)
+    assert sorted(len(team) for team in teams) == [8, 8]
+
+
+def test_order_by_lane(make_member):
+    team = [make_member(1), make_member(2), make_member(3)]
+    lanes = {1: "support", 3: "top"}
+    assert [m.id for m in modes.order_by_lane(team, lanes)] == [3, 1, 2]
+
+
+def test_draft_view_restores_turn(make_member):
+    import asyncio
+    from types import SimpleNamespace
+
+    from cogs.scrim import DraftView
+
+    captains = [make_member(1), make_member(2)]
+    teams = [[captains[0], make_member(3)], [captains[1], make_member(4), make_member(5)]]
+    pool = [make_member(6), make_member(7), make_member(8)]
+
+    async def build():
+        return DraftView(SimpleNamespace(last_teams={}), captains, pool, teams=teams, custom_id="x", timeout=None)
+
+    view = asyncio.run(build())
+    assert view.turn == 3
+    # змейка 0,1,1,0,0,1: после трёх пиков ходит первый капитан
+    assert view.current_captain.id == 1
+    assert view.is_persistent()

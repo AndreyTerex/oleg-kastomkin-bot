@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 
@@ -80,6 +81,15 @@ MISTRAL_MODELS: list[str] = [
 
 # Каталог для сохранения состояния (в Docker смонтирован как volume).
 DATA_DIR: str = os.getenv("DATA_DIR", "data")
+
+# Часовой пояс, в котором организаторы пишут время сбора («сегодня 21:00»). Игроки видят его в своём поясе.
+try:
+    TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow")
+except (ZoneInfoNotFoundError, ValueError):
+    TIMEZONE = ZoneInfo("Europe/Moscow")
+
+# За сколько минут до начала сбора бот зовёт записавшихся. 0 — не напоминать.
+REMIND_MINUTES: int = _env_int("REMIND_MINUTES", 15)
 
 TEAM_SIZE = 5
 

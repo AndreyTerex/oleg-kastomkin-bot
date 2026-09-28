@@ -15,3 +15,32 @@ jobs:
       - run: pip install -r requirements.txt pytest
       - run: python -m compileall -q .
       - run: python -m pytest -q
+
+  # Готовый образ бота в GitHub Container Registry. Watchtower на компьютере с ботом
+  # замечает новый образ и сам перезапускает бота — ничего скачивать руками не нужно.
+  image:
+    needs: tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/andreyterex/oleg-kastomkin-bot:latest
+            ghcr.io/andreyterex/oleg-kastomkin-bot:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

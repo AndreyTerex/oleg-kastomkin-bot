@@ -5,9 +5,10 @@
 """
 from __future__ import annotations
 
+import itertools
 import random
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 import discord
 
@@ -18,6 +19,7 @@ from utils import BLUE_SIDE, NEUTRAL, RED_SIDE, member_lanes, player_name, shuff
 TEAMS_DRAFT = "draft"
 TEAMS_RANDOM = "random"
 TEAMS_BALANCED = "balanced"
+TEAMS_SKILL = "skill"
 
 LANES_FREE = "free"
 LANES_RANDOM = "random"
@@ -47,6 +49,7 @@ TEAM_OPTIONS = (
     Option(TEAMS_DRAFT, "Капитанский драфт", "👑", "Два случайных капитана по очереди разбирают игроков"),
     Option(TEAMS_RANDOM, "Случайные команды", "🎲", "Бот делит состав на две команды наугад"),
     Option(TEAMS_BALANCED, "По отмеченным линиям", "🧭", "Команды подбираются так, чтобы каждый встал на свою линию"),
+    Option(TEAMS_SKILL, "По силе", "⚖️", "Команды уравниваются по статистике побед на сервере"),
 )
 
 LANE_OPTIONS = (
@@ -94,6 +97,8 @@ PRESETS = (
            TEAMS_RANDOM, LANES_RANDOM, CHAMPS_MIRROR),
     Preset("chaos", "Хаос", "🌪️", "Всё решает рандом, каждому один чемпион без выбора",
            TEAMS_RANDOM, LANES_RANDOM, CHAMPS_RANDOM),
+    Preset("fair", "Честный бой", "⚖️", "Команды уравнены по статистике побед, каждый на своей линии",
+           TEAMS_SKILL, LANES_MAIN, CHAMPS_FREE),
 )
 
 PRESET_BY_KEY = {preset.key: preset for preset in PRESETS}
@@ -159,6 +164,49 @@ def random_teams(players: Sequence[discord.Member]) -> list[list[discord.Member]
     mixed = shuffled(players)
     half = (len(mixed) + 1) // 2
     return [mixed[:half], mixed[half:]]
+
+
+# До стольких игроков перебираем все деления; больше — жадно по рейтингу.
+EXACT_SPLIT_LIMIT = 14
+# Деления, которые хуже лучшего не больше чем на столько, считаются равными — из них выбираем случайно,
+# чтобы одни и те же составы не повторялись из катки в катку.
+SKILL_TOLERANCE = 0.03
+
+
+def skill_teams(
+    players: Sequence[discord.Member], rating: Callable[[discord.Member], float]
+) -> list[list[discord.Member]]:
+    """Две команды с максимально близкой суммой рейтингов."""
+    players = list(players)
+    if len(players) < 2:
+        return [players, []]
+    half = len(players) // 2
+    ratings = {member.id: rating(member) for member in players}
+
+    if len(players) <= EXACT_SPLIT_LIMIT:
+        total = sum(ratings.values())
+        splits = []
+        # Первый игрок всегда в первой команде — так каждое деление встречается один раз.
+        first, rest = players[0], players[1:]
+        size = len(players) - half  # первая команда больше, если игроков нечётно
+        for combo in itertools.combinations(rest, size - 1):
+            team = [first, *combo]
+            diff = abs(total - 2 * sum(ratings[member.id] for member in team))
+            splits.append((diff, team))
+        best = min(diff for diff, _ in splits)
+        team = random.choice([team for diff, team in splits if diff <= best + SKILL_TOLERANCE])
+        chosen = {member.id for member in team}
+        blue, red = team, [member for member in players if member.id not in chosen]
+    else:
+        # Змейка по рейтингу: 1-2-2-1… даёт близкие суммы и на больших составах.
+        ordered = sorted(players, key=lambda member: (-ratings[member.id], random.random()))
+        blue, red = [], []
+        for index, member in enumerate(ordered):
+            (blue if index % 4 in (0, 3) else red).append(member)
+
+    if random.random() < 0.5:
+        blue, red = red, blue
+    return [shuffled(blue), shuffled(red)]
 
 
 def balanced_teams(players: Sequence[discord.Member]) -> tuple[list[list[discord.Member]], dict[int, str]] | None:
@@ -296,6 +344,11 @@ def champion_rules(how: str) -> list[str]:
     return []
 
 
+def order_by_lane(team: Sequence[discord.Member], lanes: dict[int, str]) -> list[discord.Member]:
+    """Игроки команды по порядку линий (топ → саппорт), без линии — в конце. Порядок устойчивый."""
+    return sorted(team, key=lambda member: LANE_ORDER.get(lanes.get(member.id), len(LANE_ORDER)))
+
+
 def team_lines(
     team: Sequence[discord.Member],
     lanes: dict[int, str],
@@ -304,7 +357,7 @@ def team_lines(
     captain: discord.Member | None = None,
 ) -> str:
     """Состав команды: по порядку линий, с капитаном и чемпионами, если они есть."""
-    ordered = sorted(team, key=lambda member: LANE_ORDER.get(lanes.get(member.id), len(LANE_ORDER)))
+    ordered = order_by_lane(team, lanes)
     lines = []
     for member in ordered:
         lane_key = lanes.get(member.id)
@@ -349,7 +402,7 @@ def deal_embed(
     if notes:
         embed.add_field(name="Обратите внимание", value="\n".join(f"• {note}" for note in notes), inline=False)
 
-    footer = "Развести по голосовым — «Раскидать по каналам» · сыграли катку — «Новая раздача» в посте сбора"
+    footer = "Развести по голосовым — «Раскидать по каналам» · сыграли — отметьте победителя в посте сбора"
     if champions and patch:
         footer = f"Патч {patch} · чемпионы не повторяются · " + footer
     embed.set_footer(text=footer)

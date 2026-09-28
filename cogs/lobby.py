@@ -9,6 +9,7 @@ import asyncio
 import logging
 import random
 import time
+from datetime import datetime
 from pathlib import Path
 
 import discord
@@ -17,9 +18,11 @@ from discord.ext import commands
 
 import config
 import modes
+import portraits
 from champions import POOL, ChampionsUnavailable
 from cogs.scrim import DraftView
 from storage import JsonStore
+from timeparse import parse_when
 from utils import BLUE_SIDE, NEUTRAL, RED_SIDE, format_players, player_name, respond, shuffled
 
 log = logging.getLogger("scrimbot.lobby")
@@ -55,9 +58,14 @@ CUSTOM_ID_REROLL = "lol:lobby:reroll"
 CUSTOM_ID_EDIT = "lol:lobby:edit"
 CUSTOM_ID_MODE = "lol:lobby:mode"
 CUSTOM_ID_CANCEL = "lol:lobby:close"
+CUSTOM_ID_WIN_BLUE = "lol:lobby:win:blue"
+CUSTOM_ID_WIN_RED = "lol:lobby:win:red"
 
 # Кнопки, которые нужны только внутренней кастомке.
-CUSTOM_GAME_ONLY = frozenset({CUSTOM_ID_MODE, CUSTOM_ID_CAPTAINS, CUSTOM_ID_DRAFT, CUSTOM_ID_REROLL, CUSTOM_ID_MOVE})
+CUSTOM_GAME_ONLY = frozenset({
+    CUSTOM_ID_MODE, CUSTOM_ID_CAPTAINS, CUSTOM_ID_DRAFT, CUSTOM_ID_REROLL, CUSTOM_ID_MOVE,
+    CUSTOM_ID_WIN_BLUE, CUSTOM_ID_WIN_RED,
+})
 
 CANCEL_LABELS = {
     KIND_SCRIM: "Отменить скрим",
@@ -84,7 +92,43 @@ PING_CHOICES = [
 # Записи старше двух недель на старте выбрасываются, чтобы файл не рос бесконечно.
 RECORD_TTL = 14 * 24 * 60 * 60
 # Сбор старше полутора суток уже не «ближайший»: /ping, /roster и Олег его не предлагают.
+# Считается от времени начала, если оно известно, иначе от создания поста.
 LOBBY_STALE_AFTER = 36 * 60 * 60
+# Драфт закрывается, если капитаны столько секунд никого не выбирали.
+DRAFT_TIMEOUT = 15 * 60
+# Как часто фоновая проверка смотрит напоминания и драфты.
+TICK = 30
+
+
+# Формат серии по умолчанию: обычно играем до двух побед.
+DEFAULT_SERIES = 3
+SERIES_CHOICES = [
+    app_commands.Choice(name="Bo3 — до двух побед", value=3),
+    app_commands.Choice(name="Bo1 — одна катка", value=1),
+    app_commands.Choice(name="Bo5 — до трёх побед", value=5),
+]
+SERIES_WINNERS = ("🔵 синими", "🔴 красными")
+# Две отметки подряд быстрее этого — почти наверняка двойной клик.
+REPORT_COOLDOWN = 20
+
+
+def series_score(record: dict, *, drop_last: bool = False) -> tuple[int, int]:
+    results = list(record.get("results") or [])
+    if drop_last:
+        results = results[:-1]
+    blue = sum(1 for result in results if result.get("winner") == 0)
+    return blue, len(results) - blue
+
+
+def series_winner(record: dict, *, drop_last: bool = False) -> int | None:
+    """0 — синие, 1 — красные, None — серия ещё идёт. Считается первая серия сбора."""
+    need = record.get("series", DEFAULT_SERIES) // 2 + 1
+    blue, red = series_score(record, drop_last=drop_last)
+    if blue >= need and blue > red:
+        return 0
+    if red >= need and red > blue:
+        return 1
+    return None
 
 
 def progress_bar(done: int, total: int, width: int = 10) -> str:
@@ -161,6 +205,9 @@ class LobbyView(discord.ui.View):
                     continue
                 child.disabled = not has_teams
             elif custom_id == CUSTOM_ID_MOVE:
+                child.disabled = not has_teams
+            elif custom_id in (CUSTOM_ID_WIN_BLUE, CUSTOM_ID_WIN_RED):
+                # Отмечается каждая катка серии: после отметки сразу начинается следующая.
                 child.disabled = not has_teams
             else:
                 child.disabled = False
@@ -279,6 +326,67 @@ class LobbyView(discord.ui.View):
             embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
         )
 
+    # --- результат катки ------------------------------------------------
+
+    @discord.ui.button(
+        label="Победили синие", emoji="🔵", style=discord.ButtonStyle.primary, custom_id=CUSTOM_ID_WIN_BLUE, row=3
+    )
+    async def win_blue(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._report(interaction, 0)
+
+    @discord.ui.button(
+        label="Победили красные", emoji="🔴", style=discord.ButtonStyle.danger, custom_id=CUSTOM_ID_WIN_RED, row=3
+    )
+    async def win_red(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._report(interaction, 1)
+
+    async def _report(self, interaction: discord.Interaction, side: int) -> None:
+        cog: "Lobby" = interaction.client.get_cog("Lobby")
+        record = cog.get_record(interaction.message.id)
+        if record is None:
+            await respond(interaction, "Этот сбор больше не отслеживается.")
+            return
+        if not cog.is_organizer(interaction, record):
+            await respond(interaction, "Результат отмечает автор сбора или организатор ивентов.")
+            return
+        if record.get("closed") or len(record.get("teams") or []) != 2:
+            await respond(interaction, "Составов нет — отмечать нечего.")
+            return
+        round_no = record.get("round", 1)
+        if time.time() - record.get("last_report_at", 0) < REPORT_COOLDOWN:
+            # Защита от двойного клика: катки не длятся секунды.
+            await respond(interaction, f"Катку {round_no - 1} только что записал. Если это следующая — нажмите через пару секунд.")
+            return
+        stats_cog = interaction.client.get_cog("Stats")
+        if stats_cog is None:
+            await respond(interaction, "Модуль статистики не загружен — посмотрите логи бота.")
+            return
+
+        winners, losers = record["teams"][side], record["teams"][1 - side]
+        # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
+        record["last_report_at"] = time.time()
+        record["round"] = round_no + 1
+        game_id = await stats_cog.stats.record_game(
+            interaction.guild.id, list(winners), list(losers), lobby_id=interaction.message.id, round_no=round_no
+        )
+        record.setdefault("results", []).append({"round": round_no, "winner": side, "game": game_id})
+        await cog.save()
+        await interaction.response.edit_message(
+            embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
+        )
+
+        side_name = (BLUE_SIDE, RED_SIDE)[side]
+        names = ", ".join(player_name(m) for m in cog.members_from_ids(interaction.guild, winners))
+        lines = [f"🏆 Катка {round_no}: победа — **{side_name}**! {names}", cog.score_line(record)]
+        if series_winner(record) is not None and series_winner(record, drop_last=True) is None:
+            lines.append(f"🎉 **Серия Bo{record.get('series', DEFAULT_SERIES)} за {SERIES_WINNERS[side]}!**")
+        announce = await interaction.followup.send("\n".join(lines), wait=True)
+        await interaction.followup.send(
+            "Записал в статистику. Ошиблись кнопкой — отмените:",
+            view=UndoResultView(cog, record, interaction.message, game_id, round_no, announce),
+            ephemeral=True,
+        )
+
     # --- режим, запуск, драфт, развод по каналам -----------------------
 
     @discord.ui.button(
@@ -341,12 +449,13 @@ class LobbyView(discord.ui.View):
         record["teams"] = [[member.id for member in team] for team in teams]
         record["deal"] = cog.pack_deal(lanes, champions)
         record["round"] = 1
+        record["results"] = []
         record["stage"] = STAGE_DONE
         await cog.save()
 
         await interaction.message.edit(embed=cog.build_embed(interaction.guild, record), view=LobbyView(record))
         await interaction.followup.send(
-            embed=modes.deal_embed(teams, lanes, champions, mode, notes, patch=POOL.version)
+            **await cog.deal_message(teams, lanes, champions, mode, notes)
         )
 
     @discord.ui.button(
@@ -367,8 +476,7 @@ class LobbyView(discord.ui.View):
             await respond(interaction, "Сначала заролльте капитанов — кто-то из них покинул сервер.")
             return
 
-        scrim_cog = interaction.client.get_cog("Scrim")
-        if scrim_cog is None:
+        if interaction.client.get_cog("Scrim") is None:
             await respond(interaction, "Модуль драфта не загружен — посмотрите логи бота.")
             return
 
@@ -379,41 +487,26 @@ class LobbyView(discord.ui.View):
             await respond(interaction, "Кроме капитанов в составе никого нет.")
             return
 
+        # Прошлый драфт этого сбора (если перезапускают) больше не принимает пики.
+        old = cog.drafts.pop(interaction.message.id, None)
+        if old is not None:
+            old.stop()
+
         # Номер драфта: если его перезапустили, старый драфт уже не должен трогать сбор.
-        draft_no = record.get("draft_no", 0) + 1
-        record["draft_no"] = draft_no
+        record["draft_no"] = record.get("draft_no", 0) + 1
         record["stage"] = STAGE_DRAFT
         record["teams"] = None
         record["deal"] = None
-        await cog.save()
+        record.pop("draft", None)
 
-        lobby_message = interaction.message
-
-        def is_current() -> bool:
-            return record.get("draft_no") == draft_no and not record.get("closed")
-
-        async def on_finish(teams: list[list[discord.Member]]) -> None:
-            if is_current():
-                await cog.finish_draft(lobby_message, record, teams)
-
-        async def on_expire() -> None:
-            if not is_current() or record.get("stage") != STAGE_DRAFT:
-                return
-            record["stage"] = STAGE_CAPTAINS
-            await cog.save()
-            try:
-                await lobby_message.edit(embed=cog.build_embed(lobby_message.guild, record), view=LobbyView(record))
-            except discord.HTTPException:
-                log.exception("Не удалось обновить сбор после таймаута драфта")
-
-        draft = DraftView(
-            scrim_cog, captains, shuffled(pool), on_finish=on_finish, on_expire=on_expire,
-            expired_hint="Время на драфт вышло — нажмите «Перезапустить драфт» в посте сбора",
-        )
+        draft = cog.draft_view(interaction.message, record, captains, shuffled(pool))
+        cog.store_draft(record, draft)
         await interaction.response.edit_message(
             embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
         )
         draft.message = await interaction.followup.send(embed=draft.build_embed(), view=draft, wait=True)
+        record["draft"]["message_id"] = draft.message.id
+        await cog.save()
 
     @discord.ui.button(
         label="Новая раздача", emoji="🔁", style=discord.ButtonStyle.primary, custom_id=CUSTOM_ID_REROLL, row=2
@@ -464,6 +557,44 @@ class LobbyView(discord.ui.View):
             view=MoveView(cog, record),
             ephemeral=True,
         )
+
+
+class UndoResultView(discord.ui.View):
+    """Отмена ошибочно отмеченного результата. Видит только тот, кто отмечал."""
+
+    def __init__(
+        self, cog: "Lobby", record: dict, lobby_message: discord.Message, game_id: int, round_no: int,
+        announce: discord.Message,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.record = record
+        self.lobby_message = lobby_message
+        self.game_id = game_id
+        self.round_no = round_no
+        self.announce = announce
+
+    @discord.ui.button(label="Отменить результат", emoji="↩️", style=discord.ButtonStyle.secondary)
+    async def undo(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        stats_cog = interaction.client.get_cog("Stats")
+        if stats_cog is not None:
+            await stats_cog.stats.undo_game(interaction.guild.id, self.game_id)
+        self.record["results"] = [r for r in self.record.get("results", []) if r.get("game") != self.game_id]
+        # Номер катки откатываем, только если после этой отметки новых не было.
+        if self.record.get("round") == self.round_no + 1:
+            self.record["round"] = self.round_no
+        self.record.pop("last_report_at", None)
+        await self.cog.save()
+        try:
+            await self.lobby_message.edit(
+                embed=self.cog.build_embed(self.lobby_message.guild, self.record), view=LobbyView(self.record)
+            )
+            await self.announce.edit(content=f"~~{self.announce.content}~~\n↩️ Результат отменён.")
+        except discord.HTTPException:
+            log.exception("Не удалось обновить сообщения после отмены результата")
+        button.disabled = True
+        await interaction.response.edit_message(content="Результат отменён, статистика исправлена.", view=self)
+        self.stop()
 
 
 class ModeView(discord.ui.View):
@@ -738,6 +869,8 @@ class Lobby(commands.Cog):
         self._refresh_task: asyncio.Task | None = None
         # Сборы, где прямо сейчас идёт новая раздача: двойной клик не должен раздать дважды.
         self._rerolling: set[int] = set()
+        # Живые драфты сборов: id поста сбора → меню драфта.
+        self.drafts: dict[int, DraftView] = {}
 
     async def cog_load(self) -> None:
         data = self.store.load()
@@ -757,11 +890,23 @@ class Lobby(commands.Cog):
             await self.store.save()
         self.bot.add_view(LobbyView())
         log.info("Активных сборов восстановлено: %d", len(fresh))
-        self._refresh_task = asyncio.create_task(self._refresh_messages())
+        self._refresh_task = asyncio.create_task(self._background())
 
     async def cog_unload(self) -> None:
         if self._refresh_task is not None:
             self._refresh_task.cancel()
+
+    async def _background(self) -> None:
+        """После старта перерисовывает посты и восстанавливает драфты, дальше раз в TICK секунд
+        напоминает о сборах и закрывает драфты, где капитаны давно не выбирали."""
+        await self._refresh_messages()
+        while True:
+            try:
+                await self.remind_due()
+                await self.expire_drafts()
+            except Exception:
+                log.exception("Ошибка в фоновой проверке сборов")
+            await asyncio.sleep(TICK)
 
     async def _refresh_messages(self) -> None:
         """Перерисовывает сохранённые сообщения сборов после перезапуска.
@@ -778,6 +923,8 @@ class Lobby(commands.Cog):
                 continue
             try:
                 message = await channel.fetch_message(int(message_id))
+                if record.get("stage") == STAGE_DRAFT and not record.get("closed"):
+                    await self.restore_draft(message, record)
                 await message.edit(
                     embed=self.build_embed(channel.guild, record), view=LobbyView(record)
                 )
@@ -801,6 +948,162 @@ class Lobby(commands.Cog):
             record["closed"] = True
             await self.save()
             log.info("Пост сбора %s удалён — сбор закрыт", payload.message_id)
+
+    # --- драфт, который переживает перезапуск ------------------------------
+
+    def draft_view(
+        self,
+        lobby_message: discord.Message,
+        record: dict,
+        captains: list[discord.Member],
+        pool: list[discord.Member],
+        teams: list[list[discord.Member]] | None = None,
+    ) -> DraftView:
+        """Меню драфта сбора. Постоянное: после рестарта бот находит его по custom_id."""
+        draft_no = record["draft_no"]
+        key = lobby_message.id
+
+        def is_current() -> bool:
+            return record.get("draft_no") == draft_no and not record.get("closed")
+
+        async def on_pick(view: DraftView) -> None:
+            if is_current():
+                self.store_draft(record, view)
+                await self.save()
+
+        async def on_finish(teams: list[list[discord.Member]]) -> None:
+            if not is_current():
+                return
+            record.pop("draft", None)
+            self.drafts.pop(key, None)
+            await self.finish_draft(lobby_message, record, teams)
+
+        view = DraftView(
+            self.bot.get_cog("Scrim"), captains, pool,
+            on_finish=on_finish, on_pick=on_pick, teams=teams,
+            expired_hint="Время на драфт вышло — нажмите «Перезапустить драфт» в посте сбора",
+            custom_id=f"lol:draft:{key}:{draft_no}", timeout=None,
+        )
+        self.drafts[key] = view
+        return view
+
+    @staticmethod
+    def store_draft(record: dict, view: DraftView) -> None:
+        """Ход драфта на диск. Каждый пик продлевает срок: капитаны думают, а не ушли."""
+        state = record.setdefault("draft", {})
+        state["captains"] = [captain.id for captain in view.captains]
+        state["pool"] = [member.id for member in view.pool]
+        state["teams"] = [[member.id for member in team] for team in view.teams]
+        state["expires_at"] = time.time() + DRAFT_TIMEOUT
+
+    async def restore_draft(self, lobby_message: discord.Message, record: dict) -> None:
+        """Возвращает к жизни меню драфта после перезапуска бота."""
+        state = record.get("draft") or {}
+        guild = lobby_message.guild
+        captains = self.members_from_ids(guild, state.get("captains"))
+        teams = [self.members_from_ids(guild, ids) for ids in state.get("teams") or []]
+        pool = self.members_from_ids(guild, state.get("pool"))
+        broken = len(captains) != 2 or len(teams) != 2 or any(not team for team in teams)
+        if broken or not state.get("message_id") or state.get("expires_at", 0) < time.time():
+            await self.expire_draft(str(lobby_message.id), record)
+            return
+        if self.bot.get_cog("Scrim") is None:
+            return
+        view = self.draft_view(lobby_message, record, captains, pool, teams)
+        view.message = lobby_message.channel.get_partial_message(state["message_id"])
+        self.bot.add_view(view, message_id=state["message_id"])
+        log.info("Драфт сбора %s восстановлен: осталось игроков %d", lobby_message.id, len(pool))
+
+    async def expire_drafts(self) -> None:
+        now = time.time()
+        for message_id, record in list(self.store.data.items()):
+            state = record.get("draft")
+            if not state:
+                continue
+            if record.get("closed") or record.get("stage") != STAGE_DRAFT or state.get("expires_at", 0) < now:
+                await self.expire_draft(message_id, record)
+
+    async def expire_draft(self, message_id: str, record: dict) -> None:
+        """Снимает стадию драфта: меню сереет, а в посте сбора снова можно запустить драфт."""
+        state = record.pop("draft", None) or {}
+        view = self.drafts.pop(int(message_id), None)
+        if view is not None:
+            view.stop()
+            view.select.disabled = True
+        if record.get("stage") == STAGE_DRAFT:
+            record["stage"] = STAGE_CAPTAINS
+        await self.save()
+
+        channel = self.bot.get_channel(record["channel_id"])
+        if channel is None:
+            return
+        if state.get("message_id"):
+            draft_message = channel.get_partial_message(state["message_id"])
+            try:
+                if view is not None:
+                    await draft_message.edit(embed=view.expired_embed(), view=view)
+                else:
+                    await draft_message.edit(view=None)
+            except discord.HTTPException:
+                log.debug("Не удалось погасить меню драфта %s", state["message_id"])
+        if not record.get("closed"):
+            try:
+                await channel.get_partial_message(int(message_id)).edit(
+                    embed=self.build_embed(channel.guild, record), view=LobbyView(record)
+                )
+            except discord.HTTPException:
+                log.exception("Не удалось обновить сбор %s после таймаута драфта", message_id)
+        log.info("Драфт сбора %s закрыт по таймауту", message_id)
+
+    # --- напоминания --------------------------------------------------------
+
+    async def remind_due(self) -> None:
+        """За REMIND_MINUTES до начала зовёт записавшихся — один раз на сбор."""
+        if config.REMIND_MINUTES <= 0:
+            return
+        now = time.time()
+        window = config.REMIND_MINUTES * 60
+        changed = False
+        for message_id, record in list(self.store.data.items()):
+            start_at = record.get("start_at")
+            if not start_at or record.get("reminded") or record.get("closed"):
+                continue
+            if start_at - now > window:
+                continue
+            record["reminded"] = True
+            changed = True
+            # Бот был выключен и проспал начало или сбор создан прямо перед игрой — звать поздно или незачем.
+            if now >= start_at or record.get("created_at", 0) > start_at - window:
+                continue
+            await self.send_reminder(message_id, record)
+        if changed:
+            await self.save()
+
+    async def send_reminder(self, message_id: str, record: dict) -> None:
+        channel = self.bot.get_channel(record["channel_id"])
+        if channel is None:
+            return
+        members = self.members_from_ids(channel.guild, record[STATUS_IN])
+        if not members:
+            return
+        title = KIND_TITLES.get(record.get("kind", KIND_SCRIM), KIND_TITLES[KIND_SCRIM])
+        jump_url = f"https://discord.com/channels/{channel.guild.id}/{channel.id}/{message_id}"
+        lines = [
+            f"⏰ **{title}** начинается <t:{int(record['start_at'])}:R>!",
+            " ".join(member.mention for member in members),
+        ]
+        subs = self.members_from_ids(channel.guild, record[STATUS_SUB])
+        if subs:
+            lines.append("Запасные, будьте рядом: " + ", ".join(player_name(member) for member in subs))
+        lines.append(f"[Пост сбора]({jump_url})")
+        try:
+            await channel.send(
+                "\n".join(lines),
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=members),
+            )
+            log.info("Напоминание о сборе %s отправлено", message_id)
+        except discord.HTTPException:
+            log.exception("Не удалось напомнить о сборе %s", message_id)
 
     # --- работа с записями ----------------------------------------------
 
@@ -835,6 +1138,16 @@ class Lobby(commands.Cog):
             return member
         return None
 
+    @staticmethod
+    def score_line(record: dict) -> str:
+        blue, red = series_score(record)
+        series = record.get("series", DEFAULT_SERIES)
+        line = f"📊 **Серия Bo{series}:** 🔵 {blue} : {red} 🔴"
+        winner = series_winner(record)
+        if winner is not None:
+            line += f" — серия за {SERIES_WINNERS[winner]}"
+        return line
+
     def get_record(self, message_id: int) -> dict | None:
         return self.store.data.get(str(message_id))
 
@@ -866,6 +1179,7 @@ class Lobby(commands.Cog):
         record["teams"] = [[member.id for member in team] for team in teams]
         record["deal"] = self.pack_deal(lanes, champions)
         record["round"] = 1
+        record["results"] = []
         record["stage"] = STAGE_DONE
         await self.save()
         try:
@@ -879,12 +1193,27 @@ class Lobby(commands.Cog):
         captains = [team[0] for team in teams]  # драфт начинается с капитанов
         try:
             await message.channel.send(
-                embed=modes.deal_embed(
-                    teams, lanes, champions, mode, notes + champion_notes, captains=captains, patch=POOL.version
-                )
+                **await self.deal_message(teams, lanes, champions, mode, notes + champion_notes, captains=captains)
             )
         except discord.HTTPException:
             log.exception("Не удалось опубликовать раздачу после драфта")
+
+    async def deal_message(
+        self,
+        teams: list[list[discord.Member]],
+        lanes: dict[int, str],
+        champions: dict,
+        mode: dict,
+        notes: list[str],
+        **options,
+    ) -> dict:
+        """Эмбед раздачи и, если есть чемпионы, картинка с их портретами."""
+        embed = modes.deal_embed(teams, lanes, champions, mode, notes, patch=POOL.version, **options)
+        image = await portraits.deal_image(teams, champions, lambda team: modes.order_by_lane(team, lanes))
+        if image is None:
+            return {"embed": embed}
+        embed.set_image(url=f"attachment://{image.filename}")
+        return {"embed": embed, "file": image}
 
     async def reroll_deal(self, message: discord.Message, record: dict) -> None:
         """Новая раздача после катки: составы те же, линии и чемпионы заново, без чемпионов прошлой катки."""
@@ -897,7 +1226,7 @@ class Lobby(commands.Cog):
         lanes, notes = self.assign_team_lanes(teams, mode["lanes"])
         champions, champion_notes = await self.deal_for(teams, lanes, mode, exclude=previous)
 
-        record["round"] = record.get("round", 1) + 1
+        # Номер катки двигает отметка победителя, а не раздача: переразадать можно и посреди катки.
         record["deal"] = self.pack_deal(lanes, champions)
         await self.save()
         try:
@@ -908,9 +1237,9 @@ class Lobby(commands.Cog):
         captains = self.members_from_ids(guild, record.get("captains"))
         try:
             await message.channel.send(
-                embed=modes.deal_embed(
+                **await self.deal_message(
                     teams, lanes, champions, mode, notes + champion_notes,
-                    captains=captains, patch=POOL.version, round_no=record["round"],
+                    captains=captains, round_no=record["round"],
                 )
             )
         except discord.HTTPException:
@@ -934,6 +1263,24 @@ class Lobby(commands.Cog):
                 notes.append(
                     "Собрать команды по отмеченным линиям не вышло: нужно ровно 10 игроков "
                     "и подходящий набор ролей. Команды поделены случайно, линии розданы случайно."
+                )
+        elif mode["teams"] == modes.TEAMS_SKILL:
+            stats_cog = self.bot.get_cog("Stats")
+            guild_id = players[0].guild.id
+
+            def rating(member: discord.Member) -> float:
+                return stats_cog.stats.player(guild_id, member.id).rating if stats_cog else 0.5
+
+            teams = modes.skill_teams(players, rating)
+            lanes, lane_notes = self.assign_team_lanes(teams, mode["lanes"])
+            notes += lane_notes
+            if stats_cog is None or not any(stats_cog.stats.player(guild_id, m.id).games for m in players):
+                notes.append("Статистики пока нет — команды поделены случайно. Отмечайте победы кнопками в посте сбора.")
+            else:
+                strength = [sum(rating(m) for m in team) / len(team) for team in teams if team]
+                notes.append(
+                    "Команды уравнены по статистике: средний рейтинг "
+                    + " против ".join(f"{value:.0%}" for value in strength) + "."
                 )
         else:
             teams = modes.random_teams(players)
@@ -1030,17 +1377,25 @@ class Lobby(commands.Cog):
         if closed:
             title += " (отменён)"
 
-        lines = [f"🕒 **Когда:** {record['time']}"]
+        start_at = record.get("start_at")
+        if start_at:
+            # Discord сам покажет время в часовом поясе каждого, а «через 2 часа» будет тикать.
+            lines = [f"🕒 **Когда:** <t:{int(start_at)}:F> · <t:{int(start_at)}:R>"]
+        else:
+            lines = [f"🕒 **Когда:** {record['time']}"]
         if record.get("opponent"):
             lines.append(f"⚔️ **Соперник:** {record['opponent']}")
         if record.get("note"):
             lines.append(f"📝 {record['note']}")
         mode = modes.get_mode(record)
         if kind != KIND_SCRIM:
-            mode_line = f"🎮 **Режим:** {modes.mode_title(mode)}"
+            mode_line = f"🎮 **Режим:** {modes.mode_title(mode)} · Bo{record.get('series', DEFAULT_SERIES)}"
             if modes.find_preset(mode) is None:
                 mode_line += f" — {modes.mode_summary(mode)}"
             lines.append(mode_line)
+
+        if record.get("results"):
+            lines.append(self.score_line(record))
 
         embed = discord.Embed(
             title=title,
@@ -1087,8 +1442,9 @@ class Lobby(commands.Cog):
             footer = "Сбор отменён"
         elif len(teams) == 2:
             footer = "Составы готовы — можно раскидать по каналам"
+            footer += f" · катка {record.get('round', 1)}: после игры отметьте победителя"
             if mode["lanes"] != modes.LANES_FREE or mode["champs"] != modes.CHAMPS_FREE:
-                footer += f" · катка {record.get('round', 1)}, после неё — «Новая раздача»"
+                footer += ", новые чемпионы — «Новая раздача»"
         elif stage == STAGE_DRAFT:
             footer = "Идёт драфт"
         elif len(captains) == 2:
@@ -1121,6 +1477,7 @@ class Lobby(commands.Cog):
         note: str | None,
         mention: discord.Role | None,
         ping: str,
+        series: int = DEFAULT_SERIES,
     ) -> None:
         warning: str | None = None
         # Массовый пинг доступен только тем, кто и сам может упоминать @everyone,
@@ -1146,6 +1503,7 @@ class Lobby(commands.Cog):
             )
             mention = None
 
+        start = parse_when(when, datetime.now(config.TIMEZONE))
         record = {
             "guild_id": interaction.guild.id,
             "channel_id": interaction.channel_id,
@@ -1156,11 +1514,14 @@ class Lobby(commands.Cog):
             "opponent": opponent,
             "note": note,
             "created_at": time.time(),
+            "start_at": start.timestamp() if start else None,
+            "reminded": False,
             "closed": False,
             "stage": STAGE_SIGNUP,
             "captains": None,
             "teams": None,
             "mode": modes.DEFAULT_PRESET.mode,
+            "series": series,
             "deal": None,
             STATUS_IN: [],
             STATUS_SUB: [],
@@ -1227,8 +1588,9 @@ class Lobby(commands.Cog):
         ping="Кого позвать (по умолчанию @everyone)",
         mention="Дополнительно упомянуть конкретную роль",
         slots="Сколько игроков нужно (по умолчанию 10)",
+        series="Формат серии: после каждой катки отмечаете победителя (по умолчанию Bo3)",
     )
-    @app_commands.choices(ping=PING_CHOICES)
+    @app_commands.choices(ping=PING_CHOICES, series=SERIES_CHOICES)
     @app_commands.guild_only()
     async def custom(
         self,
@@ -1238,6 +1600,7 @@ class Lobby(commands.Cog):
         ping: app_commands.Choice[str] | None = None,
         mention: discord.Role | None = None,
         slots: app_commands.Range[int, 2, 20] = config.TEAM_SIZE * 2,
+        series: app_commands.Choice[int] | None = None,
     ) -> None:
         await self._open_lobby(
             interaction,
@@ -1248,6 +1611,7 @@ class Lobby(commands.Cog):
             note=note,
             mention=mention,
             ping=ping.value if ping else PING_EVERYONE,
+            series=series.value if series else DEFAULT_SERIES,
         )
 
     def latest_open_record(self, guild: discord.Guild) -> tuple[str, dict] | None:
@@ -1258,7 +1622,7 @@ class Lobby(commands.Cog):
             for message_id, record in self.store.data.items()
             if record["guild_id"] == guild.id
             and not record.get("closed")
-            and now - record.get("created_at", now) < LOBBY_STALE_AFTER
+            and now - max(record.get("created_at", now), record.get("start_at") or 0) < LOBBY_STALE_AFTER
         ]
         if not records:
             return None

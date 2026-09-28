@@ -52,6 +52,12 @@ class CaptainsView(discord.ui.View):
             return False
         return True
 
+    def expired_embed(self) -> discord.Embed:
+        embed = self.build_embed()
+        embed.color = discord.Color.dark_grey()
+        embed.set_footer(text=self.expired_hint)
+        return embed
+
     async def on_timeout(self) -> None:
         for item in self.children:
             item.disabled = True
@@ -86,8 +92,9 @@ class CaptainsView(discord.ui.View):
 class PlayerSelect(discord.ui.Select):
     """Выпадающий список свободных игроков."""
 
-    def __init__(self, draft: "DraftView") -> None:
-        super().__init__(placeholder="Выберите игрока в свою команду", min_values=1, max_values=1)
+    def __init__(self, draft: "DraftView", custom_id: str | None = None) -> None:
+        kwargs = {"custom_id": custom_id} if custom_id else {}
+        super().__init__(placeholder="Выберите игрока в свою команду", min_values=1, max_values=1, **kwargs)
         self.draft = draft
         self.refresh()
 
@@ -120,8 +127,18 @@ class DraftView(discord.ui.View):
         on_finish: Callable[[list[list[discord.Member]]], Awaitable[None]] | None = None,
         on_expire: Callable[[], Awaitable[None]] | None = None,
         expired_hint: str = "Время на драфт вышло — запустите /draft заново",
+        *,
+        teams: list[list[discord.Member]] | None = None,
+        on_pick: Callable[["DraftView"], Awaitable[None]] | None = None,
+        custom_id: str | None = None,
+        timeout: float | None = 900,
     ) -> None:
-        super().__init__(timeout=900)
+        """teams — уже набранные составы (капитан первым), когда драфт восстанавливается после перезапуска.
+
+        С custom_id и timeout=None драфт постоянный: бот перерегистрирует его после рестарта,
+        а сроки отслеживает сам владелец (лобби).
+        """
+        super().__init__(timeout=timeout)
         self.cog = cog
         self.captains = captains
         self.pool = list(pool)
@@ -130,11 +147,13 @@ class DraftView(discord.ui.View):
         # Вызывается, если капитаны не успели: лобби снимает стадию драфта, чтобы его можно было перезапустить.
         self.on_expire = on_expire
         self.expired_hint = expired_hint
-        self.teams: list[list[discord.Member]] = [[captains[0]], [captains[1]]]
-        self.order = draft_order(len(self.pool))
-        self.turn = 0
-        self.message: discord.Message | None = None
-        self.select = PlayerSelect(self)
+        # Вызывается после каждого пика: так лобби сохраняет ход драфта на диск.
+        self.on_pick = on_pick
+        self.teams: list[list[discord.Member]] = [list(team) for team in teams] if teams else [[captains[0]], [captains[1]]]
+        self.turn = sum(len(team) - 1 for team in self.teams)
+        self.order = draft_order(self.turn + len(self.pool))
+        self.message: discord.Message | discord.PartialMessage | None = None
+        self.select = PlayerSelect(self, custom_id)
         self.add_item(self.select)
 
     @property
@@ -208,6 +227,8 @@ class DraftView(discord.ui.View):
         self.turn += 1
 
         finished = not self.pool
+        if self.on_pick is not None and not finished:
+            await self.on_pick(self)
         if finished:
             self.cog.last_teams[interaction.guild.id] = (list(self.teams[0]), list(self.teams[1]))
             self.select.disabled = True
@@ -229,11 +250,8 @@ class DraftView(discord.ui.View):
                 log.exception("Не удалось обработать таймаут драфта")
         if self.message is None:
             return
-        embed = self.build_embed()
-        embed.color = discord.Color.dark_grey()
-        embed.set_footer(text=self.expired_hint)
         try:
-            await self.message.edit(embed=embed, view=self)
+            await self.message.edit(embed=self.expired_embed(), view=self)
         except discord.HTTPException:
             log.debug("Не удалось обновить сообщение драфта после таймаута")
 
