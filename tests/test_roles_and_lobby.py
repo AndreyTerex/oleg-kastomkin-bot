@@ -49,11 +49,29 @@ class FakeGuild:
 
 def test_promote_sub_skips_people_who_left():
     cog = lobby.Lobby.__new__(lobby.Lobby)
-    record = _record()
+    record = _record(waiting=[9, 3])
     promoted = cog.promote_sub(FakeGuild([1, 2, 3]), record)  # 9 ушёл с сервера
     assert promoted.id == 3
     assert record[lobby.STATUS_IN] == [1, 2, 3]
     assert record[lobby.STATUS_SUB] == [9]
+    assert record["waiting"] == [9]
+
+
+def test_promote_sub_ignores_voluntary_subs():
+    cog = lobby.Lobby.__new__(lobby.Lobby)
+    # 9 и 3 сами выбрали «Запасной» — очереди нет, в состав их не тянем.
+    record = _record()
+    assert cog.promote_sub(FakeGuild([1, 2, 3, 9]), record) is None
+    assert record[lobby.STATUS_SUB] == [9, 3]
+
+
+def test_set_waiting_keeps_order_and_resets():
+    record = {}
+    lobby.set_waiting(record, 5, True)
+    lobby.set_waiting(record, 6, True)
+    lobby.set_waiting(record, 5, False)
+    lobby.set_waiting(record, 7, True)
+    assert record["waiting"] == [6, 7]
 
 
 def test_promote_sub_not_after_teams_split():
@@ -156,5 +174,6 @@ def test_result_buttons_stay_open_between_games():
     record = _record(stage=lobby.STAGE_DONE, teams=[[1], [2]], round=2, results=[{"winner": 0}])
     states = asyncio.run(buttons(record))
     assert not states[lobby.CUSTOM_ID_WIN_BLUE] and not states[lobby.CUSTOM_ID_WIN_RED]
+    # До деления на команды кнопок побед в посте нет вовсе.
     states = asyncio.run(buttons(_record()))
-    assert states[lobby.CUSTOM_ID_WIN_BLUE]
+    assert lobby.CUSTOM_ID_WIN_BLUE not in states
