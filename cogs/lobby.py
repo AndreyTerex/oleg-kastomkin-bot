@@ -131,6 +131,15 @@ def series_winner(record: dict, *, drop_last: bool = False) -> int | None:
     return None
 
 
+def set_waiting(record: dict, user_id: int, waiting: bool) -> None:
+    """Очередь в состав: кто хотел играть, но не влез. Порядок — кто раньше нажал «Играю»."""
+    queue = record.setdefault("waiting", [])
+    if user_id in queue:
+        queue.remove(user_id)
+    if waiting:
+        queue.append(user_id)
+
+
 def progress_bar(done: int, total: int, width: int = 10) -> str:
     """Полоска набора: «🟩🟩🟩⬜⬜». При большом сборе клетка — несколько игроков."""
     if total <= 0:
@@ -207,8 +216,12 @@ class LobbyView(discord.ui.View):
             elif custom_id == CUSTOM_ID_MOVE:
                 child.disabled = not has_teams
             elif custom_id in (CUSTOM_ID_WIN_BLUE, CUSTOM_ID_WIN_RED):
+                # До деления на команды отмечать нечего — не занимаем место в посте.
+                if not has_teams:
+                    self.remove_item(child)
+                    continue
                 # Отмечается каждая катка серии: после отметки сразу начинается следующая.
-                child.disabled = not has_teams
+                child.disabled = False
             else:
                 child.disabled = False
 
@@ -250,6 +263,8 @@ class LobbyView(discord.ui.View):
                 record[key].remove(user_id)
         if status is not None:
             record[status].append(user_id)
+        # Своё решение человека важнее очереди: сам выбрал «Запасной» — в состав его не тянем.
+        set_waiting(record, user_id, note is not None)
 
         promoted = cog.promote_sub(interaction.guild, record) if left_roster else None
 
@@ -260,10 +275,7 @@ class LobbyView(discord.ui.View):
         if note:
             await interaction.followup.send(note, ephemeral=True)
         if promoted is not None:
-            await interaction.followup.send(
-                f"🔼 {promoted.mention}, освободилось место — ты теперь в основном составе!",
-                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[promoted]),
-            )
+            await cog.announce_promoted(interaction.followup, [promoted])
 
     @discord.ui.button(label="Играю", emoji="✅", style=discord.ButtonStyle.success, custom_id="lol:lobby:in")
     async def sign_in(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -768,7 +780,9 @@ class RosterEditView(discord.ui.View):
                     self.record[key].remove(user_id)
 
             # В состав больше нужного не пускаем даже организатора — иначе счётчик врёт.
-            if target_status == STATUS_IN and len(self.record[STATUS_IN]) >= limit:
+            overflowed = target_status == STATUS_IN and len(self.record[STATUS_IN]) >= limit
+            set_waiting(self.record, user_id, overflowed)
+            if overflowed:
                 self.record[STATUS_SUB].append(user_id)
                 overflow.append(user_id)
                 continue
@@ -777,15 +791,23 @@ class RosterEditView(discord.ui.View):
                 self.record[target_status].append(user_id)
             changed.append(user_id)
 
+        promoted = []
+        while (member := self.cog.promote_sub(guild, self.record)) is not None:
+            promoted.append(member)
+
         await self.cog.save()
         await self.lobby_message.edit(
             embed=self.cog.build_embed(guild, self.record), view=LobbyView(self.record)
         )
         self.refresh_options()
+        if promoted:
+            await self.cog.announce_promoted(self.lobby_message.channel, promoted)
 
         lines = []
         if changed:
             lines.append(f"{verb}: {self._names(guild, changed)}.")
+        if promoted:
+            lines.append(f"Из очереди в состав встали: {', '.join(player_name(m) for m in promoted)}.")
         if overflow:
             lines.append(
                 f"В состав не поместились (уже {limit}/{limit}), оставлены в запасе: "
@@ -883,9 +905,18 @@ class Lobby(commands.Cog):
         trimmed = [
             key for key, record in fresh.items() if not record.get("closed") and self._trim_roster(record)
         ]
+        # Сборы, созданные до появления дат: время разбираем относительно момента создания поста.
+        dated = 0
+        for record in fresh.values():
+            if "start_at" not in record:
+                created = datetime.fromtimestamp(record.get("created_at", now), config.TIMEZONE)
+                start = parse_when(record.get("time", ""), created)
+                record["start_at"] = start.timestamp() if start else None
+                record["reminded"] = bool(start) and start.timestamp() <= now
+                dated += 1
         if trimmed:
             log.info("Состав подрезан до нормы у сборов: %s", ", ".join(trimmed))
-        if len(fresh) != len(data) or trimmed:
+        if len(fresh) != len(data) or trimmed or dated:
             self.store.data = fresh
             await self.store.save()
         self.bot.add_view(LobbyView())
@@ -1118,25 +1149,40 @@ class Lobby(commands.Cog):
         record[STATUS_SUB] = [
             user_id for user_id in record[STATUS_SUB] if user_id not in overflow
         ] + overflow
+        for user_id in overflow:
+            set_waiting(record, user_id, True)
         return True
 
     def promote_sub(self, guild: discord.Guild, record: dict) -> discord.Member | None:
-        """Первый запасной встаёт на освободившееся место — пока составы ещё не поделены.
+        """На освободившееся место встаёт первый из очереди — пока составы ещё не поделены.
 
-        После капитанов и драфта состав уже распределён, там решает организатор.
+        В очереди только те, кто нажал «Играю», когда состав был полон. Кто сам выбрал «Запасной»,
+        остаётся в запасе. После капитанов и драфта состав уже распределён, там решает организатор.
         """
         if record.get("stage", STAGE_SIGNUP) != STAGE_SIGNUP or record.get("teams"):
             return None
         if len(record[STATUS_IN]) >= record.get("target", config.TEAM_SIZE):
             return None
-        for user_id in list(record[STATUS_SUB]):
+        for user_id in list(record.get("waiting") or []):
             member = guild.get_member(user_id)
-            if member is None:
+            if member is None or user_id not in record[STATUS_SUB]:
                 continue
             record[STATUS_SUB].remove(user_id)
             record[STATUS_IN].append(user_id)
+            set_waiting(record, user_id, False)
             return member
         return None
+
+    @staticmethod
+    async def announce_promoted(destination, members: list[discord.Member]) -> None:
+        mentions = ", ".join(member.mention for member in members)
+        try:
+            await destination.send(
+                f"🔼 {mentions}, освободилось место — вы теперь в основном составе!",
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=members),
+            )
+        except discord.HTTPException:
+            log.exception("Не удалось позвать поднятых из очереди")
 
     @staticmethod
     def score_line(record: dict) -> str:
