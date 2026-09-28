@@ -30,6 +30,7 @@ import copy
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -50,6 +51,12 @@ PROBE_URL = "https://www.gstatic.com/generate_204"
 GEMINI_CHECK_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"
 # Сколько кандидатов подряд проверять на Gemini за одну перепроверку.
 GEMINI_CHECK_TRIES = 8
+# Быстрая замена сбойного сервера: столько серверов (сначала работавшие раньше, затем случайные),
+# а не все сотни из подписки — полная проверка идёт по расписанию.
+QUICK_CHECK_SIZE = 48
+QUICK_CHECK_KNOWN = 32
+# Повторять упавшие с фрагментацией, только если без неё нашлось меньше стольких рабочих: экономит полпрохода.
+FRAGMENT_RETRY_BELOW = 3
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 # Так подписку отдают списком ключей: многие сервисы для «незнакомых» клиентов отвечают YAML для Clash.
 SUBSCRIPTION_USER_AGENT = "v2rayN/7.0"
@@ -114,6 +121,15 @@ class ProbeResult:
         return self.ok and bool(self.country) and self.country not in excluded and not self.gemini_blocked
 
 
+def quick_sample(candidates: list[Server], good: dict[str, float], size: int = QUICK_CHECK_SIZE) -> list[Server]:
+    """Серверы для быстрой замены: сначала работавшие раньше (по задержке), остальное — случайные."""
+    known = sorted((s for s in candidates if s.fingerprint in good), key=lambda s: good[s.fingerprint])
+    picked = known[:QUICK_CHECK_KNOWN]
+    rest = [s for s in candidates if s.fingerprint not in good]
+    picked += random.sample(rest, min(len(rest), max(0, size - len(picked))))
+    return picked
+
+
 def gemini_verdict(status: int, text: str) -> bool | None:
     """Ответ Gemini на проверку: 200 — пускает, «location is not supported» — нет, иное — непонятно."""
     if status == 200:
@@ -162,6 +178,7 @@ class VpnState:
         data.setdefault("selected", None)
         data.setdefault("blacklist", {})
         data.setdefault("fragment", {})
+        data.setdefault("good", {})  # отпечаток → задержка последней удачной проверки (для быстрой замены)
         data.setdefault("last_check", None)
 
     @property
@@ -191,8 +208,10 @@ class VpnState:
             if result.ok:
                 blacklist.pop(fp, None)
                 self.store.data["fragment"][fp] = result.fragment
+                self.store.data["good"][fp] = round(result.latency_ms or 0)
             else:
                 blacklist[fp] = now
+                self.store.data["good"].pop(fp, None)
         # Старые записи не копим.
         for fp in [fp for fp, at in blacklist.items() if now - at > 24 * 3600]:
             del blacklist[fp]
@@ -488,7 +507,8 @@ class VPN:
         known = self.state.data["fragment"]
         first = [(server, mode == "on" or (mode == "auto" and known.get(server.fingerprint) is True)) for server in servers]
         results = await self._probe_pass(first)
-        if mode == "auto":
+        found = sum(1 for result in results.values() if result.usable(self.excluded))
+        if mode == "auto" and found < FRAGMENT_RETRY_BELOW:
             retry = [
                 (server, not fragment) for server, fragment in first
                 if server.fingerprint in results and not results[server.fingerprint].ok
@@ -704,8 +724,12 @@ class VPN:
                     await self.activate_direct()
             if not full and self.current is None and self.ready:
                 return self.status()  # напрямую: все серверы перебираем только по расписанию (_full_check_due)
-            if not full and await self._current_alive():
+            # Сначала — один запрос через текущий сервер: жив — полную проверку (если пора) делаем спокойно,
+            # мёртв — быстро ищем замену среди выборки, а не ждём проверки всех сотен серверов.
+            alive = self.current is not None and await self._current_alive()
+            if not full and alive:
                 return self.status()
+            quick = self.current is not None and not alive and not self.need_full
             self.need_full = False
             await self.refresh_servers()
             now = time.time()
@@ -715,7 +739,14 @@ class VPN:
                 server for fp, server in self.servers.items()
                 if fp not in self.invalid and fp not in blocked
             ]
-            results = await self.probe(candidates)
+            results = {}
+            if quick:
+                # Текущий сервер сбоит: сначала быстро ищем замену среди недавно работавших.
+                results = await self.probe(quick_sample(candidates, self.state.data["good"]))
+                if not any(result.usable(self.excluded) for result in results.values()):
+                    quick = False  # среди выборки рабочих нет — проверяем всё
+            if not quick:
+                results.update(await self.probe([s for s in candidates if s.fingerprint not in results]))
             if not any(result.usable(self.excluded) for result in results.values()):
                 # Все проверенные мимо — даём шанс недавно упавшим.
                 retry = [self.servers[fp] for fp in blocked if fp in self.servers and fp not in results]
@@ -754,7 +785,9 @@ class VPN:
                     len(results), working, choice.name, choice.country, choice.latency_ms or 0,
                 )
             self.last_summary = {"at": now, "checked": len(results), "working": working}
-            self.state.data["last_check"] = self.last_summary
+            if not quick:
+                # Время полной проверки — от него считается следующая по расписанию; быструю не учитываем.
+                self.state.data["last_check"] = self.last_summary
             await self.state.save()
             return self.status()
 

@@ -228,3 +228,28 @@ def test_deal_summary_lists_teams_lanes_and_champions():
     assert "Красная сторона: Анория — Mid — Катарина / Люкс / Талия." in text
     assert deal_summary(guild, {"teams": []}) is None
     assert LOBBY_TOPIC.search("Олег, кого лучше им забанить?")
+
+
+def test_failed_typing_indicator_does_not_break_the_reply():
+    import asyncio
+
+    import discord
+
+    from cogs.chat import typing_if_possible
+
+    class Broken:
+        async def __aenter__(self):
+            raise discord.DiscordServerError(type("R", (), {"status": 503, "reason": "x"})(), "upstream")
+
+        async def __aexit__(self, *exc):
+            return False
+
+    channel = type("C", (), {"typing": lambda self: Broken()})()
+    done = []
+
+    async def run():
+        async with typing_if_possible(channel):
+            done.append("ответ отправлен")
+
+    asyncio.run(run())
+    assert done == ["ответ отправлен"]

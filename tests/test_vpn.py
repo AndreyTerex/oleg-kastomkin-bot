@@ -285,6 +285,7 @@ def test_light_recheck_does_not_probe_all_servers(monkeypatch, tmp_path):
     client.state = vpn.VpnState(tmp_path / "vpn.json")
     client.state.load()
     client.started = True
+    client.current = vpn.ProbeResult("fp", "Germany", True, 80.0, "DE")
     probed = []
 
     async def alive():
@@ -296,6 +297,7 @@ def test_light_recheck_does_not_probe_all_servers(monkeypatch, tmp_path):
 
     monkeypatch.setattr(client, "_current_alive", alive)
     monkeypatch.setattr(client, "probe", probe)
+    monkeypatch.setattr(type(client), "ready", property(lambda self: True))
     asyncio.run(client.recheck(full=False))
     assert probed == []
 
@@ -404,3 +406,49 @@ def test_gemini_check_failing_everywhere_does_not_leave_bot_without_vpn(monkeypa
     results = {"a": result("a", 50), "b": result("b", 80)}
     choice = asyncio.run(client._choose_with_gemini(None, results, 1000.0))
     assert choice.fingerprint == "a" and asked == ["a", "b"]  # сеть/ключ подвели — берём лучший по скорости
+
+
+def test_quick_sample_prefers_servers_that_worked_before():
+    servers = [links.parse_link(f"trojan://p{i}@s{i}.example.com:443?sni=s{i}.example.com#S{i}") for i in range(100)]
+    good = {servers[5].fingerprint: 300, servers[7].fingerprint: 80}
+    sample = vpn.quick_sample(servers, good, size=10)
+    assert [s.name for s in sample[:2]] == ["S7", "S5"] and len(sample) == 10
+    assert len({s.fingerprint for s in sample}) == 10
+
+
+def test_dead_server_is_replaced_from_a_quick_sample(monkeypatch, tmp_path):
+    monkeypatch.setattr(vpn.config, "VPN_CHECK_GEMINI", False)
+    monkeypatch.setattr(vpn.config, "VPN_EXCLUDE_COUNTRIES", ["RU"])
+    servers = [links.parse_link(f"trojan://p{i}@s{i}.example.com:443?sni=s{i}.example.com#S{i}") for i in range(200)]
+    client = vpn.VPN()
+    client.state = vpn.VpnState(tmp_path / "vpn.json")
+    client.state.load()
+    client.started = True
+    client.servers = {s.fingerprint: s for s in servers}
+    client.current = vpn.ProbeResult(servers[0].fingerprint, "S0", True, 600.0, "FI")
+    client.state.data["good"] = {servers[9].fingerprint: 90}
+    probed, activated = [], []
+
+    async def alive():
+        return False
+
+    async def refresh(force=False):
+        return None
+
+    async def probe(batch):
+        probed.append(len(batch))
+        return {s.fingerprint: vpn.ProbeResult(s.fingerprint, s.name, True, 90.0, "DE") for s in batch if s.name == "S9"}
+
+    async def activate(result):
+        activated.append(result.name)
+        client.current = result
+        return True
+
+    monkeypatch.setattr(client, "_current_alive", alive)
+    monkeypatch.setattr(client, "refresh_servers", refresh)
+    monkeypatch.setattr(client, "probe", probe)
+    monkeypatch.setattr(client, "activate", activate)
+    monkeypatch.setattr(type(client), "ready", property(lambda self: True))
+    asyncio.run(client.recheck(full=True))  # даже если полная проверка «по расписанию» — сначала быстрая замена
+    assert probed == [vpn.QUICK_CHECK_SIZE] and activated == ["S9"]
+    assert client.state.data["last_check"] is None  # полная проверка ещё впереди

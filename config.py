@@ -138,7 +138,7 @@ except ValueError:
 VPN_SWITCH_MIN_GAIN_MS: int = max(0, _env_int("VPN_SWITCH_MIN_GAIN_MS", 150))
 # Сколько серверов проверять одновременно и сколько секунд ждать ответа от каждого.
 VPN_PROBE_CONCURRENCY: int = max(1, _env_int("VPN_PROBE_CONCURRENCY", 8))
-VPN_PROBE_TIMEOUT: int = max(3, _env_int("VPN_PROBE_TIMEOUT", 8))
+VPN_PROBE_TIMEOUT: int = max(3, _env_int("VPN_PROBE_TIMEOUT", 6))
 XRAY_BIN: str = os.getenv("XRAY_BIN", "xray").strip() or "xray"
 
 # Google не пускает к Gemini из России («User location is not supported»). Если есть HTTP-прокси за рубежом,

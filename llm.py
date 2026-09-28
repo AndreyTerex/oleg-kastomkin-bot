@@ -161,7 +161,8 @@ def build_providers() -> list[Provider]:
             # GLM по умолчанию «думает» вслух: для реплик в чате это лишняя задержка.
             options={"thinking": {"type": "disabled"}},
             max_tokens=900,
-            timeout=25.0,
+            # Бесплатный GLM либо отвечает за несколько секунд, либо висит в очереди — ждать 25 с незачем.
+            timeout=12.0,
         ))
     for model in config.TOKENHARBOR_MODELS:
         providers.append(Provider(
