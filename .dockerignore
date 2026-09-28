@@ -8,3 +8,5 @@ __pycache__/
 README.md
 *.zip
 pack_for_friend.*
+tests/
+.github/

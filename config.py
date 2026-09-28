@@ -3,8 +3,19 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import discord
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # без python-dotenv переменные задаются окружением (так работает Docker)
+    load_dotenv = None
+
+# Файл .env рядом с bot.py подхватывается и при запуске без Docker. Уже заданные переменные
+# окружения (например, из docker compose) важнее файла и не перезаписываются.
+if load_dotenv is not None:
+    load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
 
 
 def _env_int(name: str, default: int = 0) -> int:
