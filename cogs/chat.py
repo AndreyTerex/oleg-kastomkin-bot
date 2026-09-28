@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import random
@@ -408,7 +409,7 @@ class Chat(commands.Cog):
             def choose(text: str) -> str | None:
                 return pick_variant(text, allow_skip=allow_skip, avoid_openings=openings)
 
-            async with message.channel.typing():
+            async with typing_if_possible(message.channel):
                 reply = await self.client.complete(
                     persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
                     validate=lambda text: choose(text) is not None,
@@ -783,7 +784,7 @@ class Chat(commands.Cog):
             + f"\n\nПоследнее сообщение написал {message.author.display_name}. Что он просит запомнить и о ком?"
         )
         try:
-            async with message.channel.typing():
+            async with typing_if_possible(message.channel):
                 reply = await self.client.complete(
                     MEMORY_SYSTEM, prompt, temperature=0.2, validate=lambda text: "{" in text, economy=True,
                 )
@@ -1235,6 +1236,22 @@ def strip_leading_name(text: str, member) -> str:
             rest = text[match.end():]
             return rest[:1].lower() + rest[1:] if rest[:1].isupper() and not rest[:2].isupper() else rest
     return text
+
+
+@contextlib.asynccontextmanager
+async def typing_if_possible(channel):
+    """«Олег печатает…», но сбой Discord на этом индикаторе не должен обрывать сам ответ."""
+    indicator = channel.typing()
+    try:
+        await indicator.__aenter__()
+    except discord.HTTPException:
+        log.debug("Не удалось показать «печатает…» в #%s", channel)
+        indicator = None
+    try:
+        yield
+    finally:
+        if indicator is not None:
+            await indicator.__aexit__(None, None, None)
 
 
 def deal_summary(guild: discord.Guild, record: dict) -> str | None:
