@@ -55,12 +55,27 @@ DEFAULT_CHATTY_CHANNELS = ("основной-флуд", "олежа-кастом
 
 NAME = re.compile(r"(?<![\w-])(олег|олеж|кастомкин)\w*", re.IGNORECASE)
 
-HISTORY_LIMIT = 20
+HISTORY_LIMIT = 30
 HISTORY_MAX_AGE = timedelta(hours=6)
 LINE_LIMIT = 300
 # Длинный ответ режется до одной-двух фраз: у модели лучшая мысль обычно в начале, дальше вода.
 REPLY_SOFT_LIMIT = 200
 REPLY_LIMIT = 300
+# На настоящий вопрос ответ может быть длиннее — два-три предложения по делу.
+HELP_SOFT_LIMIT = 320
+HELP_LIMIT = 450
+
+# Настоящий вопрос к Олегу: тогда сначала точный ответ, а шутка — потом.
+HELP_QUESTION = re.compile(
+    r"\?|(?<!\w)(как|что|чем|почему|зачем|сколько|когда|кто|где|куда|какой|какая|какое|какие|каким|чей|"
+    r"можно ли|посоветуй|подскажи|объясни|расскажи|помоги|напомни|покажи|what|how)(?!\w)",
+    re.IGNORECASE,
+)
+STATS_TOPIC = re.compile(r"стат|винрейт|лучш|топ|лидер|побед|рейтинг|сильн|слаб", re.IGNORECASE)
+# Вопрос про то, кто на какой линии, а не про игру на линии («как стоять на миде»).
+LANES_TOPIC = re.compile(
+    r"кто\b.{0,25}(топ|лес|джанг|мид|адк|стрел|сапп?орт|сапп?\b|лини)|какие (линии|роли)|отметил", re.IGNORECASE
+)
 # Не больше стольких ответов за окно в одном канале — иначе Олег перетягивает весь чат на себя.
 BURST_LIMIT = 6
 BURST_WINDOW = 2 * 60
@@ -377,7 +392,8 @@ class Chat(commands.Cog):
             # Каждый раз новый типаж, два одинаковых подряд не выпадают; подходящий к разговору — чаще.
             mood = pick_mood(message.content, state.last_mood)
             state.last_mood = mood[0]
-            prompt, openings = await self.build_prompt(message, called=called, mood=mood)
+            help_mode = called and is_help_question(message.content)
+            prompt, openings = await self.build_prompt(message, called=called, mood=mood, help_mode=help_mode)
             allow_skip = not called
 
             def choose(text: str) -> str | None:
@@ -395,7 +411,8 @@ class Chat(commands.Cog):
                 state.answers.append(state.last_spoke)
                 log.info("Олег выполнил по подсказке модели: %s (%s)", action, reply.model)
                 return
-            text, state.last_tail = tidy_tail(clean_reply(choose(reply.text) or ""), state.last_tail)
+            limits = {"soft_limit": HELP_SOFT_LIMIT, "hard_limit": HELP_LIMIT} if help_mode else {}
+            text, state.last_tail = tidy_tail(clean_reply(choose(reply.text) or "", **limits), state.last_tail)
             if not text:
                 if allow_skip:
                     # Модель решила промолчать — следующую попытку встрять откладываем, но не на весь кулдаун.
@@ -434,7 +451,8 @@ class Chat(commands.Cog):
                 self.sleep_announced = False
 
     async def build_prompt(
-        self, message: discord.Message, *, called: bool, mood: tuple[str, str] | None = None
+        self, message: discord.Message, *, called: bool, mood: tuple[str, str] | None = None,
+        help_mode: bool = False,
     ) -> tuple[str, set[str]]:
         """Запрос к модели по секциям и начала последних реплик Олега, которые не стоит повторять."""
         lines, speakers = await self.collect_history(message)
@@ -458,10 +476,17 @@ class Chat(commands.Cog):
             memories.append(f"- {fact}")
 
         recent_text = " ".join(line for line in lines[-8:])
-        if LOBBY_TOPIC.search(recent_text):
+        if help_mode or LOBBY_TOPIC.search(recent_text):
             lobby = self.lobby_summary(message.guild)
             if lobby:
                 facts.append(lobby)
+        if help_mode:
+            # На вопросы — знания о боте и сервере, чтобы отвечать фактами, а не догадками.
+            facts.append(self.commands_summary(message.guild))
+            if STATS_TOPIC.search(message.content):
+                facts.append(self.leaderboard_summary(message.guild))
+            if LANES_TOPIC.search(message.content):
+                facts.append(self.lanes_summary(message.guild))
         optout_names = [
             one_line(member.display_name)
             for user_id in self.store.data.get("optout", [])
@@ -473,7 +498,9 @@ class Chat(commands.Cog):
         own = [line.split(": ", 1)[1] for line in lines if is_own_line(line)][-5:]
         openings = {opening(text) for text in own if opening(text)}
 
-        if called:
+        if help_mode:
+            task = persona.TASK_HELP.format(name=one_line(message.author.display_name))
+        elif called:
             length = persona.LENGTH_SHORT if len(message.content) < 25 else persona.LENGTH_NORMAL
             task = persona.TASK_CALLED.format(name=one_line(message.author.display_name), length=length)
         else:
@@ -797,6 +824,39 @@ class Chat(commands.Cog):
                 return member
         return None
 
+    def commands_summary(self, guild: discord.Guild) -> str:
+        """Слэш-команды бота прямо из кода — поэтому список всегда актуальный."""
+        commands_list = self.bot.tree.get_commands(guild=guild) or self.bot.tree.get_commands()
+        lines = [
+            f"/{command.name} — {command.description}"
+            for command in sorted(commands_list, key=lambda c: c.name)
+            if isinstance(command, app_commands.Command)
+        ]
+        return "Команды бота:\n" + "\n".join(lines) if lines else "Список команд бота сейчас недоступен."
+
+    def leaderboard_summary(self, guild: discord.Guild) -> str:
+        stats_cog = self.bot.get_cog("Stats")
+        if stats_cog is None:
+            return "Статистика каток сейчас недоступна."
+        ranking = stats_cog.ranking(guild.id)
+        games = stats_cog.stats.games_count(guild.id)
+        if not ranking:
+            return f"Статистика каток: отмечено каток — {games}, для таблицы лидеров пока мало данных (нужно от 3 каток на игрока)."
+        lines = []
+        for place, (user_id, record) in enumerate(ranking[:5], start=1):
+            member = guild.get_member(user_id)
+            lines.append(f"{place}. {one_line(member.display_name) if member else user_id} — {record.describe()}")
+        return f"Таблица лидеров кастомок (всего отмечено каток: {games}):\n" + "\n".join(lines)
+
+    def lanes_summary(self, guild: discord.Guild) -> str:
+        lines = []
+        for lane in config.LANES:
+            role = guild.get_role(lane.role_id)
+            members = [one_line(m.display_name) for m in (role.members if role else []) if not m.bot]
+            shown = ", ".join(members[:12]) + (f" и ещё {len(members) - 12}" if len(members) > 12 else "")
+            lines.append(f"{lane.label} ({lane.title}): {shown or 'никто не отметил'}")
+        return "Кто какие линии отметил на сервере:\n" + "\n".join(lines)
+
     def lobby_summary(self, guild: discord.Guild) -> str | None:
         lobby_cog = self.bot.get_cog("Lobby")
         if lobby_cog is None:
@@ -1077,6 +1137,11 @@ def pick_variant(text: str, *, allow_skip: bool = False, avoid_openings: set[str
         return None
     text = text.strip()
     return text if text and acceptable_reply(text) else None
+
+
+def is_help_question(text: str) -> bool:
+    """Настоящий вопрос, а не просто зов («Олег, привет») — на него сначала ответ по делу."""
+    return bool(HELP_QUESTION.search(NAME.sub(" ", text)))
 
 
 def opening(text: str) -> str:

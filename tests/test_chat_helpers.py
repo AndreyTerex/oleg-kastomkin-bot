@@ -139,3 +139,49 @@ def test_roast_prompt_hides_tiny_stats():
     interaction = NS(guild=NS(id=1), user=NS(id=7, display_name="Вася"), channel=NS(history=history))
     prompt = asyncio.run(cog.build_roast_prompt(interaction, NS(id=7, display_name="Вася", roles=[])))
     assert "Статистика" not in prompt and "катк" not in prompt
+
+
+def test_is_help_question():
+    assert chat.is_help_question("Олег, как контрить Зеда?")
+    assert chat.is_help_question("олег сколько человек записалось")
+    assert chat.is_help_question("Олег, что ты умеешь")
+    assert not chat.is_help_question("Олег, привет")
+    assert not chat.is_help_question("олег ты лучший")
+
+
+def test_knowledge_summaries():
+    from types import SimpleNamespace as NS
+
+    from discord import app_commands
+
+    import config
+    from stats import Record
+
+    @app_commands.command(name="custom", description="Объявить сбор на кастомку")
+    async def custom(interaction):
+        pass
+
+    mid = config.LANE_BY_KEY["mid"]
+    vasya = NS(id=1, display_name="Вася", bot=False)
+    guild = NS(
+        id=5,
+        get_member=lambda user_id: vasya if user_id == 1 else None,
+        get_role=lambda role_id: NS(members=[vasya]) if role_id == mid.role_id else None,
+    )
+    stats_cog = NS(ranking=lambda guild_id: [(1, Record(7, 3))], stats=NS(games_count=lambda guild_id: 12))
+    cog = chat.Chat.__new__(chat.Chat)
+    cog.bot = NS(
+        tree=NS(get_commands=lambda guild=None: [custom]),
+        get_cog=lambda name: stats_cog,
+    )
+    assert "/custom — Объявить сбор на кастомку" in cog.commands_summary(guild)
+    board = cog.leaderboard_summary(guild)
+    assert "всего отмечено каток: 12" in board and "1. Вася — 10 каток, 7 побед (70%)" in board
+    lanes = cog.lanes_summary(guild)
+    assert "Mid (Мид): Вася" in lanes and "Top (Топ): никто не отметил" in lanes
+
+
+def test_lanes_topic_only_for_who_questions():
+    assert chat.LANES_TOPIC.search("Олег, кто у нас играет на миде?")
+    assert chat.LANES_TOPIC.search("какие линии у Васи")
+    assert not chat.LANES_TOPIC.search("Олег, как контрить ясуо на миде?")
