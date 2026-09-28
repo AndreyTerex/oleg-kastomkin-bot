@@ -80,9 +80,21 @@ GEMINI_MODELS: list[str] = [
     if model.strip()
 ]
 
+# VPN для нейросетей, закрытых из России (см. vpn.py): подписка и/или ключи vless://, trojan://, vmess://.
+# Бот сам запускает Xray как локальный прокси и ходит через него только к провайдерам из LLM_PROXY_FOR.
+VPN_SUBSCRIPTION: str = os.getenv("VPN_SUBSCRIPTION", "").strip()
+VPN_URL: str = os.getenv("VPN_URL", "").strip()
+# Необязательно: брать только серверы, в названии которых есть это (регулярное выражение), например «DE|NL|Finland».
+VPN_FILTER: str = os.getenv("VPN_FILTER", "").strip()
+VPN_PORT: int = _env_int("VPN_PORT", 10809)
+XRAY_BIN: str = os.getenv("XRAY_BIN", "xray").strip() or "xray"
+
 # Google не пускает к Gemini из России («User location is not supported»). Если есть HTTP-прокси за рубежом,
-# укажите его: http://логин:пароль@адрес:порт. Через прокси ходят только провайдеры из LLM_PROXY_FOR.
-LLM_PROXY: str = os.getenv("LLM_PROXY", "").strip()
+# укажите его: http://логин:пароль@адрес:порт. С VPN_SUBSCRIPTION / VPN_URL прокси подставляется сам.
+# Через прокси ходят только провайдеры из LLM_PROXY_FOR.
+LLM_PROXY: str = os.getenv("LLM_PROXY", "").strip() or (
+    f"http://127.0.0.1:{VPN_PORT}" if (VPN_SUBSCRIPTION or VPN_URL) else ""
+)
 LLM_PROXY_FOR: list[str] = [
     name.strip().lower() for name in os.getenv("LLM_PROXY_FOR", "gemini").split(",") if name.strip()
 ]
