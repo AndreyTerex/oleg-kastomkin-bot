@@ -134,8 +134,9 @@ LLM_OVERLOAD_RETRIES: int = max(0, _env_int("LLM_OVERLOAD_RETRIES", 3))
 LLM_PROXY_FOR: list[str] = [
     name.strip().lower() for name in os.getenv("LLM_PROXY_FOR", "all").split(",") if name.strip()
 ]
-# Discord тоже через VPN (если он задан). VPN_FOR_DISCORD=0 — Discord напрямую.
-VPN_FOR_DISCORD: bool = os.getenv("VPN_FOR_DISCORD", "1").strip().lower() not in ("0", "false", "no", "off", "нет")
+# Discord через VPN (VPN_FOR_DISCORD=1). По умолчанию напрямую: через нестабильный VPN-сервер соединение
+# с Discord рвалось, и нажатия кнопок в это время пропадали («Приложение не ответило вовремя»).
+VPN_FOR_DISCORD: bool = os.getenv("VPN_FOR_DISCORD", "0").strip().lower() not in ("0", "false", "no", "off", "нет")
 
 # Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Первым — Gemini (самые сильные
 # бесплатные модели), за ним Groq с большим лимитом (около 1000 ответов в день), остальные — в запасе.
