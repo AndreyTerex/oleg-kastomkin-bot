@@ -1,6 +1,6 @@
 """/oleg-vpn — состояние VPN бота (Discord и нейросети): какой сервер выбран и перевыбор по кнопке.
 
-Только для тех, у кого есть «Управлять сервером», и ответ виден лишь вызвавшему.
+Только для администраторов сервера, и ответ виден лишь вызвавшему.
 Адресов, ключей и ссылки подписки здесь нет — только название сервера, страна и задержка.
 """
 from __future__ import annotations
@@ -57,8 +57,8 @@ class RecheckView(discord.ui.View):
 
     @discord.ui.button(label="Перевыбрать сейчас", emoji="🔄", style=discord.ButtonStyle.primary)
     async def recheck(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("Нужно право «Управлять сервером».", ephemeral=True)
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Команда только для администраторов сервера.", ephemeral=True)
             return
         if not VPN_CLIENT.started:
             await interaction.response.send_message("VPN не запущен — смотрите логи бота.", ephemeral=True)
@@ -81,11 +81,11 @@ class VpnAdmin(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="oleg-vpn", description="Какой VPN-сервер сейчас у нейросетей Олега")
-    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.default_permissions(administrator=True)
     @app_commands.guild_only()
     async def vpn_status(self, interaction: discord.Interaction) -> None:
-        if not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("Нужно право «Управлять сервером».", ephemeral=True)
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Команда только для администраторов сервера.", ephemeral=True)
             return
         status = VPN_CLIENT.status()
         view = RecheckView() if status["enabled"] else None
