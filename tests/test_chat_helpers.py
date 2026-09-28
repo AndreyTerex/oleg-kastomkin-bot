@@ -191,3 +191,10 @@ def test_persona_is_about_baiting_not_jokes():
     assert "байт" in persona.PERSONA and "не шути ради шутки" in persona.PERSONA
     # Границы троллинга на месте.
     assert "никогда про внешность" in persona.PERSONA and "не добивай одного человека" in persona.PERSONA
+
+
+def test_clean_reply_keeps_inner_quotes():
+    text = "«Набирайте тех же» — классика того, кто боится замены"
+    assert chat.clean_reply(text) == text
+    assert chat.clean_reply("«Весь ответ в кавычках»") == "Весь ответ в кавычках"
+    assert chat.clean_reply('"просто текст"') == "просто текст"

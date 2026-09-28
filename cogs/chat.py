@@ -1211,7 +1211,12 @@ def acceptable_reply(text: str) -> bool:
 def clean_reply(text: str, *, soft_limit: int = REPLY_SOFT_LIMIT, hard_limit: int = REPLY_LIMIT) -> str:
     """Приводит ответ модели к реплике в чате: одним абзацем, без «Олег:», пингов и простыней."""
     text = INVISIBLE.sub("", text)
-    text = " ".join(text.split()).strip("«»\" ")
+    text = " ".join(text.split()).strip()
+    # Кавычки снимаем, только если в них обёрнут весь ответ: иначе обрываем цитату внутри («Набирайте тех же» → …»).
+    for left, right in (("«", "»"), ('"', '"'), ("“", "”")):
+        wrapped = text.count(left) == (2 if left == right else 1)
+        if len(text) > 1 and text.startswith(left) and text.endswith(right) and wrapped:
+            text = text[1:-1].strip()
     text = re.sub(r"^(олег(\s+кастомкин)?\s*(\(ты\))?\s*:)\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"@(everyone|here)", r"\1", text, flags=re.IGNORECASE)
     if len(text) > soft_limit:
