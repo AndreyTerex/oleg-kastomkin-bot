@@ -140,13 +140,21 @@ def set_waiting(record: dict, user_id: int, waiting: bool) -> None:
         queue.append(user_id)
 
 
-def progress_bar(done: int, total: int, width: int = 10) -> str:
-    """Полоска набора: «🟩🟩🟩⬜⬜». При большом сборе клетка — несколько игроков."""
+# Запасных в полоске не больше стольких клеток, чтобы строка не уезжала за край.
+SUB_CELLS_LIMIT = 5
+
+
+def progress_bar(done: int, total: int, width: int = 10, subs: int = 0) -> str:
+    """Полоска набора: «🟩🟩🟩⬜⬜🟨» — состав, свободные места и запасные в конце.
+
+    При большом сборе клетка — несколько игроков, запасные считаются в том же масштабе.
+    """
     if total <= 0:
         return ""
     cells = min(total, width)
     filled = min(cells, round(done * cells / total))
-    return "🟩" * filled + "⬜" * (cells - filled)
+    sub_cells = min(SUB_CELLS_LIMIT, max(1 if subs else 0, round(subs * cells / total)))
+    return "🟩" * filled + "⬜" * (cells - filled) + "🟨" * sub_cells
 
 
 class LobbyView(discord.ui.View):
@@ -1471,7 +1479,10 @@ class Lobby(commands.Cog):
                 if status == STATUS_IN:
                     embed.add_field(
                         name=f"{heading} {len(members)}/{target}",
-                        value=f"{progress_bar(len(members), target)}\n{format_players(members)}",
+                        value=(
+                            f"{progress_bar(len(members), target, subs=len(record[STATUS_SUB]))}\n"
+                            f"{format_players(members)}"
+                        ),
                         inline=False,
                     )
                 else:
