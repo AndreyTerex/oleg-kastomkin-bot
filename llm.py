@@ -139,7 +139,8 @@ def build_providers() -> list[Provider]:
             # Немного размышлений улучшает шутки, но всё сверх этого — только задержка.
             options={"reasoning_effort": "low"},
             max_tokens=1500,  # вместе с размышлениями
-            timeout=25.0,
+            # Flash отвечает за несколько секунд; дольше — почти всегда тормозит VPN, ждать 25 с незачем.
+            timeout=18.0,
             scarce=is_scarce_gemini(model),
         ))
     for model in config.PUTER_MODELS:
@@ -434,8 +435,9 @@ class LLMClient:
                     return error_text
         except (aiohttp.ClientError, TimeoutError, ValueError) as error:
             if proxy == config.VPN_PROXY_URL and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
-                # Прокси не довёз запрос — следующие модели пойдут напрямую, а VPN сразу перепроверит серверы.
-                VPN_CLIENT.report_failure(connection=isinstance(error, aiohttp.ClientConnectionError))
+                # Прокси не довёз запрос или тянул его дольше таймаута — сервер VPN сбоит: следующие модели
+                # пойдут напрямую (или подождут, если без VPN не работают), а VPN сразу перепроверит серверы.
+                VPN_CLIENT.report_failure(connection=True)
             pause = TIMEOUT_PAUSE if isinstance(error, TimeoutError) else ERROR_PAUSE
             self._blocked_until[provider.label] = time.time() + pause
             self._blocked_daily[provider.label] = False

@@ -220,6 +220,8 @@ class Chat(commands.Cog):
         if message.type not in (discord.MessageType.default, discord.MessageType.reply):
             return
         if self.mode_for(message.channel) == MODE_OFF:
+            if NAME.search(message.content or ""):
+                log.info("Олега позвали в #%s, но там он выключен (/oleg-mode)", message.channel)
             return
 
         self.check_content_access(message)
@@ -240,6 +242,9 @@ class Chat(commands.Cog):
                 return
 
         if not self.client.enabled or self.is_quiet(message.channel.id):
+            if called:
+                log.info("Олега позвали в #%s, но он молчит (%s)", message.channel,
+                         "нет ключей нейросетей" if not self.client.enabled else "/oleg-quiet")
             return
         mode = self.mode_for(message.channel)
         state = self.state(message.channel.id)
@@ -368,6 +373,8 @@ class Chat(commands.Cog):
         now = time.time()
         # Где писать нельзя, туда и не сочиняем — иначе лимит Groq уйдёт впустую.
         if not message.channel.permissions_for(message.guild.me).send_messages:
+            if called:
+                log.info("Олега позвали в #%s, но у него нет права писать там", message.channel)
             return
         if now < self.sleep_until:
             if called:

@@ -242,6 +242,7 @@ tokens → Tokens (classic), право `read:packages`). Другой вари�
 | Логи бота | `docker compose logs -f bot` |
 | Логи автообновления | `docker compose logs -f watchtower` |
 | Перезапустить | `docker compose restart bot` |
+| Применить изменения в `.env` | `docker compose up -d` — `.env` читается только при создании контейнера, простой перезапуск (и кнопка Restart в Docker Desktop) новые ключи не подхватит |
 | Выключить | `docker compose down` |
 
 ## Запуск без Docker
