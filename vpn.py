@@ -553,6 +553,11 @@ class VPN:
     # --- перепроверка
 
     @property
+    def broken(self) -> bool:
+        """Xray запущен, но сервер только что уронил соединение — ждём, пока проверка найдёт рабочий."""
+        return self.ready and time.time() < self.broken_until
+
+    @property
     def healthy(self) -> bool:
         """Через прокси можно ходить: Xray запущен и недавно не ронял соединения."""
         return self.ready and time.time() >= self.broken_until

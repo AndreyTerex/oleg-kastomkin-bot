@@ -208,12 +208,14 @@ def test_broken_vpn_sends_next_models_direct(monkeypatch):
 
     class FakeVpn:
         healthy = True
+        broken = False
         reports = []
 
         def report_failure(self, **kwargs):
             self.reports.append(kwargs)
             if kwargs.get("connection"):
                 self.healthy = False
+                self.broken = True
 
     fake = FakeVpn()
     monkeypatch.setattr(llm, "VPN_CLIENT", fake)
@@ -239,11 +241,14 @@ def test_broken_vpn_sends_next_models_direct(monkeypatch):
 
     chain = [
         Provider(name="gemini", url="u", api_key="k", model="gemini-3.8-flash", proxy=vpn_url, scarce=True),
+        Provider(name="gemini", url="u", api_key="k", model="gemini-3.5-flash-lite", proxy=vpn_url),
         Provider(name="groq", url="u", api_key="k", model="oss", proxy=vpn_url),
     ]
     client = llm.LLMClient(chain)
     client._session = Session()
     reply = asyncio.run(client.complete("s", "u"))
     assert reply.text == "ответ напрямую" and reply.model == "groq:oss"
-    assert client._session.proxies == [vpn_url, None]  # Groq уже без прокси, без ожидания таймаутов
+    # Вторую Gemini напрямую не спрашиваем (из России не пустят), Groq — уже без прокси, без таймаутов.
+    assert client._session.proxies == [vpn_url, None]
+    assert "gemini:gemini-3.5-flash-lite" not in client._blocked_until  # и не отключаем её надолго
     assert fake.reports == [{"connection": True}]
