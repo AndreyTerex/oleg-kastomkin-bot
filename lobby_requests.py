@@ -24,7 +24,8 @@ REMOVE_VERB = re.compile(r"(?<!\w)(убери|выкинь|удали|вычер
 CONTEXT = re.compile(r"состав|запас|сбор|кастомк|скрим|играющ|основн|старт|лобби|список", re.IGNORECASE)
 # Куда: «в запас(ные)», «в (основной) состав», «в игру», «в старт».
 TO_SUB = re.compile(r"(?<!\w)(в|во)\s+(\w+\s+)?запас", re.IGNORECASE)
-TO_IN = re.compile(r"(?<!\w)в\s+(основ|состав|игр|старт|играющ)", re.IGNORECASE)
+# «в составе» — это вопрос «кто в составе?», а не просьба; поэтому «состав» без «е» на конце.
+TO_IN = re.compile(r"(?<!\w)в\s+(основ|состав(?!е)|игр|старт|играющ)", re.IGNORECASE)
 FROM_LOBBY = re.compile(r"(?<!\w)из\s+(сбора|кастомк\w*|скрима|списка|лобби|состава)", re.IGNORECASE)
 SELF = re.compile(r"(?<!\w)(меня|себя|мне|себе)(?!\w)", re.IGNORECASE)
 MENTION = re.compile(r"<@[!&]?\d+>")
@@ -38,8 +39,9 @@ TRANSLIT = str.maketrans({
 })
 # Латинские буквы, которые по-русски пишут иначе: kataz → «катаз», x → «кс».
 LATIN_SOUNDS = str.maketrans({"x": "ks", "w": "v", "q": "k", "j": "zh"})
-# Падежные окончания: «катаза», «катазу», «катазом».
+# Падежные окончания: «катаза», «катазу», «катазом», «анорию» (у Anoria окончание съедает «а»).
 MAX_ENDING = 3
+VOWELS = "aeiouy"
 
 
 @dataclass
@@ -75,6 +77,10 @@ def matches(word: str, member: discord.Member) -> bool:
     for name in name_keys(member):
         if key == name or (key.startswith(name) and len(key) - len(name) <= MAX_ENDING):
             return True
+        # Ник на гласную склоняется со сменой окончания: Anoria → «Анорию», «Анории».
+        stem = name.rstrip(VOWELS)
+        if len(stem) >= 3 and stem != name and key.startswith(stem) and len(key) - len(stem) <= MAX_ENDING:
+            return True
         # «кат» → «kataz»: короткое прозвище в начале ника тоже годится, если не меньше 4 букв.
         if len(key) >= 4 and name.startswith(key):
             return True
@@ -86,7 +92,11 @@ def parse(
 ) -> LobbyRequest | None:
     """None — это не просьба про состав сбора."""
     text = MENTION.sub(" ", message.content)
-    if not VERB.search(text) or not CONTEXT.search(text):
+    has_verb = bool(VERB.search(text))
+    if not CONTEXT.search(text):
+        return None
+    # Без глагола («Олег, Anoria в запас») — только если сказано, куда, и это не вопрос.
+    if not has_verb and ("?" in text or not (TO_SUB.search(text) or TO_IN.search(text))):
         return None
 
     # Сначала «куда»: «убери из состава в запас» — это перевод в запас, а не удаление.
@@ -116,4 +126,7 @@ def parse(
         replied = getattr(message.reference.resolved, "author", None)
         if isinstance(replied, discord.Member) and not replied.bot:
             request.targets = [replied]
+    # Без глагола и без понятно кого — скорее всего, это обычная реплика, пусть ответит Олег.
+    if not has_verb and not request.targets:
+        return None
     return request

@@ -12,7 +12,8 @@ def member(user_id, display, name=None):
 KATAZ = member(1, "kataz")
 KEKS = member(2, "Кексик Шмексик (ИТАЛЯ)", "keks")
 FOXY = member(3, "Føxý (Дениска)", "foxy")
-PEOPLE = [KATAZ, KEKS, FOXY]
+ANORIA = member(4, "Anoria")
+PEOPLE = [KATAZ, KEKS, FOXY, ANORIA]
 
 
 def message(text, author=KEKS, mentions=(), reference=None):
@@ -55,3 +56,18 @@ def test_not_about_lobby():
 def test_unknown_name_gives_no_targets_but_is_a_request():
     request = parse("Олег, переведи васю в основной состав")
     assert request is not None and request.targets == []
+
+
+def test_name_with_changed_ending():
+    request = parse("Олег переведи анорию в запасные", author=KATAZ)
+    assert request.status == lr.STATUS_SUB and request.targets == [ANORIA]
+    assert parse("Олег, верни анории место в основном составе").targets == [ANORIA]
+
+
+def test_request_without_verb():
+    request = parse("олег Anoria в запас", author=KATAZ)
+    assert request.status == lr.STATUS_SUB and request.targets == [ANORIA]
+    assert parse("олег катаз в основной состав").targets == [KATAZ]
+    # Вопросы и реплики без «кого» — это не просьба, пусть отвечает Олег.
+    assert parse("Олег, кто в составе?") is None
+    assert parse("Олег, а ты в игру вообще пойдёшь") is None
