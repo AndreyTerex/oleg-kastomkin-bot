@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 import aiohttp
@@ -21,6 +21,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
 TOKENHARBOR_URL = "https://tokenharbor.ai/v1/chat/completions"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 # Если модель зависла или недоступна, какое-то время сразу идём к следующей,
 # чтобы чат не ждал по минуте на каждом сообщении.
@@ -47,6 +48,21 @@ GROQ_OPTIONS = {
 }
 
 _RETRY_RE = re.compile(r"try again in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s")
+# Google кладёт паузу в подробности ошибки: "retryDelay": "48s".
+_RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*:\s*['\"]([\d.]+)s")
+# Сбои на стороне провайдера («модель перегружена») — пропускаем его ненадолго.
+OVERLOAD_PAUSE = 60.0
+# Провайдер не работает в стране, откуда идёт запрос (Gemini из России), — не дёргаем его часами.
+REGION_PAUSE = 6 * 3600.0
+_REGION_RE = re.compile(
+    r"location is not supported|not available in your (country|region)|unsupported_country|region is not supported",
+    re.IGNORECASE,
+)
+
+
+def is_region_block(status: int, text: str) -> bool:
+    """Отказ по стране: Google отвечает 400 FAILED_PRECONDITION «User location is not supported»."""
+    return status in (400, 403, 451) and bool(_REGION_RE.search(text))
 
 
 @dataclass(frozen=True)
@@ -59,6 +75,7 @@ class Provider:
     max_tokens_field: str = "max_tokens"
     max_tokens: int = 900
     timeout: float = 30.0
+    proxy: str | None = None
 
     @property
     def label(self) -> str:
@@ -84,6 +101,17 @@ class LLMUnavailable(Exception):
 def build_providers() -> list[Provider]:
     """Цепочка провайдеров в порядке LLM_ORDER (по умолчанию Groq → остальные)."""
     providers: list[Provider] = []
+    for model in config.GEMINI_MODELS:
+        providers.append(Provider(
+            name="gemini",
+            url=GEMINI_URL,
+            api_key=config.GEMINI_API_KEY,
+            model=model,
+            # Немного размышлений улучшает шутки, но всё сверх этого — только задержка.
+            options={"reasoning_effort": "low"},
+            max_tokens=1500,  # вместе с размышлениями
+            timeout=25.0,
+        ))
     for model in config.TOKENHARBOR_MODELS:
         providers.append(Provider(
             name="tokenharbor",
@@ -122,6 +150,11 @@ def build_providers() -> list[Provider]:
             options=options,
             max_tokens_field="max_completion_tokens",
         ))
+    if config.LLM_PROXY:
+        providers = [
+            replace(provider, proxy=config.LLM_PROXY) if provider.name in config.LLM_PROXY_FOR else provider
+            for provider in providers
+        ]
     return order_providers([provider for provider in providers if provider.api_key], config.LLM_ORDER)
 
 
@@ -138,6 +171,9 @@ def _rate_limit_wait(message: str, headers, daily: bool) -> float:
             return float(retry)
         except ValueError:
             pass
+    delay = _RETRY_DELAY_RE.search(message)
+    if delay:
+        return float(delay.group(1))
     match = _RETRY_RE.search(message)
     if match:
         hours, minutes, seconds = match.groups()
@@ -193,19 +229,29 @@ class LLMClient:
             headers = {"Authorization": f"Bearer {provider.api_key}", "X-Title": "Oleg Kastomkin"}
             try:
                 async with self._session.post(
-                    provider.url, json=body, headers=headers,
+                    provider.url, json=body, headers=headers, proxy=provider.proxy,
                     timeout=aiohttp.ClientTimeout(total=provider.timeout),
                 ) as response:
                     payload = await response.json(content_type=None)
+                    if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
+                        # Google отдаёт ошибки списком из одного объекта.
+                        payload = payload[0]
                     if not isinstance(payload, dict):
                         # Прокси и балансировщики иногда отдают строку или список вместо объекта.
                         payload = {"error": {"message": str(payload)[:300]}}
                     if response.status == 429:
                         # Обычно ошибка лежит в error, у некоторых провайдеров — прямо в корне ответа.
                         error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
-                        message = f"{error.get('message', '')} {(error.get('metadata') or {}).get('raw', '')}"
-                        daily = bool(re.search(r"per[ -]day|month|week|7-day|allowance|quota", message, re.IGNORECASE))
+                        message = (
+                            f"{error.get('message', '')} {(error.get('metadata') or {}).get('raw', '')} "
+                            f"{error.get('details', '')}"
+                        )
+                        daily = bool(re.search(
+                            r"per[ _-]?day|month|week|7-day|allowance|quota", message, re.IGNORECASE
+                        ))
                         wait = _rate_limit_wait(message, response.headers, daily)
+                        # Короткая пауза — это поминутный лимит, даже если в тексте есть слово «quota».
+                        daily = daily and wait >= 3600
                         log.warning(
                             "Лимит %s (%s), пауза %.0f с",
                             provider.label, "суточный" if daily else "временный", wait,
@@ -221,6 +267,27 @@ class LLMClient:
                             "%s: кончились бесплатные кредиты (HTTP 402), пропускаем его %.0f ч",
                             provider.label, QUOTA_PAUSE / 3600,
                         )
+                        continue
+                    if is_region_block(response.status, str(payload)):
+                        # Все модели этого провайдера недоступны из этой страны — отключаем их разом.
+                        until = time.time() + REGION_PAUSE
+                        for other in self.providers:
+                            if other.name == provider.name:
+                                self._blocked_until[other.label] = until
+                                self._blocked_daily[other.label] = False
+                        last_error = f"{provider.name}: недоступен из этой страны"
+                        log.warning(
+                            "%s не работает из вашей страны (%s). Отключаю его на %.0f ч — отвечают другие модели. "
+                            "Чтобы он заработал, укажите в .env LLM_PROXY (HTTP-прокси за рубежом).",
+                            provider.name, str(payload)[:120], REGION_PAUSE / 3600,
+                        )
+                        continue
+                    if response.status in (500, 502, 503, 504):
+                        # «Модель перегружена» — временно: пропускаем её минуту и спрашиваем следующую.
+                        self._blocked_until[provider.label] = time.time() + OVERLOAD_PAUSE
+                        self._blocked_daily[provider.label] = False
+                        last_error = f"{provider.label}: HTTP {response.status}"
+                        log.warning("%s перегружен (HTTP %s), пропускаем %.0f с", provider.label, response.status, OVERLOAD_PAUSE)
                         continue
                     if response.status >= 400:
                         last_error = f"{provider.label}: HTTP {response.status}"

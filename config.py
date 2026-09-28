@@ -71,12 +71,27 @@ HF_MODELS: list[str] = [
     if model.strip()
 ]
 
-# Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Первым — Groq с самым большим
-# бесплатным лимитом (около 1000 ответов в день), чтобы Олег весь день отвечал одной сильной моделью,
-# а не прыгал между ними. Провайдеры с маленькими лимитами — в запасе.
+# Ключ Google AI Studio (aistudio.google.com → Get API key): бесплатные Gemini Flash — лучшие из бесплатных
+# по-русски. Модели по порядку: самая сильная Flash, при перегрузке — следующая.
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODELS: list[str] = [
+    model.strip()
+    for model in os.getenv("GEMINI_MODELS", "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite").split(",")
+    if model.strip()
+]
+
+# Google не пускает к Gemini из России («User location is not supported»). Если есть HTTP-прокси за рубежом,
+# укажите его: http://логин:пароль@адрес:порт. Через прокси ходят только провайдеры из LLM_PROXY_FOR.
+LLM_PROXY: str = os.getenv("LLM_PROXY", "").strip()
+LLM_PROXY_FOR: list[str] = [
+    name.strip().lower() for name in os.getenv("LLM_PROXY_FOR", "gemini").split(",") if name.strip()
+]
+
+# Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Первым — Gemini (самые сильные
+# бесплатные модели), за ним Groq с большим лимитом (около 1000 ответов в день), остальные — в запасе.
 LLM_ORDER: list[str] = [
     name.strip().lower()
-    for name in os.getenv("LLM_ORDER", "groq,tokenharbor,openrouter,huggingface").split(",")
+    for name in os.getenv("LLM_ORDER", "gemini,groq,tokenharbor,openrouter,huggingface").split(",")
     if name.strip()
 ]
 
