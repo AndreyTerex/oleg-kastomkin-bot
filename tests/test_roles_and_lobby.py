@@ -200,3 +200,28 @@ def test_result_buttons_stay_open_between_games():
     # До деления на команды кнопок побед в посте нет вовсе.
     states = asyncio.run(buttons(_record()))
     assert lobby.CUSTOM_ID_WIN_BLUE not in states
+
+
+def test_restart_skips_posts_that_already_look_right():
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    import discord
+
+    async def build():
+        record = {"kind": "custom", "target": 10, "time": "20:00", "captains": [], "teams": [],
+                  lobby.STATUS_IN: [], lobby.STATUS_SUB: [], lobby.STATUS_OUT: []}
+        cog = lobby.Lobby.__new__(lobby.Lobby)
+        guild = NS(get_member=lambda i: None)
+        embed, view = cog.build_embed(guild, record), lobby.LobbyView(record)
+        # Так пост возвращается от Discord: эмбед и кнопки заново собраны из JSON.
+        shown = NS(
+            embeds=[discord.Embed.from_dict(embed.to_dict())],
+            components=[discord.components.ActionRow(row) for row in view.to_components()],
+        )
+        assert lobby.same_render(shown, embed, view)
+        record[lobby.STATUS_IN].append(1)
+        changed = cog.build_embed(NS(get_member=lambda i: NS(id=1, mention="<@1>", roles=[])), record)
+        assert not lobby.same_render(shown, changed, view)
+
+    asyncio.run(build())

@@ -195,6 +195,11 @@ def test_switch_only_when_notably_faster():
     gone = {"new": result("new", 300)}
     assert vpn.choose("cur", gone, EXCLUDED, 0.3).fingerprint == "new"      # текущего нет в подписке
     assert vpn.choose("cur", {"x": result("x", 10, "RU")}, EXCLUDED, 0.3) is None
+    # 35% быстрее, но всего на 35 мс — ради этого Discord не переподключаем.
+    assert vpn.choose("cur", faster, EXCLUDED, 0.3, min_gain_ms=150).fingerprint == "cur"
+    far = {"cur": result("cur", 400), "new": result("new", 120)}
+    assert vpn.choose("cur", far, EXCLUDED, 0.3, min_gain_ms=150).fingerprint == "new"
+    assert vpn.choose("cur", broken, EXCLUDED, 0.3, min_gain_ms=150).fingerprint == "new"
 
 
 # --- data/vpn.json -------------------------------------------------------------------

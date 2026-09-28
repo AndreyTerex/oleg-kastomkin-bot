@@ -202,6 +202,33 @@ def slot_columns(members, target: int, heading: str) -> list[tuple[str, str]]:
     return [(heading, "\n".join(lines[:half])), ("\u200b", "\n".join(lines[half:]))]
 
 
+def embed_key(embed: discord.Embed) -> tuple:
+    """То, что видно в карточке, — для сравнения показанного поста с новой отрисовкой."""
+    return (
+        embed.title or None,
+        embed.description or None,
+        embed.color.value if embed.color else None,
+        tuple((field.name, field.value, bool(field.inline)) for field in embed.fields),
+        embed.footer.text or None,
+        int(embed.timestamp.timestamp()) if embed.timestamp else None,
+    )
+
+
+def buttons_key(items) -> list[tuple]:
+    return sorted(
+        (item.custom_id or "", item.label or "", bool(item.disabled), str(item.emoji or ""))
+        for item in items
+        if isinstance(item, (discord.ui.Button, discord.components.Button))
+    )
+
+
+def same_render(message: discord.Message, embed: discord.Embed, view: discord.ui.View) -> bool:
+    if len(message.embeds) != 1 or embed_key(message.embeds[0]) != embed_key(embed):
+        return False
+    shown = [child for row in message.components for child in getattr(row, "children", [])]
+    return buttons_key(shown) == buttons_key(view.children)
+
+
 class LobbyView(discord.ui.View):
     """Постоянная панель сбора.
 
@@ -321,10 +348,11 @@ class LobbyView(discord.ui.View):
 
         promoted = cog.promote_sub(interaction.guild, record) if left_roster else None
 
-        await cog.save()
+        # Сначала ответ Discord (на него 3 секунды), потом запись на диск.
         await interaction.response.edit_message(
             embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
         )
+        await cog.save()
         if note:
             await interaction.followup.send(note, ephemeral=True)
         if promoted is not None:
@@ -829,12 +857,7 @@ class RosterEditView(discord.ui.View):
         )
 
         await self.cog.save()
-        await self.lobby_message.edit(
-            embed=self.cog.build_embed(guild, self.record), view=LobbyView(self.record)
-        )
         self.refresh_options()
-        if promoted:
-            await self.cog.announce_promoted(self.lobby_message.channel, promoted)
 
         lines = []
         if changed:
@@ -847,7 +870,21 @@ class RosterEditView(discord.ui.View):
                 f"{self._names(guild, overflow)}."
             )
         lines.append("Можно править дальше — список обновлён.")
+        # Сначала отвечаем Discord (на это 3 секунды), потом правим пост: правка может ждать в очереди лимитов.
         await interaction.response.edit_message(content="\n".join(lines), view=self)
+        try:
+            await self.lobby_message.edit(
+                embed=self.cog.build_embed(guild, self.record), view=LobbyView(self.record)
+            )
+        except discord.HTTPException as error:
+            log.warning("Не удалось обновить пост сбора %s после правки состава: %s", self.lobby_message.id, error)
+            await interaction.followup.send(
+                "Состав сохранён, но Discord пока не даёт обновить пост сбора (лимит правок старых сообщений). "
+                "Пост обновится при следующем нажатии кнопки в нём.",
+                ephemeral=True,
+            )
+        if promoted:
+            await self.cog.announce_promoted(self.lobby_message.channel, promoted)
 
     @discord.ui.button(label="Убрать из сбора", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
     async def remove_players(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -921,6 +958,8 @@ class Lobby(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.store = JsonStore(Path(config.DATA_DIR) / "lobbies.json")
+        # Когда какой чемпион выпадал на сервере: id сервера → {id чемпиона: время}.
+        self.champion_history = JsonStore(Path(config.DATA_DIR) / "champion_history.json")
         self._refresh_task: asyncio.Task | None = None
         # Сборы, где прямо сейчас идёт новая раздача: двойной клик не должен раздать дважды.
         self._rerolling: set[int] = set()
@@ -928,6 +967,7 @@ class Lobby(commands.Cog):
         self.drafts: dict[int, DraftView] = {}
 
     async def cog_load(self) -> None:
+        self.champion_history.load()
         data = self.store.load()
         now = time.time()
         fresh = {
@@ -980,7 +1020,10 @@ class Lobby(commands.Cog):
         """
         await self.bot.wait_until_ready()
         closed_missing = 0
+        redrawn = 0
         for message_id, record in list(self.store.data.items()):
+            if record.get("closed"):
+                continue  # отменённый сбор уже нарисован закрытым — лишняя правка только тратит лимит
             channel = self.bot.get_channel(record["channel_id"])
             if channel is None:
                 log.warning("Канал %s для сбора %s недоступен", record["channel_id"], message_id)
@@ -989,9 +1032,12 @@ class Lobby(commands.Cog):
                 message = await channel.fetch_message(int(message_id))
                 if record.get("stage") == STAGE_DRAFT and not record.get("closed"):
                     await self.restore_draft(message, record)
-                await message.edit(
-                    embed=self.build_embed(channel.guild, record), view=LobbyView(record)
-                )
+                embed, view = self.build_embed(channel.guild, record), LobbyView(record)
+                # Правим только то, что изменилось: у постов старше часа Discord ограничивает число правок,
+                # и перерисовка всех сборов при каждом перезапуске бота съедала этот лимит.
+                if not same_render(message, embed, view):
+                    await message.edit(embed=embed, view=view)
+                    redrawn += 1
             except discord.NotFound:
                 # Пост удалили — значит, сбор отменили. Запись остаётся в файле, но закрытой.
                 if not record.get("closed"):
@@ -1002,7 +1048,7 @@ class Lobby(commands.Cog):
                 log.exception("Не удалось обновить сообщение сбора %s", message_id)
         if closed_missing:
             await self.save()
-        log.info("Сообщения сборов перерисованы")
+        log.info("Сообщения сборов проверены, перерисовано: %d", redrawn)
 
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
@@ -1445,7 +1491,16 @@ class Lobby(commands.Cog):
             # Если без прошлых чемпионов останется совсем мало — раздаём из всех.
             if len(fresh) >= 60:
                 pool = fresh
-        return modes.deal_champions(teams, lanes, mode["champs"], pool), []
+        guild_id = next((str(member.guild.id) for team in teams for member in team), None)
+        history = self.champion_history.data.setdefault(guild_id, {}) if guild_id else {}
+        dealt = modes.deal_champions(teams, lanes, mode["champs"], pool, last_seen=history)
+        if guild_id:
+            now = time.time()
+            for champions in dealt.values():
+                for champion in champions:
+                    history[champion.id] = now
+            await self.champion_history.save()
+        return dealt, []
 
     @staticmethod
     def pack_deal(lanes: dict[int, str], champions: dict) -> dict:
