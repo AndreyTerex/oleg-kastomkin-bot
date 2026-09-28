@@ -56,6 +56,9 @@ CUSTOM_ID_EDIT = "lol:lobby:edit"
 CUSTOM_ID_MODE = "lol:lobby:mode"
 CUSTOM_ID_CANCEL = "lol:lobby:close"
 
+# Кнопки, которые нужны только внутренней кастомке.
+CUSTOM_GAME_ONLY = frozenset({CUSTOM_ID_MODE, CUSTOM_ID_CAPTAINS, CUSTOM_ID_DRAFT, CUSTOM_ID_REROLL, CUSTOM_ID_MOVE})
+
 CANCEL_LABELS = {
     KIND_SCRIM: "Отменить скрим",
     KIND_CUSTOM: "Отменить кастомку",
@@ -82,6 +85,15 @@ PING_CHOICES = [
 RECORD_TTL = 14 * 24 * 60 * 60
 # Сбор старше полутора суток уже не «ближайший»: /ping, /roster и Олег его не предлагают.
 LOBBY_STALE_AFTER = 36 * 60 * 60
+
+
+def progress_bar(done: int, total: int, width: int = 10) -> str:
+    """Полоска набора: «🟩🟩🟩⬜⬜». При большом сборе клетка — несколько игроков."""
+    if total <= 0:
+        return ""
+    cells = min(total, width)
+    filled = min(cells, round(done * cells / total))
+    return "🟩" * filled + "⬜" * (cells - filled)
 
 
 class LobbyView(discord.ui.View):
@@ -111,6 +123,11 @@ class LobbyView(discord.ui.View):
 
         for child in list(self.children):
             custom_id = getattr(child, "custom_id", None)
+
+            # Скрим — это одна команда против соперника: делить её на две и раздавать чемпионов незачем.
+            if kind == KIND_SCRIM and custom_id in CUSTOM_GAME_ONLY:
+                self.remove_item(child)
+                continue
 
             # Подписи зависят только от стадии — их видно и на закрытом сборе.
             if custom_id == CUSTOM_ID_CANCEL:
@@ -177,14 +194,17 @@ class LobbyView(discord.ui.View):
             status = STATUS_SUB
             note = (
                 f"Состав уже собран ({target}/{target}) — записал вас запасным. "
-                "Если кто-то отпишется, организатор переведёт вас в состав."
+                "Если кто-то отпишется до деления на команды, вы встанете в состав автоматически."
             )
 
+        left_roster = user_id in record[STATUS_IN] and status != STATUS_IN
         for key in (STATUS_IN, STATUS_SUB, STATUS_OUT):
             if user_id in record[key]:
                 record[key].remove(user_id)
         if status is not None:
             record[status].append(user_id)
+
+        promoted = cog.promote_sub(interaction.guild, record) if left_roster else None
 
         await cog.save()
         await interaction.response.edit_message(
@@ -192,6 +212,11 @@ class LobbyView(discord.ui.View):
         )
         if note:
             await interaction.followup.send(note, ephemeral=True)
+        if promoted is not None:
+            await interaction.followup.send(
+                f"🔼 {promoted.mention}, освободилось место — ты теперь в основном составе!",
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[promoted]),
+            )
 
     @discord.ui.button(label="Играю", emoji="✅", style=discord.ButtonStyle.success, custom_id="lol:lobby:in")
     async def sign_in(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -354,6 +379,9 @@ class LobbyView(discord.ui.View):
             await respond(interaction, "Кроме капитанов в составе никого нет.")
             return
 
+        # Номер драфта: если его перезапустили, старый драфт уже не должен трогать сбор.
+        draft_no = record.get("draft_no", 0) + 1
+        record["draft_no"] = draft_no
         record["stage"] = STAGE_DRAFT
         record["teams"] = None
         record["deal"] = None
@@ -361,10 +389,27 @@ class LobbyView(discord.ui.View):
 
         lobby_message = interaction.message
 
-        async def on_finish(teams: list[list[discord.Member]]) -> None:
-            await cog.finish_draft(lobby_message, record, teams)
+        def is_current() -> bool:
+            return record.get("draft_no") == draft_no and not record.get("closed")
 
-        draft = DraftView(scrim_cog, captains, shuffled(pool), on_finish=on_finish)
+        async def on_finish(teams: list[list[discord.Member]]) -> None:
+            if is_current():
+                await cog.finish_draft(lobby_message, record, teams)
+
+        async def on_expire() -> None:
+            if not is_current() or record.get("stage") != STAGE_DRAFT:
+                return
+            record["stage"] = STAGE_CAPTAINS
+            await cog.save()
+            try:
+                await lobby_message.edit(embed=cog.build_embed(lobby_message.guild, record), view=LobbyView(record))
+            except discord.HTTPException:
+                log.exception("Не удалось обновить сбор после таймаута драфта")
+
+        draft = DraftView(
+            scrim_cog, captains, shuffled(pool), on_finish=on_finish, on_expire=on_expire,
+            expired_hint="Время на драфт вышло — нажмите «Перезапустить драфт» в посте сбора",
+        )
         await interaction.response.edit_message(
             embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
         )
@@ -772,6 +817,24 @@ class Lobby(commands.Cog):
         ] + overflow
         return True
 
+    def promote_sub(self, guild: discord.Guild, record: dict) -> discord.Member | None:
+        """Первый запасной встаёт на освободившееся место — пока составы ещё не поделены.
+
+        После капитанов и драфта состав уже распределён, там решает организатор.
+        """
+        if record.get("stage", STAGE_SIGNUP) != STAGE_SIGNUP or record.get("teams"):
+            return None
+        if len(record[STATUS_IN]) >= record.get("target", config.TEAM_SIZE):
+            return None
+        for user_id in list(record[STATUS_SUB]):
+            member = guild.get_member(user_id)
+            if member is None:
+                continue
+            record[STATUS_SUB].remove(user_id)
+            record[STATUS_IN].append(user_id)
+            return member
+        return None
+
     def get_record(self, message_id: int) -> dict | None:
         return self.store.data.get(str(message_id))
 
@@ -973,10 +1036,11 @@ class Lobby(commands.Cog):
         if record.get("note"):
             lines.append(f"📝 {record['note']}")
         mode = modes.get_mode(record)
-        mode_line = f"🎮 **Режим:** {modes.mode_title(mode)}"
-        if modes.find_preset(mode) is None:
-            mode_line += f" — {modes.mode_summary(mode)}"
-        lines.append(mode_line)
+        if kind != KIND_SCRIM:
+            mode_line = f"🎮 **Режим:** {modes.mode_title(mode)}"
+            if modes.find_preset(mode) is None:
+                mode_line += f" — {modes.mode_summary(mode)}"
+            lines.append(mode_line)
 
         embed = discord.Embed(
             title=title,
@@ -1003,8 +1067,14 @@ class Lobby(commands.Cog):
         else:
             for status, heading in STATUS_TITLES.items():
                 members = self.members_from_ids(guild, record[status])
-                name = f"{heading} {len(members)}/{target}" if status == STATUS_IN else heading
-                embed.add_field(name=name, value=format_players(members), inline=False)
+                if status == STATUS_IN:
+                    embed.add_field(
+                        name=f"{heading} {len(members)}/{target}",
+                        value=f"{progress_bar(len(members), target)}\n{format_players(members)}",
+                        inline=False,
+                    )
+                else:
+                    embed.add_field(name=heading, value=format_players(members), inline=False)
             if len(captains) == 2:
                 embed.add_field(
                     name="👑 Капитаны",
@@ -1024,11 +1094,12 @@ class Lobby(commands.Cog):
         elif len(captains) == 2:
             footer = "Капитаны выбраны — можно начинать драфт"
         elif going >= target:
-            footer = (
-                "Состав собран — можно ролить капитанов"
-                if mode["teams"] == modes.TEAMS_DRAFT
-                else "Состав собран — можно запускать"
-            )
+            if kind == KIND_SCRIM:
+                footer = "Состав собран — ждём соперника"
+            elif mode["teams"] == modes.TEAMS_DRAFT:
+                footer = "Состав собран — можно ролить капитанов"
+            else:
+                footer = "Состав собран — можно запускать"
             waiting = len(record[STATUS_SUB])
             if waiting:
                 footer += f" · в запасе {waiting}"
@@ -1064,6 +1135,16 @@ class Lobby(commands.Cog):
             warning = (
                 "Объявление опубликовано без пинга: у бота нет права «Упоминать @everyone» в этом канале."
             )
+        # Неупоминаемую роль бот с правом «Упоминать @everyone» пинганул бы за любого участника.
+        if (
+            mention is not None
+            and not mention.mentionable
+            and not interaction.user.guild_permissions.mention_everyone
+        ):
+            warning = " ".join(
+                filter(None, [warning, f"Роль {mention.name} не упомянута: её могут пинговать только модераторы."])
+            )
+            mention = None
 
         record = {
             "guild_id": interaction.guild.id,

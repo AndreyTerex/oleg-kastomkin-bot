@@ -106,6 +106,11 @@ PROFANITY = re.compile(
 )
 SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 
+# Как Олег подписан в переданной модели истории чата: так он узнаёт свои прошлые реплики.
+OWN_NAME = "Олег (ты)"
+# Паузу в разговоре длиннее этой модель видит отдельной строкой.
+PAUSE_VISIBLE = timedelta(minutes=30)
+
 SPONTANEOUS_COOLDOWN = 12 * 60
 SPONTANEOUS_CHANCE = 0.07
 SPONTANEOUS_TOPIC_BONUS = 2.5
@@ -353,14 +358,25 @@ class Chat(commands.Cog):
 
         state.busy = True
         try:
-            # Каждый раз новый типаж, два одинаковых подряд не выпадают.
-            mood = random.choice([m for m in persona.MOODS if m[0] != state.last_mood])
+            # Каждый раз новый типаж, два одинаковых подряд не выпадают; подходящий к разговору — чаще.
+            mood = pick_mood(message.content, state.last_mood)
             state.last_mood = mood[0]
-            prompt = await self.build_prompt(message, called=called, mood=mood)
+            prompt, openings = await self.build_prompt(message, called=called, mood=mood)
+            allow_skip = not called
+
+            def choose(text: str) -> str | None:
+                return pick_variant(text, allow_skip=allow_skip, avoid_openings=openings)
+
             async with message.channel.typing():
-                reply = await self.client.complete(persona.PERSONA, prompt, validate=acceptable_answer)
-            text, state.last_tail = tidy_tail(clean_reply(pick_variant(reply.text) or ""), state.last_tail)
+                reply = await self.client.complete(
+                    persona.PERSONA, prompt, validate=lambda text: choose(text) is not None
+                )
+            text, state.last_tail = tidy_tail(clean_reply(choose(reply.text) or ""), state.last_tail)
             if not text:
+                if allow_skip:
+                    # Модель решила промолчать — следующую попытку встрять откладываем, но не на весь кулдаун.
+                    state.last_spoke = time.time() - SPONTANEOUS_COOLDOWN / 2
+                    log.info("Олег решил не встревать в #%s", message.channel)
                 return
             if called:
                 await message.reply(text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
@@ -395,26 +411,23 @@ class Chat(commands.Cog):
 
     async def build_prompt(
         self, message: discord.Message, *, called: bool, mood: tuple[str, str] | None = None
-    ) -> str:
+    ) -> tuple[str, set[str]]:
+        """Запрос к модели по секциям и начала последних реплик Олега, которые не стоит повторять."""
         lines, speakers = await self.collect_history(message)
         facts = [f"Сейчас {now_msk()}."]
         people = []
         for member in speakers.values():
             lanes = ", ".join(lane.label for lane in member_lanes(member)) or "линии не отмечены"
-            people.append(f"- {member.display_name}: {lanes}")
+            people.append(f"- {one_line(member.display_name)}: {lanes}")
         if people:
             facts.append("Кто в разговоре и какие линии отметил:\n" + "\n".join(people))
 
         memories = []
         for member in speakers.values():
             for fact in self.memory.about(message.guild.id, member.id)[-4:]:
-                memories.append(f"- {member.display_name}: {fact}")
+                memories.append(f"- {one_line(member.display_name)}: {fact}")
         for fact in self.memory.general(message.guild.id)[-4:]:
             memories.append(f"- {fact}")
-        if memories:
-            facts.append(
-                "Что ты помнишь (используй к месту для шуток, не пересказывай списком):\n" + "\n".join(memories)
-            )
 
         recent_text = " ".join(line for line in lines[-8:])
         if LOBBY_TOPIC.search(recent_text):
@@ -422,18 +435,39 @@ class Chat(commands.Cog):
             if lobby:
                 facts.append(lobby)
         optout_names = [
-            member.display_name
+            one_line(member.display_name)
             for user_id in self.store.data.get("optout", [])
             if (member := message.guild.get_member(user_id))
         ]
         if optout_names:
             facts.append("Попросили их не подкалывать: " + ", ".join(optout_names) + ".")
 
-        task = persona.TASK_CALLED.format(name=message.author.display_name) if called else persona.TASK_CHIME_IN
-        task = f"{task} {persona.VARIANTS}"
+        own = [line.split(": ", 1)[1] for line in lines if is_own_line(line)][-5:]
+        openings = {opening(text) for text in own if opening(text)}
+
+        if called:
+            length = persona.LENGTH_SHORT if len(message.content) < 25 else persona.LENGTH_NORMAL
+            task = persona.TASK_CALLED.format(name=one_line(message.author.display_name), length=length)
+        else:
+            task = persona.TASK_CHIME_IN
+        task_parts = [task]
+        if openings:
+            task_parts.append(persona.AVOID_OPENINGS.format(openings=", ".join(f"«{o}…»" for o in sorted(openings))))
+        task_parts.append(persona.VARIANTS)
+        if not called:
+            task_parts.append(persona.SKIP_OPTION)
         if mood is not None:
-            task = persona.MOOD_LINE.format(name=mood[0], description=mood[1]) + "\n\n" + task
-        return "\n\n".join(facts) + f"\n\nЧат #{message.channel} (сверху старые):\n" + "\n".join(lines) + f"\n\n{task}"
+            task_parts.insert(0, persona.MOOD_LINE.format(name=mood[0], description=mood[1]))
+
+        examples = random.sample(persona.EXAMPLES, min(persona.EXAMPLES_PER_PROMPT, len(persona.EXAMPLES)))
+        sections = [
+            section("context", "\n\n".join(facts)),
+            section("memory", "\n".join(memories)) if memories else "",
+            section("examples", "\n".join(f"- {where} → «{text}»" for where, text in examples)),
+            section("chat", f"Канал #{message.channel}\n" + "\n".join(lines)),
+            section("task", "\n".join(task_parts)),
+        ]
+        return "\n\n".join(part for part in sections if part), openings
 
     async def collect_history(self, message: discord.Message) -> tuple[list[str], dict[int, discord.Member]]:
         """Последние сообщения канала строками «ник: текст» и кто в них участвует."""
@@ -448,18 +482,26 @@ class Chat(commands.Cog):
 
         lines: list[str] = []
         speakers: dict[int, discord.Member] = {}
+        previous_at = None
         for msg in history:
             # Кто попросил не трогать его, того и не читаем — кроме сообщения, где он сам позвал Олега.
             if self.opted_out(msg.author.id) and msg.id != message.id:
                 continue
             if msg.author.id == me.id:
-                author = "Олег (ты)"
+                author = OWN_NAME
             elif msg.author.bot:
                 continue
             else:
-                author = msg.author.display_name
+                author = one_line(msg.author.display_name)
                 if isinstance(msg.author, discord.Member):
                     speakers[msg.author.id] = msg.author
+            # Паузы видны модели: шутка про разговор трёхчасовой давности звучит невпопад.
+            if previous_at is not None and (gap := msg.created_at - previous_at) >= PAUSE_VISIBLE:
+                lines.append(f"— прошло {human_gap(gap)} —")
+            previous_at = msg.created_at
+            target = replied_author(msg, me)
+            if target:
+                author = f"{author} ↪ {target}"
             lines.append(f"{author}: {describe(msg)}")
         return lines, speakers
 
@@ -509,6 +551,10 @@ class Chat(commands.Cog):
                 return persona.ROLE_DANGEROUS.format(role=role.name)
             if not role_requests.reachable(role, guild):
                 return persona.ROLE_TOO_HIGH.format(role=role.name)
+            # Через Олега нельзя выдать роль выше своей: модератор с «Управлять ролями» в самом
+            # Discord тоже не может. Роли линий себе выдаёт кто угодно — это их назначение.
+            if not own_lane and not role_requests.author_can_manage(role, author):
+                return persona.ROLE_ABOVE_AUTHOR.format(role=role.name)
         if not request.targets:
             return persona.ROLE_CREATED.format(role=created.name) if created else persona.ROLE_NO_TARGET
 
@@ -770,7 +816,8 @@ def describe(message: discord.Message) -> str:
         text = "[картинка]" if any((a.content_type or "").startswith("image") for a in message.attachments) else "[вложение]"
     if not text and message.stickers:
         text = "[стикер]"
-    text = " ".join(text.split())
+    # «</chat>» в тексте не должен закрывать секцию запроса и превращать реплику в указание модели.
+    text = " ".join(text.split()).replace("</", "‹/")
     return text[:LINE_LIMIT] + ("…" if len(text) > LINE_LIMIT else "") if text else "[пусто]"
 
 
@@ -801,31 +848,92 @@ def now_msk() -> str:
     return f"{WEEKDAYS[now.weekday()]}, {now:%H:%M} по Москве"
 
 
-def pick_variant(text: str) -> str | None:
+def pick_variant(text: str, *, allow_skip: bool = False, avoid_openings: set[str] | frozenset[str] = frozenset()) -> str | None:
     """Лучший из трёх вариантов, которые придумала модель.
 
     Если модель ответила просто текстом — берём его. Сломанный JSON — None: пусть ответит следующая модель.
+    Пустая строка — модель решила промолчать (можно только когда Олега не звали).
+    Вариант, который начинается как одна из последних реплик Олега, уступает место свежему.
     """
     data = parse_json(text)
+    if data is not None and allow_skip and data.get("skip") is True:
+        return ""
     if data is not None and isinstance(data.get("variants"), list):
         variants = [v.strip() for v in data["variants"] if isinstance(v, str) and v.strip()]
         if not variants:
             return None
         best = data.get("best", 0)
         index = best if isinstance(best, int) and 0 <= best < len(variants) else 0
+        ordered = [variants[index]] + [v for i, v in enumerate(variants) if i != index]
         # Лучший вариант с матом или иероглифами заменяем первым чистым из оставшихся.
-        for candidate in [variants[index]] + variants:
-            if acceptable_reply(candidate):
-                return candidate
-        return None
+        clean = [candidate for candidate in ordered if acceptable_reply(candidate)]
+        fresh = [candidate for candidate in clean if opening(candidate) not in avoid_openings]
+        return (fresh or clean or [None])[0]
     if "{" in text:
         return None
     text = text.strip()
     return text if text and acceptable_reply(text) else None
 
 
-def acceptable_answer(text: str) -> bool:
-    return pick_variant(text) is not None
+def opening(text: str) -> str:
+    """Первые два слова реплики без знаков — по ним видно, что Олег начинает одинаково."""
+    words = re.findall(r"[\wё-]+", text.casefold())
+    return " ".join(words[:2])
+
+
+def pick_mood(text: str, last: str) -> tuple[str, str]:
+    """Типаж для реплики: не тот же, что в прошлый раз, подходящий к сообщению — с повышенным шансом."""
+    hour = datetime.now(MSK).hour
+    options, weights = [], []
+    for mood in persona.MOODS:
+        name = mood[0]
+        if name == last:
+            continue
+        weight = 1.0
+        trigger = persona.MOOD_TRIGGERS.get(name)
+        if trigger is not None and trigger.search(text or ""):
+            weight *= persona.MOOD_BOOST
+        if name == "сонный" and hour in persona.SLEEPY_HOURS:
+            weight *= persona.MOOD_BOOST
+        if name == "подражатель" and len(text or "") < persona.MIMIC_MIN_LENGTH:
+            weight = 0.0
+        options.append(mood)
+        weights.append(weight)
+    if not any(weights):
+        return random.choice(options)
+    return random.choices(options, weights=weights, k=1)[0]
+
+
+def is_own_line(line: str) -> bool:
+    """Строка истории с репликой самого Олега — обычной или ответом кому-то."""
+    return line.startswith(f"{OWN_NAME}: ") or line.startswith(f"{OWN_NAME} ↪ ")
+
+
+def section(tag: str, body: str) -> str:
+    return f"<{tag}>\n{body}\n</{tag}>"
+
+
+def one_line(text: str) -> str:
+    """Ник одной строкой и без угловых скобок — чтобы им нельзя было закрыть секцию запроса."""
+    return " ".join(text.split()).replace("<", "‹").replace(">", "›")
+
+
+def human_gap(gap: timedelta) -> str:
+    minutes = int(gap.total_seconds() // 60)
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours = minutes // 60
+    return f"{hours} ч" if hours < 24 else f"{hours // 24} дн"
+
+
+def replied_author(message: discord.Message, me: discord.abc.User) -> str | None:
+    """Кому отвечает сообщение — если это ответ на чужое сообщение из того же канала."""
+    reference = message.reference
+    resolved = getattr(reference, "resolved", None) if reference else None
+    author = getattr(resolved, "author", None)
+    if author is None:
+        return None
+    return OWN_NAME if author.id == me.id else one_line(author.display_name)
 
 
 def acceptable_reply(text: str) -> bool:

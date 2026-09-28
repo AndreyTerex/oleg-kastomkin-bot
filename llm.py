@@ -202,6 +202,9 @@ class LLMClient:
                     timeout=aiohttp.ClientTimeout(total=provider.timeout),
                 ) as response:
                     payload = await response.json(content_type=None)
+                    if not isinstance(payload, dict):
+                        # Прокси и балансировщики иногда отдают строку или список вместо объекта.
+                        payload = {"error": {"message": str(payload)[:300]}}
                     if response.status == 429:
                         # OpenRouter и Groq кладут ошибку в error, Mistral — прямо в корень ответа.
                         error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
