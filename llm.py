@@ -26,6 +26,7 @@ HF_URL = "https://router.huggingface.co/v1/chat/completions"
 TOKENHARBOR_URL = "https://tokenharbor.ai/v1/chat/completions"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 PUTER_URL = "https://api.puter.com/puterai/openai/v1/chat/completions"
+ZAI_URL = "https://api.z.ai/api/paas/v4/chat/completions"
 
 # Если модель зависла или недоступна, какое-то время сразу идём к следующей,
 # чтобы чат не ждал по минуте на каждом сообщении.
@@ -147,6 +148,17 @@ def build_providers() -> list[Provider]:
             url=PUTER_URL,
             api_key=config.PUTER_AUTH_TOKEN,
             model=model,
+            max_tokens=900,
+            timeout=25.0,
+        ))
+    for model in config.ZAI_MODELS:
+        providers.append(Provider(
+            name="zai",
+            url=ZAI_URL,
+            api_key=config.ZAI_API_KEY,
+            model=model,
+            # GLM по умолчанию «думает» вслух: для реплик в чате это лишняя задержка.
+            options={"thinking": {"type": "disabled"}},
             max_tokens=900,
             timeout=25.0,
         ))

@@ -20,7 +20,7 @@ def test_order_providers_follows_llm_order_and_keeps_model_order():
 def test_default_chain_starts_with_gemini_then_groq():
     import config
 
-    assert config.LLM_ORDER[:3] == ["gemini", "puter", "groq"]
+    assert config.LLM_ORDER[:3] == ["gemini", "puter", "zai"] and config.LLM_ORDER[-2:] == ["groq", "huggingface"]
     assert config.GEMINI_MODELS[0].startswith("gemini-") and "flash" in config.GEMINI_MODELS[0]
     assert config.GROQ_MODELS[0] == "openai/gpt-oss-120b"
     assert not hasattr(config, "MISTRAL_API_KEY")
@@ -286,3 +286,14 @@ def test_out_of_credits_pauses_the_whole_provider(monkeypatch):
     client._session = _FakeSession([(402, {"error": {"message": "Insufficient funds"}}), _ok("groq")])
     assert asyncio.run(client.complete("s", "u")).text == "groq"
     assert client._session.calls == ["x-ai/grok-4.1-fast", "oss"]  # второй Grok уже не дёргаем
+
+
+
+def test_zai_comes_before_groq(monkeypatch):
+    import config
+    import llm
+
+    for key in ("GEMINI_API_KEY", "ZAI_API_KEY", "GROQ_API_KEY"):
+        monkeypatch.setattr(config, key, "k")
+    names = [p.label for p in llm.build_providers()]
+    assert names.index("zai:glm-4.7-flash") < min(i for i, n in enumerate(names) if n.startswith("groq:"))

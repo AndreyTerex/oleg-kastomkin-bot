@@ -73,6 +73,12 @@ PUTER_MODELS: list[str] = [
     if model.strip()
 ]
 
+# Ключ Z.ai (z.ai, регистрация по почте → профиль → API Keys): бесплатные модели GLM Flash, около запроса в секунду.
+ZAI_API_KEY: str = os.getenv("ZAI_API_KEY", "").strip()
+ZAI_MODELS: list[str] = [
+    model.strip() for model in os.getenv("ZAI_MODELS", "glm-4.7-flash,glm-4.5-flash").split(",") if model.strip()
+]
+
 # Токен Hugging Face: сильные модели (по умолчанию DeepSeek V3.2), но всего $0.10 бесплатно в месяц —
 # это около 170 ответов. Суффикс :cheapest выбирает самого дешёвого провайдера модели.
 HF_TOKEN: str = os.getenv("HF_TOKEN", "").strip()
@@ -159,11 +165,11 @@ VPN_CHECK_GEMINI: bool = bool(GEMINI_API_KEY) and ("all" in LLM_PROXY_FOR or "ge
 VPN_FOR_DISCORD: bool = os.getenv("VPN_FOR_DISCORD", "0").strip().lower() not in ("0", "false", "no", "off", "нет")
 
 # Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Первым — Gemini (самые сильные
-# бесплатные модели), за ним Puter (если задан токен), Groq с большим лимитом (около 1000 ответов в день),
-# остальные — в запасе.
+# бесплатные модели), за ним Puter и Z.ai (если заданы ключи), TokenHarbor и OpenRouter. Groq отвечает
+# быстро, но слабее — он почти в самом конце, только когда остальные на лимите.
 LLM_ORDER: list[str] = [
     name.strip().lower()
-    for name in os.getenv("LLM_ORDER", "gemini,puter,groq,tokenharbor,openrouter,huggingface").split(",")
+    for name in os.getenv("LLM_ORDER", "gemini,puter,zai,tokenharbor,openrouter,groq,huggingface").split(",")
     if name.strip()
 ]
 
