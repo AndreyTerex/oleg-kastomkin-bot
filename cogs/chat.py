@@ -404,6 +404,8 @@ class Chat(commands.Cog):
                 reply = await self.client.complete(
                     persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
                     validate=lambda text: choose(text) is not None,
+                    # Сам встрял — хватит модели попроще: умные Gemini с лимитом 20 в день — для тех, кто позвал.
+                    economy=not called,
                 )
             # Модель поняла просьбу, которую пропустил код: выполняет бот, со своими проверками прав.
             action = llm_actions.parse(parse_json(reply.text)) if called else None
@@ -775,7 +777,7 @@ class Chat(commands.Cog):
         try:
             async with message.channel.typing():
                 reply = await self.client.complete(
-                    MEMORY_SYSTEM, prompt, temperature=0.2, validate=lambda text: "{" in text
+                    MEMORY_SYSTEM, prompt, temperature=0.2, validate=lambda text: "{" in text, economy=True,
                 )
         except LLMUnavailable:
             await self.react(message, "⏳")

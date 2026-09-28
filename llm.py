@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import aiohttp
@@ -54,10 +55,10 @@ _RETRY_RE = re.compile(r"try again in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s")
 _RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*:\s*['\"]([\d.]+)s")
 # Сбои на стороне провайдера («модель перегружена») — пропускаем его ненадолго.
 OVERLOAD_PAUSE = 20.0
-# Gemini постоянно отвечает 503 «high demand», но через пару секунд обычно отвечает — и он заметно умнее запасных.
-# Поэтому перегруженную модель переспрашиваем с нарастающей паузой (LLM_OVERLOAD_RETRIES раз за запрос),
-# и только потом идём к следующей.
+# Gemini часто отвечает 503 «high demand», но через пару секунд обычно отвечает. Модель с большим лимитом
+# (Flash Lite, Groq) переспрашиваем с нарастающей паузой (LLM_OVERLOAD_RETRIES раз), «редкую» — нет.
 OVERLOAD_RETRY_DELAYS = (2.0, 4.0, 8.0)
+_OVERLOADED = "перегружен"
 # Провайдер не работает в стране, откуда идёт запрос (Gemini из России), — не дёргаем его часами.
 REGION_PAUSE = 6 * 3600.0
 VPN_REGION_PAUSE = 15 * 60.0
@@ -83,6 +84,9 @@ class Provider:
     max_tokens: int = 900
     timeout: float = 30.0
     proxy: str | None = None
+    # Модель с крошечным суточным лимитом (Gemini Flash на бесплатном тарифе — 20 запросов в день):
+    # не переспрашиваем её при перегрузке и не тратим на необязательные реплики.
+    scarce: bool = False
 
     @property
     def label(self) -> str:
@@ -105,6 +109,11 @@ class LLMUnavailable(Exception):
         self.daily = daily
 
 
+def is_scarce_gemini(model: str) -> bool:
+    """У бесплатного Gemini «Flash» — 20 запросов в день на модель, у «Flash Lite» — сотни (см. GEMINI_SCARCE)."""
+    return any(part in model for part in config.GEMINI_SCARCE) and "lite" not in model
+
+
 def build_providers() -> list[Provider]:
     """Цепочка провайдеров в порядке LLM_ORDER (по умолчанию Groq → остальные)."""
     providers: list[Provider] = []
@@ -118,6 +127,7 @@ def build_providers() -> list[Provider]:
             options={"reasoning_effort": "low"},
             max_tokens=1500,  # вместе с размышлениями
             timeout=25.0,
+            scarce=is_scarce_gemini(model),
         ))
     for model in config.TOKENHARBOR_MODELS:
         providers.append(Provider(
@@ -179,6 +189,19 @@ def order_providers(providers: list[Provider], order: list[str]) -> list[Provide
     return sorted(providers, key=lambda provider: rank.get(provider.name, len(rank)))
 
 
+def seconds_until_google_reset(now: float | None = None) -> float:
+    """Секунды до полуночи по тихоокеанскому времени — тогда Google обнуляет суточные лимиты Gemini."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo("America/Los_Angeles")
+    except Exception:  # нет базы часовых поясов — берём зимнее смещение, ошибка максимум на час
+        zone = timezone(timedelta(hours=-8))
+    current = datetime.fromtimestamp(time.time() if now is None else now, zone)
+    midnight = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max((midnight - current).total_seconds(), 60.0)
+
+
 def _rate_limit_wait(message: str, headers, daily: bool) -> float:
     retry = headers.get("retry-after")
     if retry:
@@ -224,131 +247,29 @@ class LLMClient:
         *,
         temperature: float = 1.0,
         validate: Callable[[str], bool] | None = None,
+        economy: bool = False,
     ) -> Reply:
-        """Первый годный ответ по цепочке. `validate` бракует ответ — тогда спрашиваем следующую модель."""
+        """Первый годный ответ по цепочке. `validate` бракует ответ — тогда спрашиваем следующую модель.
+
+        economy=True — необязательная реплика (Олег сам встрял, разбор «запомни»): модели с крошечным суточным
+        лимитом пропускаем, чтобы они остались для прямых обращений и прожарок.
+        """
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
 
-        last_error = "нет доступных моделей"
-        queue = list(self.providers)
-        overload_retries = 0
-        while queue:
-            provider = queue.pop(0)
+        errors: list[str] = []
+        for provider in self.providers:
+            if economy and provider.scarce:
+                continue
             if self._blocked_until.get(provider.label, 0) > time.time():
                 continue
-
-            body = {
-                "model": provider.model,
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                "temperature": temperature,
-                provider.max_tokens_field: provider.max_tokens,
-                **provider.options,
-            }
-            headers = {"Authorization": f"Bearer {provider.api_key}", "X-Title": "Oleg Kastomkin"}
-            try:
-                async with self._session.post(
-                    provider.url, json=body, headers=headers, proxy=proxy_for(provider),
-                    timeout=aiohttp.ClientTimeout(total=provider.timeout),
-                ) as response:
-                    payload = await response.json(content_type=None)
-                    if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
-                        # Google отдаёт ошибки списком из одного объекта.
-                        payload = payload[0]
-                    if not isinstance(payload, dict):
-                        # Прокси и балансировщики иногда отдают строку или список вместо объекта.
-                        payload = {"error": {"message": str(payload)[:300]}}
-                    if response.status == 429:
-                        # Обычно ошибка лежит в error, у некоторых провайдеров — прямо в корне ответа.
-                        error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
-                        message = (
-                            f"{error.get('message', '')} {(error.get('metadata') or {}).get('raw', '')} "
-                            f"{error.get('details', '')}"
-                        )
-                        daily = bool(re.search(
-                            r"per[ _-]?day|month|week|7-day|allowance|quota", message, re.IGNORECASE
-                        ))
-                        wait = _rate_limit_wait(message, response.headers, daily)
-                        # Короткая пауза — это поминутный лимит, даже если в тексте есть слово «quota».
-                        daily = daily and wait >= 3600
-                        log.warning(
-                            "Лимит %s (%s), пауза %.0f с",
-                            provider.label, "суточный" if daily else "временный", wait,
-                        )
-                        self._blocked_until[provider.label] = time.time() + wait
-                        self._blocked_daily[provider.label] = daily
-                        continue
-                    if response.status == 402:
-                        self._blocked_until[provider.label] = time.time() + QUOTA_PAUSE
-                        self._blocked_daily[provider.label] = True
-                        last_error = f"{provider.label}: кончились бесплатные кредиты"
-                        log.warning(
-                            "%s: кончились бесплатные кредиты (HTTP 402), пропускаем его %.0f ч",
-                            provider.label, QUOTA_PAUSE / 3600,
-                        )
-                        continue
-                    if is_region_block(response.status, str(payload)):
-                        if provider.proxy:
-                            # Сервер VPN выходит в стране, куда нейросеть не пускает, — VPN выберет другой.
-                            VPN_CLIENT.report_failure(region=True)
-                        # Все модели этого провайдера недоступны из этой страны — отключаем их разом.
-                        # Через VPN пауза короткая: Xray может переключиться на сервер в другой стране.
-                        pause = VPN_REGION_PAUSE if provider.proxy else REGION_PAUSE
-                        until = time.time() + pause
-                        for other in self.providers:
-                            if other.name == provider.name:
-                                self._blocked_until[other.label] = until
-                                self._blocked_daily[other.label] = False
-                        last_error = f"{provider.name}: недоступен из этой страны"
-                        log.warning(
-                            "%s не работает из вашей страны (%s). Отключаю его на %.2g ч — отвечают другие модели. "
-                            "Чтобы он заработал, укажите в .env VPN_SUBSCRIPTION или LLM_PROXY.",
-                            provider.name, str(payload)[:120], pause / 3600,
-                        )
-                        continue
-                    if response.status in (500, 502, 503, 504) and overload_retries < config.LLM_OVERLOAD_RETRIES:
-                        delay = OVERLOAD_RETRY_DELAYS[min(overload_retries, len(OVERLOAD_RETRY_DELAYS) - 1)]
-                        overload_retries += 1
-                        log.info("%s перегружен (HTTP %s), переспрашиваю через %.0f с (%d/%d)",
-                                 provider.label, response.status, delay, overload_retries, config.LLM_OVERLOAD_RETRIES)
-                        await asyncio.sleep(delay)
-                        queue.insert(0, provider)
-                        continue
-                    if response.status in (500, 502, 503, 504):
-                        # «Модель перегружена» — временно: пропускаем её минуту и спрашиваем следующую.
-                        self._blocked_until[provider.label] = time.time() + OVERLOAD_PAUSE
-                        self._blocked_daily[provider.label] = False
-                        last_error = f"{provider.label}: HTTP {response.status}"
-                        log.warning("%s перегружен (HTTP %s), пропускаем %.0f с", provider.label, response.status, OVERLOAD_PAUSE)
-                        continue
-                    if response.status >= 400:
-                        last_error = f"{provider.label}: HTTP {response.status}"
-                        log.warning("%s ответил ошибкой: %s %s", provider.label, response.status, str(payload)[:300])
-                        continue
-            except (aiohttp.ClientError, TimeoutError, ValueError) as error:
-                if provider.proxy and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
-                    # Прокси не довёз запрос — пусть VPN сразу перепроверит серверы.
-                    VPN_CLIENT.report_failure()
-                pause = TIMEOUT_PAUSE if isinstance(error, TimeoutError) else ERROR_PAUSE
-                self._blocked_until[provider.label] = time.time() + pause
-                self._blocked_daily[provider.label] = False
-                last_error = f"{provider.label}: {error!r}"
-                log.warning("Не удалось обратиться к %s: %r — пропускаем его %.0f с", provider.label, error, pause)
-                continue
-
-            choices = payload.get("choices") or []
-            text = _message_text(choices[0].get("message") or {}) if choices else ""
-            if not text:
-                # Бывает у моделей с рассуждениями: всё ушло в мысли. Пробуем следующего.
-                last_error = f"{provider.label}: пустой ответ"
-                log.warning("%s вернул пустой ответ", provider.label)
-                continue
-            if validate is not None and not validate(text):
-                last_error = f"{provider.label}: ответ забракован"
-                log.warning("%s: ответ забракован проверкой: %.120s", provider.label, text)
-                continue
-            tokens = (payload.get("usage") or {}).get("total_tokens", 0)
-            return Reply(text, provider.label, tokens)
-
+            # Перегруженную «редкую» модель не переспрашиваем: неудачный запрос тоже съедает её суточный лимит,
+            # а следующая модель Gemini в цепочке — со своим лимитом, это и есть повтор.
+            retries = 0 if provider.scarce else config.LLM_OVERLOAD_RETRIES
+            reply = await self._ask_with_retries(provider, system, user, temperature, validate, retries, errors)
+            if reply is not None:
+                return reply
+        last_error = errors[-1] if errors else "нет доступных моделей"
         now = time.time()
         blocked = [p.label for p in self.providers if self._blocked_until.get(p.label, 0) > now]
         if blocked and len(blocked) == len(self.providers):
@@ -358,3 +279,128 @@ class LLMClient:
                 daily=all(self._blocked_daily.get(label) for label in blocked),
             )
         raise LLMUnavailable(last_error)
+
+    async def _ask_with_retries(self, provider, system, user, temperature, validate, retries, errors) -> Reply | None:
+        """Одна модель: при перегрузке переспрашиваем с нарастающей паузой, потом она отдыхает OVERLOAD_PAUSE."""
+        for attempt in range(retries + 1):
+            result = await self._ask(provider, system, user, temperature, validate)
+            if isinstance(result, Reply):
+                return result
+            if result != _OVERLOADED:
+                errors.append(result)
+                return None
+            if attempt < retries:
+                delay = OVERLOAD_RETRY_DELAYS[min(attempt, len(OVERLOAD_RETRY_DELAYS) - 1)]
+                log.info("%s перегружен, переспрашиваю через %.0f с (%d/%d)", provider.label, delay, attempt + 1, retries)
+                await asyncio.sleep(delay)
+        self._blocked_until[provider.label] = time.time() + OVERLOAD_PAUSE
+        self._blocked_daily[provider.label] = False
+        errors.append(f"{provider.label}: перегружен")
+        log.warning("%s перегружен, пропускаем %.0f с", provider.label, OVERLOAD_PAUSE)
+        return None
+
+    async def _ask(self, provider, system, user, temperature, validate) -> Reply | str:
+        """Один запрос. Ответ — Reply, _OVERLOADED или текст ошибки (паузы провайдера уже выставлены)."""
+        body = {
+            "model": provider.model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "temperature": temperature,
+            provider.max_tokens_field: provider.max_tokens,
+            **provider.options,
+        }
+        headers = {"Authorization": f"Bearer {provider.api_key}", "X-Title": "Oleg Kastomkin"}
+        try:
+            async with self._session.post(
+                provider.url, json=body, headers=headers, proxy=proxy_for(provider),
+                timeout=aiohttp.ClientTimeout(total=provider.timeout),
+            ) as response:
+                payload = await response.json(content_type=None)
+                if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
+                    # Google отдаёт ошибки списком из одного объекта.
+                    payload = payload[0]
+                if not isinstance(payload, dict):
+                    # Прокси и балансировщики иногда отдают строку или список вместо объекта.
+                    payload = {"error": {"message": str(payload)[:300]}}
+                if response.status == 429:
+                    # Обычно ошибка лежит в error, у некоторых провайдеров — прямо в корне ответа.
+                    error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+                    message = (
+                        f"{error.get('message', '')} {(error.get('metadata') or {}).get('raw', '')} "
+                        f"{error.get('details', '')}"
+                    )
+                    daily = bool(re.search(
+                        r"per[ _-]?day|month|week|7-day|allowance|quota", message, re.IGNORECASE
+                    ))
+                    wait = _rate_limit_wait(message, response.headers, daily)
+                    if provider.name == "gemini" and "PerDay" in message:
+                        # Кончился суточный лимит модели (…RequestsPerDay…): Google сбрасывает его в полночь
+                        # по тихоокеанскому времени, а retryDelay в ответе — секунды, из-за которых
+                        # закончившуюся модель дёргали бы каждые полминуты.
+                        wait = max(wait, seconds_until_google_reset())
+                    # Короткая пауза — это поминутный лимит, даже если в тексте есть слово «quota».
+                    daily = daily and wait >= 3600
+                    log.warning(
+                        "Лимит %s (%s), пауза %.0f с",
+                        provider.label, "суточный" if daily else "временный", wait,
+                    )
+                    self._blocked_until[provider.label] = time.time() + wait
+                    self._blocked_daily[provider.label] = daily
+                    return f"{provider.label}: лимит"
+                if response.status == 402:
+                    self._blocked_until[provider.label] = time.time() + QUOTA_PAUSE
+                    self._blocked_daily[provider.label] = True
+                    error_text = f"{provider.label}: кончились бесплатные кредиты"
+                    log.warning(
+                        "%s: кончились бесплатные кредиты (HTTP 402), пропускаем его %.0f ч",
+                        provider.label, QUOTA_PAUSE / 3600,
+                    )
+                    return error_text
+                if is_region_block(response.status, str(payload)):
+                    if provider.proxy:
+                        # Сервер VPN выходит в стране, куда нейросеть не пускает, — VPN выберет другой.
+                        VPN_CLIENT.report_failure(region=True)
+                    # Все модели этого провайдера недоступны из этой страны — отключаем их разом.
+                    # Через VPN пауза короткая: Xray может переключиться на сервер в другой стране.
+                    pause = VPN_REGION_PAUSE if provider.proxy else REGION_PAUSE
+                    until = time.time() + pause
+                    for other in self.providers:
+                        if other.name == provider.name:
+                            self._blocked_until[other.label] = until
+                            self._blocked_daily[other.label] = False
+                    error_text = f"{provider.name}: недоступен из этой страны"
+                    log.warning(
+                        "%s не работает из вашей страны (%s). Отключаю его на %.2g ч — отвечают другие модели. "
+                        "Чтобы он заработал, укажите в .env VPN_SUBSCRIPTION или LLM_PROXY.",
+                        provider.name, str(payload)[:120], pause / 3600,
+                    )
+                    return error_text
+                if response.status in (500, 502, 503, 504):
+                    return _OVERLOADED  # паузы и повторы решает _ask_with_retries
+                if response.status >= 400:
+                    error_text = f"{provider.label}: HTTP {response.status}"
+                    log.warning("%s ответил ошибкой: %s %s", provider.label, response.status, str(payload)[:300])
+                    return error_text
+        except (aiohttp.ClientError, TimeoutError, ValueError) as error:
+            if provider.proxy and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
+                # Прокси не довёз запрос — пусть VPN сразу перепроверит серверы.
+                VPN_CLIENT.report_failure()
+            pause = TIMEOUT_PAUSE if isinstance(error, TimeoutError) else ERROR_PAUSE
+            self._blocked_until[provider.label] = time.time() + pause
+            self._blocked_daily[provider.label] = False
+            error_text = f"{provider.label}: {error!r}"
+            log.warning("Не удалось обратиться к %s: %r — пропускаем его %.0f с", provider.label, error, pause)
+            return error_text
+
+        choices = payload.get("choices") or []
+        text = _message_text(choices[0].get("message") or {}) if choices else ""
+        if not text:
+            # Бывает у моделей с рассуждениями: всё ушло в мысли. Пробуем следующего.
+            error_text = f"{provider.label}: пустой ответ"
+            log.warning("%s вернул пустой ответ", provider.label)
+            return error_text
+        if validate is not None and not validate(text):
+            error_text = f"{provider.label}: ответ забракован"
+            log.warning("%s: ответ забракован проверкой: %.120s", provider.label, text)
+            return error_text
+        tokens = (payload.get("usage") or {}).get("total_tokens", 0)
+        return Reply(text, provider.label, tokens)

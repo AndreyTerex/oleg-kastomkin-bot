@@ -76,8 +76,16 @@ HF_MODELS: list[str] = [
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODELS: list[str] = [
     model.strip()
-    for model in os.getenv("GEMINI_MODELS", "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite").split(",")
+    for model in os.getenv(
+        "GEMINI_MODELS",
+        "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite",
+    ).split(",")
     if model.strip()
+]
+# Модели с крошечным бесплатным лимитом (20 запросов в день): их берегут для прямых обращений к Олегу
+# и не переспрашивают при перегрузке. Считаются все Gemini с этими словами в названии, кроме «-lite».
+GEMINI_SCARCE: list[str] = [
+    part.strip().lower() for part in os.getenv("GEMINI_SCARCE", "flash").split(",") if part.strip()
 ]
 
 # VPN для нейросетей, закрытых из России (см. vpn.py): подписка и/или ключи vless://, trojan://, vmess://.
