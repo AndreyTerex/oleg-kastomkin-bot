@@ -55,6 +55,8 @@ _RETRY_RE = re.compile(r"try again in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s")
 _RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*:\s*['\"]([\d.]+)s")
 # Сбои на стороне провайдера («модель перегружена») — пропускаем его ненадолго.
 OVERLOAD_PAUSE = 20.0
+# Сколько ждать подключения (вместе с прокси и TLS), прежде чем считать сервер недоступным.
+CONNECT_TIMEOUT = 8.0
 # Gemini часто отвечает 503 «high demand», но через пару секунд обычно отвечает. Модель с большим лимитом
 # (Flash Lite, Groq) переспрашиваем с нарастающей паузой (LLM_OVERLOAD_RETRIES раз), «редкую» — нет.
 OVERLOAD_RETRY_DELAYS = (2.0, 4.0, 8.0)
@@ -177,8 +179,9 @@ def build_providers() -> list[Provider]:
 
 
 def proxy_for(provider: Provider) -> str | None:
-    """Прокси запроса. Встроенный VPN не запущен (например, нет Xray вне Docker) — идём напрямую."""
-    if provider.proxy and provider.proxy == config.VPN_PROXY_URL and not VPN_CLIENT.ready:
+    """Прокси запроса. Встроенный VPN не запущен (нет Xray вне Docker) или только что уронил соединение —
+    идём напрямую, а не ждём таймаутов через сломанный сервер."""
+    if provider.proxy and provider.proxy == config.VPN_PROXY_URL and not VPN_CLIENT.healthy:
         return None
     return provider.proxy
 
@@ -309,10 +312,13 @@ class LLMClient:
             **provider.options,
         }
         headers = {"Authorization": f"Bearer {provider.api_key}", "X-Title": "Oleg Kastomkin"}
+        proxy = proxy_for(provider)
         try:
             async with self._session.post(
-                provider.url, json=body, headers=headers, proxy=proxy_for(provider),
-                timeout=aiohttp.ClientTimeout(total=provider.timeout),
+                provider.url, json=body, headers=headers, proxy=proxy,
+                # Подключение (с прокси и TLS) — отдельно и коротко: сломанный VPN-сервер не должен
+                # держать каждую модель по 25 секунд.
+                timeout=aiohttp.ClientTimeout(total=provider.timeout, connect=CONNECT_TIMEOUT),
             ) as response:
                 payload = await response.json(content_type=None)
                 if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
@@ -356,11 +362,12 @@ class LLMClient:
                     )
                     return error_text
                 if is_region_block(response.status, str(payload)):
-                    if provider.proxy:
+                    if proxy:
                         # Сервер VPN выходит в стране, куда нейросеть не пускает, — VPN выберет другой.
                         VPN_CLIENT.report_failure(region=True)
                     # Все модели этого провайдера недоступны из этой страны — отключаем их разом.
                     # Через VPN пауза короткая: Xray может переключиться на сервер в другой стране.
+                    # Шли напрямую только потому, что VPN сломан, — тоже короткая пауза: VPN скоро починится.
                     pause = VPN_REGION_PAUSE if provider.proxy else REGION_PAUSE
                     until = time.time() + pause
                     for other in self.providers:
@@ -381,9 +388,9 @@ class LLMClient:
                     log.warning("%s ответил ошибкой: %s %s", provider.label, response.status, str(payload)[:300])
                     return error_text
         except (aiohttp.ClientError, TimeoutError, ValueError) as error:
-            if provider.proxy and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
-                # Прокси не довёз запрос — пусть VPN сразу перепроверит серверы.
-                VPN_CLIENT.report_failure()
+            if proxy == config.VPN_PROXY_URL and isinstance(error, (aiohttp.ClientConnectionError, TimeoutError)):
+                # Прокси не довёз запрос — следующие модели пойдут напрямую, а VPN сразу перепроверит серверы.
+                VPN_CLIENT.report_failure(connection=isinstance(error, aiohttp.ClientConnectionError))
             pause = TIMEOUT_PAUSE if isinstance(error, TimeoutError) else ERROR_PAUSE
             self._blocked_until[provider.label] = time.time() + pause
             self._blocked_daily[provider.label] = False

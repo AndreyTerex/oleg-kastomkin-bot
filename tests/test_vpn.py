@@ -352,3 +352,17 @@ def test_discord_goes_direct_by_default():
     import config
 
     assert config.VPN_FOR_DISCORD is False
+
+
+def test_connection_failure_marks_vpn_broken_until_a_good_check(monkeypatch, tmp_path):
+    client = vpn.VPN()
+    client.state = vpn.VpnState(tmp_path / "vpn.json")
+    client.state.load()
+    client.started = True
+    client.current = vpn.ProbeResult("fp", "Germany", True, 80.0, "DE")
+    monkeypatch.setattr(type(client), "ready", property(lambda self: True))
+    assert client.healthy
+    client.report_failure(connection=True)
+    assert not client.healthy and client.wakeup.is_set()
+    client.broken_until = 0.0  # так делает удачная проверка или смена сервера
+    assert client.healthy
