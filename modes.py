@@ -55,7 +55,7 @@ TEAM_OPTIONS = (
 
 LANE_OPTIONS = (
     Option(LANES_FREE, "Договариваетесь сами", "🗣️", "Бот линии не раздаёт"),
-    Option(LANES_RANDOM, "Случайные линии", "🎲", "Каждому в команде достаётся случайная линия"),
+    Option(LANES_RANDOM, "Случайные линии", "🎲", "Случайная из своих отмеченных, без повтора прошлой катки"),
     Option(LANES_MAIN, "Свои линии", "🧭", "Ставит на линии, отмеченные в панели ролей"),
     Option(LANES_OFFROLE, "Не своя роль", "🙃", "Ставит туда, где игрок обычно не играет"),
 )
@@ -244,14 +244,67 @@ def _match(candidates: dict[int, list[str]]) -> dict[int, str] | None:
     return dict(assigned) if backtrack(0) else None
 
 
-def assign_lanes(team: Sequence[discord.Member], how: str) -> tuple[dict[int, str], bool]:
-    """Линии внутри одной команды. Второе значение — удалось ли выполнить условие режима."""
+def random_own_lanes(
+    team: Sequence[discord.Member], previous: dict[int, str], fallback: dict[int, str],
+) -> dict[int, str]:
+    """Случайные линии из отмеченных у каждого, без повтора линии прошлой катки.
+
+    Линии в команде разные, поэтому если у двоих отмечена одна и та же единственная линия, её получит
+    только один, второму выпадет другая. Отметил одну линию и она была в прошлой катке — теперь выпадет другая.
+    """
+    own: dict[int, list[str]] = {}
+    allowed: dict[int, list[str]] = {}
+    for member in team:
+        before = previous.get(member.id)
+        allowed[member.id] = [key for key in LANE_KEYS if key != before]
+        marked = [lane.key for lane in member_lanes(member) if lane.key != before]
+        # Кто линий не отмечал (или отмечал только прошлую), тому годится любая.
+        own[member.id] = marked or list(allowed[member.id])
+    return _match_own_first(allowed, own) or fallback
+
+
+def _match_own_first(options: dict[int, list[str]], own: dict[int, list[str]]) -> dict[int, str] | None:
+    """Разные линии для всех, как можно больше — из своих (жадно по перебору, команда максимум из 5)."""
+    best: dict[int, str] | None = None
+    best_score = -1
+    order = sorted(options, key=lambda player_id: (len(own[player_id]), random.random()))
+    assigned: dict[int, str] = {}
+    taken: set[str] = set()
+
+    def backtrack(index: int, score: int) -> None:
+        nonlocal best, best_score
+        if index == len(order):
+            if score > best_score:
+                best, best_score = dict(assigned), score
+            return
+        player_id = order[index]
+        choices = [lane for lane in options[player_id] if lane not in taken]
+        random.shuffle(choices)
+        choices.sort(key=lambda lane: lane not in own[player_id])
+        for lane in choices:
+            assigned[player_id] = lane
+            taken.add(lane)
+            backtrack(index + 1, score + (lane in own[player_id]))
+            taken.discard(lane)
+            del assigned[player_id]
+
+    backtrack(0, 0)
+    return best
+
+
+def assign_lanes(
+    team: Sequence[discord.Member], how: str, previous: dict[int, str] | None = None,
+) -> tuple[dict[int, str], bool]:
+    """Линии внутри одной команды. Второе значение — удалось ли выполнить условие режима.
+
+    previous — линии прошлой катки: в случайном режиме та же линия подряд не выпадает.
+    """
     if how == LANES_FREE or not team or len(team) > len(LANE_KEYS):
         return {}, how == LANES_FREE
 
     random_lanes = dict(zip((member.id for member in shuffled(team)), shuffled(LANE_KEYS)))
     if how == LANES_RANDOM:
-        return random_lanes, True
+        return random_own_lanes(team, previous or {}, random_lanes), True
 
     candidates: dict[int, list[str]] = {}
     for member in team:
