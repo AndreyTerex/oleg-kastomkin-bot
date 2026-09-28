@@ -160,3 +160,26 @@ def test_draft_view_restores_turn(make_member):
     # змейка 0,1,1,0,0,1: после трёх пиков ходит первый капитан
     assert view.current_captain.id == 1
     assert view.is_persistent()
+
+
+def test_random_lanes_come_from_own_lanes(make_member):
+    team = [make_member(1, "top"), make_member(2, "jungle"), make_member(3, "mid"),
+            make_member(4, "adc"), make_member(5, "support")]
+    for _ in range(30):
+        lanes, _ok = modes.assign_lanes(team, modes.LANES_RANDOM)
+        assert lanes == {1: "top", 2: "jungle", 3: "mid", 4: "adc", 5: "support"}
+
+
+def test_same_single_lane_is_not_given_twice_in_a_team(make_member):
+    team = [make_member(1, "mid"), make_member(2, "mid"), make_member(3, "top", "jungle")]
+    for _ in range(30):
+        lanes, _ok = modes.assign_lanes(team, modes.LANES_RANDOM)
+        assert len(set(lanes.values())) == 3 and "mid" in (lanes[1], lanes[2])
+
+
+def test_single_lane_does_not_repeat_in_the_next_game(make_member):
+    team = [make_member(1, "mid"), make_member(2, "top", "mid", "adc")]
+    for _ in range(30):
+        lanes, _ok = modes.assign_lanes(team, modes.LANES_RANDOM, previous={1: "mid", 2: "top"})
+        assert lanes[1] != "mid" and lanes[2] != "top"
+        assert lanes[2] in ("mid", "adc")  # у второго ещё есть свои линии кроме прошлой

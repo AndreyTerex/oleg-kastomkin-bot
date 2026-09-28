@@ -1388,7 +1388,7 @@ class Lobby(commands.Cog):
         previous = {
             name for names in ((record.get("deal") or {}).get("champions") or {}).values() for name in names
         }
-        lanes, notes = self.assign_team_lanes(teams, mode["lanes"])
+        lanes, notes = self.assign_team_lanes(teams, mode["lanes"], previous=self.deal_lanes(record))
         champions, champion_notes = await self.deal_for(teams, lanes, mode, exclude=previous)
 
         # Номер катки двигает отметка победителя, а не раздача: переразадать можно и посреди катки.
@@ -1456,7 +1456,7 @@ class Lobby(commands.Cog):
         return teams, lanes, champions, notes + champion_notes
 
     def assign_team_lanes(
-        self, teams: list[list[discord.Member]], how: str
+        self, teams: list[list[discord.Member]], how: str, previous: dict[int, str] | None = None,
     ) -> tuple[dict[int, str], list[str]]:
         lanes: dict[int, str] = {}
         notes: list[str] = []
@@ -1464,7 +1464,7 @@ class Lobby(commands.Cog):
             if how != modes.LANES_FREE and len(team) > len(config.LANES):
                 notes.append(f"{side_name}: игроков больше пяти — линии не раздавались.")
                 continue
-            team_lanes, satisfied = modes.assign_lanes(team, how)
+            team_lanes, satisfied = modes.assign_lanes(team, how, previous)
             lanes.update(team_lanes)
             if not satisfied:
                 wanted = "на отмеченные линии" if how == modes.LANES_MAIN else "не на свои линии"
