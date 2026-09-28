@@ -66,8 +66,8 @@ def test_human_gap():
 
 def test_pick_mood_never_repeats_and_skips_mimic_on_short_text():
     for _ in range(200):
-        mood = chat.pick_mood("гг", last="няшка")
-        assert mood[0] not in ("няшка", "подражатель")
+        mood = chat.pick_mood("гг", last="добряк")
+        assert mood[0] not in ("добряк", "подражатель")
 
 
 def test_pick_mood_prefers_matching_mood(monkeypatch):
@@ -75,13 +75,14 @@ def test_pick_mood_prefers_matching_mood(monkeypatch):
     monkeypatch.setattr(chat.random, "choices", lambda options, weights, k: seen.append(dict(zip(options, weights))) or [options[0]])
     chat.pick_mood("опять зафидил 0/9, ужас", last="")
     weights = {mood[0]: weight for mood, weight in seen[0].items()}
-    assert weights["драма-квин"] == persona.MOOD_BOOST * weights["бюрократ"]
+    assert weights["ироничный"] == persona.MOOD_BOOST * weights["хитрый"]
 
 
 def test_persona_moods_have_known_triggers():
-    names = {name for name, _ in persona.MOODS}
+    names = {name for name, _description in persona.MOODS}
+    # Описания развёрнутые, а готовых реплик-шаблонов в них нет.
+    assert all(len(description) > 150 and "→" not in description for _name, description in persona.MOODS)
     assert set(persona.MOOD_TRIGGERS) <= names
-    assert len(persona.EXAMPLES) >= persona.EXAMPLES_PER_PROMPT
 
 
 def test_describe_escapes_section_tags():
@@ -120,3 +121,21 @@ def test_roast_prompt_mentions_stats_and_quotes():
     assert "10 каток, 3 победы (30%)" in prompt
     assert "я лучший мидер" in prompt and "- нет" not in prompt
     assert "наш Бэнни" in prompt and "Петя попросил" in prompt
+
+
+def test_roast_prompt_hides_tiny_stats():
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    from stats import Record
+
+    async def history(limit):
+        return
+        yield
+
+    cog = chat.Chat.__new__(chat.Chat)
+    cog.bot = NS(get_cog=lambda name: NS(stats=NS(player=lambda g, u: Record(0, 1))))
+    cog.memory = NS(about=lambda g, u: [])
+    interaction = NS(guild=NS(id=1), user=NS(id=7, display_name="Вася"), channel=NS(history=history))
+    prompt = asyncio.run(cog.build_roast_prompt(interaction, NS(id=7, display_name="Вася", roles=[])))
+    assert "Статистика" not in prompt and "катк" not in prompt
