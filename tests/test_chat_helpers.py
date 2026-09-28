@@ -210,3 +210,21 @@ def test_roast_does_not_repeat_the_name_after_the_mention():
     assert strip_leading_name("Костяныч (Токс), Ты опять в лесу", member) == "ты опять в лесу"
     assert strip_leading_name("ты опять в лесу", member) == "ты опять в лесу"
     assert strip_leading_name("Токсичный мид — это про тебя", member) == "Токсичный мид — это про тебя"
+
+
+def test_deal_summary_lists_teams_lanes_and_champions():
+    from types import SimpleNamespace as NS
+
+    from cogs.chat import LOBBY_TOPIC, deal_summary
+
+    people = {1: NS(display_name="Кекс"), 2: NS(display_name="Анория")}
+    guild = NS(get_member=lambda i: people.get(i))
+    record = {"teams": [[1], [2]], "deal": {
+        "lanes": {"1": "top", "2": "mid"},
+        "champions": {"1": ["Камилла", "Гарен", "Сион"], "2": ["Катарина", "Люкс", "Талия"]},
+    }}
+    text = deal_summary(guild, record)
+    assert "Синяя сторона: Кекс — Top — Камилла / Гарен / Сион." in text
+    assert "Красная сторона: Анория — Mid — Катарина / Люкс / Талия." in text
+    assert deal_summary(guild, {"teams": []}) is None
+    assert LOBBY_TOPIC.search("Олег, кого лучше им забанить?")

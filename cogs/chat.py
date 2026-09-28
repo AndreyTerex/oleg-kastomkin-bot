@@ -82,7 +82,8 @@ BURST_WINDOW = 2 * 60
 
 # О сборе Олег узнаёт, только когда о нём говорят, — иначе суёт «19:00» в каждую реплику.
 LOBBY_TOPIC = re.compile(
-    r"кастом|сбор|катк|запис|кто (играет|идёт|идет|будет|в игру)|\b\d{1,2}[:.]\d{2}\b|состав|драфт|капитан|режим",
+    r"кастом|сбор|катк|запис|кто (играет|идёт|идет|будет|в игру)|\b\d{1,2}[:.]\d{2}\b|состав|драфт|капитан|режим"
+    r"|бан|забан|пик|раздач|чемп|чамп|контр|против них|соперник|команд|сторон|синие|синих|красные|красных",
     re.IGNORECASE,
 )
 # Просьбы помолчать обычными словами работают как /oleg-quiet.
@@ -875,10 +876,12 @@ class Chat(commands.Cog):
 
         going = len(record.get("in", []))
         target = record.get("target", config.TEAM_SIZE)
-        return (
+        summary = (
             f"Ближайший сбор: {record.get('time')}, записались {going} из {target}. "
             f"Играют: {names('in')}. Запасные: {names('sub')}. Не смогут: {names('out')}."
         )
+        deal = deal_summary(guild, record)
+        return f"{summary}\n{deal}" if deal else summary
 
     def player_stats(self, guild_id: int, user_id: int):
         stats_cog = self.bot.get_cog("Stats")
@@ -1225,6 +1228,29 @@ def strip_leading_name(text: str, member) -> str:
             rest = text[match.end():]
             return rest[:1].lower() + rest[1:] if rest[:1].isupper() and not rest[:2].isupper() else rest
     return text
+
+
+def deal_summary(guild: discord.Guild, record: dict) -> str | None:
+    """Команды и раздача ближайшего сбора — чтобы на «кого забанить?» Олег смотрел на настоящих чемпионов."""
+    teams = record.get("teams") or []
+    if len(teams) != 2:
+        return None
+    deal = record.get("deal") or {}
+    lanes = deal.get("lanes") or {}
+    champions = deal.get("champions") or {}
+    lines = ["Команды поделены. Раздача (игрок — линия — выпавшие чемпионы; берёт одного из них):"]
+    for side, ids in zip(("Синяя сторона", "Красная сторона"), teams):
+        players = []
+        for user_id in ids:
+            member = guild.get_member(user_id)
+            name = member.display_name if member else "игрок"
+            lane = config.LANE_BY_KEY.get(lanes.get(str(user_id)) or "")
+            picks = " / ".join(champions.get(str(user_id)) or [])
+            players.append(f"{name}" + (f" — {lane.label}" if lane else "") + (f" — {picks}" if picks else ""))
+        lines.append(f"{side}: " + "; ".join(players) + ".")
+    if not champions:
+        lines.append("Чемпионов бот не раздавал — каждый берёт кого хочет.")
+    return "\n".join(lines)
 
 
 def clean_reply(text: str, *, soft_limit: int = REPLY_SOFT_LIMIT, hard_limit: int = REPLY_LIMIT) -> str:
