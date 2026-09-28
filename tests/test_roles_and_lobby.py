@@ -28,6 +28,9 @@ def test_progress_bar():
     assert lobby.progress_bar(3, 5) == "🟩🟩🟩⬜⬜"
     assert lobby.progress_bar(10, 20) == "🟩" * 5 + "⬜" * 5
     assert lobby.progress_bar(0, 0) == ""
+    assert lobby.progress_bar(4, 10, subs=2) == "🟩" * 4 + "⬜" * 6 + "🟨" * 2
+    assert lobby.progress_bar(5, 5, subs=9) == "🟩" * 5 + "🟨" * lobby.SUB_CELLS_LIMIT
+    assert lobby.progress_bar(10, 20, subs=1) == "🟩" * 5 + "⬜" * 5 + "🟨"
 
 
 def _record(**extra):
