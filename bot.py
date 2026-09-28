@@ -11,6 +11,7 @@ from discord.ext import commands
 import champions
 import config
 import portraits
+from vpn import VPN_CLIENT
 from utils import WARNING, respond
 
 log = logging.getLogger("scrimbot")
@@ -38,6 +39,8 @@ class ScrimBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.tree.on_error = self.on_tree_error
+        # VPN поднимаем до модулей: Олег сразу ходит к Gemini через него.
+        await VPN_CLIENT.start()
 
         for extension in EXTENSIONS:
             await self.load_extension(extension)
@@ -61,6 +64,7 @@ class ScrimBot(commands.Bot):
     async def close(self) -> None:
         await champions.POOL.close()
         await portraits.close()
+        await VPN_CLIENT.close()
         await super().close()
 
     async def on_message(self, message: discord.Message) -> None:

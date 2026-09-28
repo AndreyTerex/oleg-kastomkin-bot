@@ -54,6 +54,7 @@ _RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*:\s*['\"]([\d.]+)s")
 OVERLOAD_PAUSE = 60.0
 # Провайдер не работает в стране, откуда идёт запрос (Gemini из России), — не дёргаем его часами.
 REGION_PAUSE = 6 * 3600.0
+VPN_REGION_PAUSE = 15 * 60.0
 _REGION_RE = re.compile(
     r"location is not supported|not available in your (country|region)|unsupported_country|region is not supported",
     re.IGNORECASE,
@@ -270,16 +271,18 @@ class LLMClient:
                         continue
                     if is_region_block(response.status, str(payload)):
                         # Все модели этого провайдера недоступны из этой страны — отключаем их разом.
-                        until = time.time() + REGION_PAUSE
+                        # Через VPN пауза короткая: Xray может переключиться на сервер в другой стране.
+                        pause = VPN_REGION_PAUSE if provider.proxy else REGION_PAUSE
+                        until = time.time() + pause
                         for other in self.providers:
                             if other.name == provider.name:
                                 self._blocked_until[other.label] = until
                                 self._blocked_daily[other.label] = False
                         last_error = f"{provider.name}: недоступен из этой страны"
                         log.warning(
-                            "%s не работает из вашей страны (%s). Отключаю его на %.0f ч — отвечают другие модели. "
-                            "Чтобы он заработал, укажите в .env LLM_PROXY (HTTP-прокси за рубежом).",
-                            provider.name, str(payload)[:120], REGION_PAUSE / 3600,
+                            "%s не работает из вашей страны (%s). Отключаю его на %.2g ч — отвечают другие модели. "
+                            "Чтобы он заработал, укажите в .env VPN_SUBSCRIPTION или LLM_PROXY.",
+                            provider.name, str(payload)[:120], pause / 3600,
                         )
                         continue
                     if response.status in (500, 502, 503, 504):
