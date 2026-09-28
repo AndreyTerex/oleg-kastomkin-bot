@@ -89,6 +89,7 @@ def format_players(
     mention: bool = True,
     captain: discord.Member | None = None,
     empty: str = "—",
+    start: int = 1,
 ) -> str:
     """Список участников для поля эмбеда.
 
@@ -99,11 +100,11 @@ def format_players(
     if not members:
         return empty
     lines = []
-    for index, member in enumerate(members, start=1):
+    for index, member in enumerate(members, start=start):
         if captain is not None and member.id == captain.id:
             prefix = "👑 "
         elif numbered:
-            prefix = f"`{index}.` "
+            prefix = f"`{index:>2}.` " if start + len(members) > 10 else f"`{index}.` "
         else:
             prefix = "• "
         name = member.mention if mention else f"**{player_name(member)}**"

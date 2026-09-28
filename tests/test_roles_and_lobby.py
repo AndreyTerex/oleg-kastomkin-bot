@@ -25,12 +25,32 @@ def test_author_can_manage_only_below_top_role():
 
 
 def test_progress_bar():
-    assert lobby.progress_bar(3, 5) == "🟩🟩🟩⬜⬜"
-    assert lobby.progress_bar(10, 20) == "🟩" * 5 + "⬜" * 5
+    assert lobby.progress_bar(3, 5) == "▰▰▰▱▱"
+    assert lobby.progress_bar(10, 20) == "▰" * 5 + "▱" * 5
     assert lobby.progress_bar(0, 0) == ""
-    assert lobby.progress_bar(4, 10, subs=2) == "🟩" * 4 + "⬜" * 6 + "🟨" * 2
-    assert lobby.progress_bar(5, 5, subs=9) == "🟩" * 5 + "🟨" * lobby.SUB_CELLS_LIMIT
-    assert lobby.progress_bar(10, 20, subs=1) == "🟩" * 5 + "⬜" * 5 + "🟨"
+    assert lobby.progress_bar(1, 40) == "▰" + "▱" * 9  # один записавшийся всё равно виден
+    assert lobby.progress_bar(12, 10) == "▰" * 10
+
+
+def test_fill_line_and_color():
+    assert lobby.fill_line(6, 10, subs=2) == "`▰▰▰▰▰▰▱▱▱▱` **6/10** · не хватает 4 · в запасе 2"
+    assert lobby.fill_line(10, 10) == "`▰▰▰▰▰▰▰▰▰▰` **10/10** · состав собран"
+    assert lobby.fill_color(3, 10) == lobby.COLOR_FILLING
+    assert lobby.fill_color(7, 10) == lobby.COLOR_ALMOST
+    assert lobby.fill_color(10, 10) == lobby.COLOR_READY
+
+
+def test_slots_show_free_places_in_two_columns():
+    from types import SimpleNamespace as NS
+
+    people = [NS(id=i, mention=f"<@{i}>", roles=[]) for i in range(7)]
+    columns = lobby.slot_columns(people, 10, "✅ Основной состав")
+    assert [name for name, _ in columns] == ["✅ Основной состав", "\u200b"]
+    left, right = columns[0][1].splitlines(), columns[1][1].splitlines()
+    assert len(left) == len(right) == 5
+    assert left[0].startswith("` 1` <@0>") and right[1].startswith("` 7` <@6>")
+    assert right[2] == "` 8` ◦ *свободно*" and right[-1] == "`10` ◦ *свободно*"
+    assert len(lobby.slot_columns(people[:2], 5, "x")) == 1
 
 
 def _record(**extra):
