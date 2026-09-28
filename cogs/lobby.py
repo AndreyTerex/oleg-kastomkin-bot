@@ -779,29 +779,9 @@ class RosterEditView(discord.ui.View):
 
         guild = self.lobby_message.guild
         limit = self.record.get("target", config.TEAM_SIZE)
-        changed: list[int] = []
-        overflow: list[int] = []
-
-        for user_id in (int(value) for value in self.select.values):
-            for key in (STATUS_IN, STATUS_SUB, STATUS_OUT):
-                if user_id in self.record[key]:
-                    self.record[key].remove(user_id)
-
-            # В состав больше нужного не пускаем даже организатора — иначе счётчик врёт.
-            overflowed = target_status == STATUS_IN and len(self.record[STATUS_IN]) >= limit
-            set_waiting(self.record, user_id, overflowed)
-            if overflowed:
-                self.record[STATUS_SUB].append(user_id)
-                overflow.append(user_id)
-                continue
-
-            if target_status is not None:
-                self.record[target_status].append(user_id)
-            changed.append(user_id)
-
-        promoted = []
-        while (member := self.cog.promote_sub(guild, self.record)) is not None:
-            promoted.append(member)
+        changed, overflow, promoted = self.cog.apply_move(
+            guild, self.record, [int(value) for value in self.select.values], target_status
+        )
 
         await self.cog.save()
         await self.lobby_message.edit(
@@ -1210,10 +1190,50 @@ class Lobby(commands.Cog):
 
     def is_organizer(self, interaction: discord.Interaction, record: dict) -> bool:
         """Управлять ходом сбора может автор объявления или организатор ивентов."""
-        return (
-            interaction.user.id == record["author_id"]
-            or interaction.user.guild_permissions.manage_events
-        )
+        return self.is_organizer_member(interaction.user, record)
+
+    @staticmethod
+    def is_organizer_member(member: discord.Member, record: dict) -> bool:
+        return member.id == record["author_id"] or member.guild_permissions.manage_events
+
+    def apply_move(
+        self, guild: discord.Guild, record: dict, user_ids: list[int], target_status: str | None
+    ) -> tuple[list[int], list[int], list[discord.Member]]:
+        """Переносит игроков (None — убрать из сбора). Возвращает перенесённых, не влезших в состав
+        (они в запасе и в очереди) и поднятых из очереди на освободившиеся места."""
+        limit = record.get("target", config.TEAM_SIZE)
+        changed: list[int] = []
+        overflow: list[int] = []
+        for user_id in user_ids:
+            for key in (STATUS_IN, STATUS_SUB, STATUS_OUT):
+                if user_id in record[key]:
+                    record[key].remove(user_id)
+            # В состав больше нужного не пускаем даже организатора — иначе счётчик врёт.
+            overflowed = target_status == STATUS_IN and len(record[STATUS_IN]) >= limit
+            set_waiting(record, user_id, overflowed)
+            if overflowed:
+                record[STATUS_SUB].append(user_id)
+                overflow.append(user_id)
+                continue
+            if target_status is not None:
+                record[target_status].append(user_id)
+            changed.append(user_id)
+        promoted = []
+        while (member := self.promote_sub(guild, record)) is not None:
+            promoted.append(member)
+        return changed, overflow, promoted
+
+    async def refresh_post(self, message_id: int | str, record: dict) -> None:
+        """Перерисовывает пост сбора, когда состав поменяли не кнопкой под ним."""
+        channel = self.bot.get_channel(record["channel_id"])
+        if channel is None:
+            return
+        try:
+            await channel.get_partial_message(int(message_id)).edit(
+                embed=self.build_embed(channel.guild, record), view=LobbyView(record)
+            )
+        except discord.HTTPException:
+            log.exception("Не удалось обновить пост сбора %s", message_id)
 
     def members_from_ids(self, guild: discord.Guild, ids) -> list[discord.Member]:
         return [member for user_id in (ids or []) if (member := guild.get_member(user_id))]

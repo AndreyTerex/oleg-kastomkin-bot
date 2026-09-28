@@ -32,6 +32,7 @@ from discord.ext import commands
 
 import config
 import persona
+import lobby_requests
 import role_requests
 from llm import LLMClient, LLMUnavailable, build_providers
 from memory import Memory
@@ -110,6 +111,12 @@ SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 OWN_NAME = "Олег (ты)"
 # Паузу в разговоре длиннее этой модель видит отдельной строкой.
 PAUSE_VISIBLE = timedelta(minutes=30)
+
+# Чуть ниже единицы: при 1.0 бесплатные модели чаще уносит в бессвязные метафоры.
+REPLY_TEMPERATURE = 0.85
+
+# Статистику каток Олег упоминает, только когда катка набралось хотя бы столько.
+STATS_MIN_GAMES = 3
 
 # Прожарка: сколько сообщений канала просмотреть, сколько реплик человека взять и какой длины ответ.
 ROAST_HISTORY_SCAN = 150
@@ -208,6 +215,8 @@ class Chat(commands.Cog):
                 await self.go_quiet(message)
                 return
             if await self.handle_roles(message):
+                return
+            if await self.handle_lobby(message):
                 return
             if await self.handle_memory(message):
                 return
@@ -375,7 +384,8 @@ class Chat(commands.Cog):
 
             async with message.channel.typing():
                 reply = await self.client.complete(
-                    persona.PERSONA, prompt, validate=lambda text: choose(text) is not None
+                    persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
+                    validate=lambda text: choose(text) is not None,
                 )
             text, state.last_tail = tidy_tail(clean_reply(choose(reply.text) or ""), state.last_tail)
             if not text:
@@ -426,7 +436,7 @@ class Chat(commands.Cog):
             lanes = ", ".join(lane.label for lane in member_lanes(member)) or "линии не отмечены"
             line = f"- {one_line(member.display_name)}: {lanes}"
             record = self.player_stats(message.guild.id, member.id)
-            if record is not None and record.games:
+            if record is not None and record.games >= STATS_MIN_GAMES:
                 line += f"; статистика кастомок: {record.describe()}"
             people.append(line)
         if people:
@@ -469,11 +479,9 @@ class Chat(commands.Cog):
         if mood is not None:
             task_parts.insert(0, persona.MOOD_LINE.format(name=mood[0], description=mood[1]))
 
-        examples = random.sample(persona.EXAMPLES, min(persona.EXAMPLES_PER_PROMPT, len(persona.EXAMPLES)))
         sections = [
             section("context", "\n\n".join(facts)),
             section("memory", "\n".join(memories)) if memories else "",
-            section("examples", "\n".join(f"- {where} → «{text}»" for where, text in examples)),
             section("chat", f"Канал #{message.channel}\n" + "\n".join(lines)),
             section("task", "\n".join(task_parts)),
         ]
@@ -522,6 +530,62 @@ class Chat(commands.Cog):
             await message.reply(text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException:
             log.exception("Не удалось ответить в чат")
+
+    async def handle_lobby(self, message: discord.Message) -> bool:
+        """«Олег, переведи катаза в основной состав» — меняет состав ближайшего сбора, как кнопки под постом."""
+        lobby_cog = self.bot.get_cog("Lobby")
+        if lobby_cog is None:
+            return False
+        guild = message.guild
+        found = lobby_cog.latest_open_record(guild)
+        record = found[1] if found else {}
+        participants = lobby_cog.members_from_ids(
+            guild, (record.get("in") or []) + (record.get("sub") or []) + (record.get("out") or [])
+        )
+        request = lobby_requests.parse(message, self.bot.user, participants)
+        if request is not None and not request.targets:
+            # Кого нет в сборе, ищем среди всех — «запиши Васю в состав», когда Вася ещё не записан.
+            others = [m for m in guild.members if not m.bot and m not in participants]
+            request = lobby_requests.parse(message, self.bot.user, others)
+        if request is None:
+            return False
+        if found is None:
+            await self.say(message, persona.LOBBY_NONE)
+            return True
+        if not request.targets:
+            await self.say(message, persona.LOBBY_WHO)
+            return True
+        author = message.author
+        if any(t.id != author.id for t in request.targets) and not lobby_cog.is_organizer_member(author, record):
+            await self.say(message, persona.LOBBY_FORBIDDEN)
+            return True
+
+        message_id, record = found
+        status = {
+            lobby_requests.STATUS_IN: "in", lobby_requests.STATUS_SUB: "sub", lobby_requests.REMOVE: None,
+        }[request.status]
+        changed, overflow, promoted = lobby_cog.apply_move(guild, record, [t.id for t in request.targets], status)
+        await lobby_cog.save()
+        await lobby_cog.refresh_post(message_id, record)
+
+        names = {member.id: member.display_name for member in request.targets}
+        parts = []
+        if changed:
+            template = {"in": persona.LOBBY_TO_IN, "sub": persona.LOBBY_TO_SUB, None: persona.LOBBY_REMOVED}[status]
+            parts.append(template.format(who=", ".join(names[i] for i in changed)))
+        if overflow:
+            parts.append(persona.LOBBY_FULL.format(who=", ".join(names[i] for i in overflow)))
+        if promoted:
+            parts.append(persona.LOBBY_PROMOTED.format(who=" ".join(m.mention for m in promoted)))
+        try:
+            await message.reply(
+                " ".join(parts), mention_author=False,
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=promoted),
+            )
+        except discord.HTTPException:
+            log.exception("Не удалось ответить на просьбу про состав")
+        log.info("Состав сбора %s по просьбе %s: %s → %s", message_id, author, list(names.values()), status)
+        return True
 
     async def handle_roles(self, message: discord.Message) -> bool:
         request = role_requests.parse(message, self.bot.user)
@@ -717,9 +781,11 @@ class Chat(commands.Cog):
         guild = interaction.guild
         about = [f"Сейчас {now_msk()}.", f"Кого прожариваешь: {one_line(target.display_name)}."]
         lanes = ", ".join(lane.label for lane in member_lanes(target))
-        about.append(f"Линии: {lanes}." if lanes else "Линии в панели не отмечены — даже тут не определился.")
+        if lanes:
+            about.append(f"Отмеченные линии: {lanes}.")
         record = self.player_stats(guild.id, target.id)
-        if record is not None:
+        # Пара каток — не статистика: «ноль каток» у того, кто просто ещё не отмечал, звучит как враньё.
+        if record is not None and record.games >= STATS_MIN_GAMES:
             about.append(f"Статистика кастомок: {record.describe()}.")
         facts = self.memory.about(guild.id, target.id)
         memory = "\n".join(f"- {fact}" for fact in facts[-6:])
@@ -774,7 +840,8 @@ class Chat(commands.Cog):
         prompt = await self.build_roast_prompt(interaction, target)
         try:
             reply = await self.client.complete(
-                persona.PERSONA, prompt, validate=lambda text: pick_variant(text) is not None
+                persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
+                validate=lambda text: pick_variant(text) is not None,
             )
         except LLMUnavailable:
             await interaction.followup.send(random.choice(persona.SLEEPY_LINES))
@@ -984,7 +1051,7 @@ def pick_mood(text: str, last: str) -> tuple[str, str]:
         trigger = persona.MOOD_TRIGGERS.get(name)
         if trigger is not None and trigger.search(text or ""):
             weight *= persona.MOOD_BOOST
-        if name == "сонный" and hour in persona.SLEEPY_HOURS:
+        if name == "ленивый" and hour in persona.SLEEPY_HOURS:
             weight *= persona.MOOD_BOOST
         if name == "подражатель" and len(text or "") < persona.MIMIC_MIN_LENGTH:
             weight = 0.0
