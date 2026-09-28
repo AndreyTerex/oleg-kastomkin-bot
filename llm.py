@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import aiohttp
@@ -54,9 +55,8 @@ _RETRY_RE = re.compile(r"try again in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s")
 _RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*:\s*['\"]([\d.]+)s")
 # Сбои на стороне провайдера («модель перегружена») — пропускаем его ненадолго.
 OVERLOAD_PAUSE = 20.0
-# Gemini постоянно отвечает 503 «high demand», но через пару секунд обычно отвечает — и он заметно умнее запасных.
-# Поэтому перегруженную модель переспрашиваем с нарастающей паузой (LLM_OVERLOAD_RETRIES раз за запрос),
-# и только потом идём к следующей.
+# Gemini часто отвечает 503 «high demand», но через пару секунд обычно отвечает. Модель с большим лимитом
+# (Flash Lite, Groq) переспрашиваем с нарастающей паузой (LLM_OVERLOAD_RETRIES раз), «редкую» — нет.
 OVERLOAD_RETRY_DELAYS = (2.0, 4.0, 8.0)
 _OVERLOADED = "перегружен"
 # Провайдер не работает в стране, откуда идёт запрос (Gemini из России), — не дёргаем его часами.
@@ -84,6 +84,9 @@ class Provider:
     max_tokens: int = 900
     timeout: float = 30.0
     proxy: str | None = None
+    # Модель с крошечным суточным лимитом (Gemini Flash на бесплатном тарифе — 20 запросов в день):
+    # не переспрашиваем её при перегрузке и не тратим на необязательные реплики.
+    scarce: bool = False
 
     @property
     def label(self) -> str:
@@ -106,6 +109,11 @@ class LLMUnavailable(Exception):
         self.daily = daily
 
 
+def is_scarce_gemini(model: str) -> bool:
+    """У бесплатного Gemini «Flash» — 20 запросов в день на модель, у «Flash Lite» — сотни (см. GEMINI_SCARCE)."""
+    return any(part in model for part in config.GEMINI_SCARCE) and "lite" not in model
+
+
 def build_providers() -> list[Provider]:
     """Цепочка провайдеров в порядке LLM_ORDER (по умолчанию Groq → остальные)."""
     providers: list[Provider] = []
@@ -119,6 +127,7 @@ def build_providers() -> list[Provider]:
             options={"reasoning_effort": "low"},
             max_tokens=1500,  # вместе с размышлениями
             timeout=25.0,
+            scarce=is_scarce_gemini(model),
         ))
     for model in config.TOKENHARBOR_MODELS:
         providers.append(Provider(
@@ -180,6 +189,19 @@ def order_providers(providers: list[Provider], order: list[str]) -> list[Provide
     return sorted(providers, key=lambda provider: rank.get(provider.name, len(rank)))
 
 
+def seconds_until_google_reset(now: float | None = None) -> float:
+    """Секунды до полуночи по тихоокеанскому времени — тогда Google обнуляет суточные лимиты Gemini."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo("America/Los_Angeles")
+    except Exception:  # нет базы часовых поясов — берём зимнее смещение, ошибка максимум на час
+        zone = timezone(timedelta(hours=-8))
+    current = datetime.fromtimestamp(time.time() if now is None else now, zone)
+    midnight = (current + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max((midnight - current).total_seconds(), 60.0)
+
+
 def _rate_limit_wait(message: str, headers, daily: bool) -> float:
     retry = headers.get("retry-after")
     if retry:
@@ -225,32 +247,26 @@ class LLMClient:
         *,
         temperature: float = 1.0,
         validate: Callable[[str], bool] | None = None,
+        economy: bool = False,
     ) -> Reply:
         """Первый годный ответ по цепочке. `validate` бракует ответ — тогда спрашиваем следующую модель.
 
-        Модели провайдеров из LLM_RACE (по умолчанию Gemini) спрашиваются одновременно, каждая со своими
-        повторами при перегрузке; берём ответ той, что ответила первой, остальные запросы отменяем.
+        economy=True — необязательная реплика (Олег сам встрял, разбор «запомни»): модели с крошечным суточным
+        лимитом пропускаем, чтобы они остались для прямых обращений и прожарок.
         """
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
 
         errors: list[str] = []
-        index = 0
-        while index < len(self.providers):
-            provider = self.providers[index]
-            group = [provider]
-            if provider.name in config.LLM_RACE:
-                while index + len(group) < len(self.providers) and self.providers[index + len(group)].name == provider.name:
-                    group.append(self.providers[index + len(group)])
-            index += len(group)
-            ready = [item for item in group if self._blocked_until.get(item.label, 0) <= time.time()]
-            if not ready:
+        for provider in self.providers:
+            if economy and provider.scarce:
                 continue
-            retries = config.LLM_OVERLOAD_RETRIES if provider.name in config.LLM_RACE else 0
-            if len(ready) == 1:
-                reply = await self._ask_with_retries(ready[0], system, user, temperature, validate, retries, errors)
-            else:
-                reply = await self._race(ready, system, user, temperature, validate, retries, errors)
+            if self._blocked_until.get(provider.label, 0) > time.time():
+                continue
+            # Перегруженную «редкую» модель не переспрашиваем: неудачный запрос тоже съедает её суточный лимит,
+            # а следующая модель Gemini в цепочке — со своим лимитом, это и есть повтор.
+            retries = 0 if provider.scarce else config.LLM_OVERLOAD_RETRIES
+            reply = await self._ask_with_retries(provider, system, user, temperature, validate, retries, errors)
             if reply is not None:
                 return reply
         last_error = errors[-1] if errors else "нет доступных моделей"
@@ -264,28 +280,8 @@ class LLMClient:
             )
         raise LLMUnavailable(last_error)
 
-    async def _race(self, providers, system, user, temperature, validate, retries, errors) -> Reply | None:
-        """Спрашивает модели одновременно; первый годный ответ побеждает, остальные запросы отменяются."""
-        tasks = {
-            asyncio.create_task(self._ask_with_retries(item, system, user, temperature, validate, retries, errors))
-            for item in providers
-        }
-        try:
-            while tasks:
-                done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    reply = task.result()
-                    if reply is not None:
-                        return reply
-            return None
-        finally:
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
     async def _ask_with_retries(self, provider, system, user, temperature, validate, retries, errors) -> Reply | None:
-        """Одна модель: при перегрузке переспрашиваем с нарастающей паузой, потом отдыхает OVERLOAD_PAUSE."""
+        """Одна модель: при перегрузке переспрашиваем с нарастающей паузой, потом она отдыхает OVERLOAD_PAUSE."""
         for attempt in range(retries + 1):
             result = await self._ask(provider, system, user, temperature, validate)
             if isinstance(result, Reply):
@@ -336,6 +332,11 @@ class LLMClient:
                         r"per[ _-]?day|month|week|7-day|allowance|quota", message, re.IGNORECASE
                     ))
                     wait = _rate_limit_wait(message, response.headers, daily)
+                    if provider.name == "gemini" and "PerDay" in message:
+                        # Кончился суточный лимит модели (…RequestsPerDay…): Google сбрасывает его в полночь
+                        # по тихоокеанскому времени, а retryDelay в ответе — секунды, из-за которых
+                        # закончившуюся модель дёргали бы каждые полминуты.
+                        wait = max(wait, seconds_until_google_reset())
                     # Короткая пауза — это поминутный лимит, даже если в тексте есть слово «quota».
                     daily = daily and wait >= 3600
                     log.warning(

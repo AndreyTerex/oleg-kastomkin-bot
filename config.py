@@ -76,8 +76,16 @@ HF_MODELS: list[str] = [
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODELS: list[str] = [
     model.strip()
-    for model in os.getenv("GEMINI_MODELS", "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite").split(",")
+    for model in os.getenv(
+        "GEMINI_MODELS",
+        "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-3.5-flash-lite",
+    ).split(",")
     if model.strip()
+]
+# Модели с крошечным бесплатным лимитом (20 запросов в день): их берегут для прямых обращений к Олегу
+# и не переспрашивают при перегрузке. Считаются все Gemini с этими словами в названии, кроме «-lite».
+GEMINI_SCARCE: list[str] = [
+    part.strip().lower() for part in os.getenv("GEMINI_SCARCE", "flash").split(",") if part.strip()
 ]
 
 # VPN для нейросетей, закрытых из России (см. vpn.py): подписка и/или ключи vless://, trojan://, vmess://.
@@ -121,10 +129,6 @@ VPN_PROXY_URL: str = f"http://127.0.0.1:{VPN_PORT}" if (VPN_SUBSCRIPTION or VPN_
 LLM_PROXY: str = os.getenv("LLM_PROXY", "").strip() or VPN_PROXY_URL
 # Сколько раз за запрос переспрашивать перегруженную модель (HTTP 503) перед переходом к следующей.
 LLM_OVERLOAD_RETRIES: int = max(0, _env_int("LLM_OVERLOAD_RETRIES", 3))
-# Модели этих провайдеров спрашиваются одновременно — берём ответ той, что ответит первой.
-LLM_RACE: list[str] = [
-    name.strip().lower() for name in os.getenv("LLM_RACE", "gemini").split(",") if name.strip()
-]
 LLM_PROXY_FOR: list[str] = [
     name.strip().lower() for name in os.getenv("LLM_PROXY_FOR", "all").split(",") if name.strip()
 ]
