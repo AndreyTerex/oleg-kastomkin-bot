@@ -58,6 +58,9 @@ PROBE_BATCH = 32
 XRAY_ENV = {**os.environ, "GOMAXPROCS": "1"}
 # Сообщения «прокси упал» от нейросети чаще этого не запускают новую проверку.
 FAILURE_DEBOUNCE = 60
+# Прокси не довёз запрос — столько секунд считаем VPN сломанным (нейросети идут напрямую),
+# пока проверка не подтвердит рабочий сервер.
+BROKEN_PAUSE = 180
 # Без рабочего сервера (режим «напрямую») все серверы перепроверяются так часто.
 DIRECT_RETRY_HOURS = 0.5
 FRAGMENT_TAG = "fragment"
@@ -306,6 +309,7 @@ class VPN:
         self.lock = asyncio.Lock()
         self.last_failure_report = 0.0
         self.need_full = False
+        self.broken_until = 0.0
         self.started = False
 
     # --- настройки
@@ -492,6 +496,7 @@ class VPN:
             self.invalid.add(server.fingerprint)
             return False
         self.current = result
+        self.broken_until = 0.0
         self.state.select(result)
         await self.state.save()
         return True
@@ -547,11 +552,24 @@ class VPN:
 
     # --- перепроверка
 
-    def report_failure(self, *, region: bool = False) -> None:
-        """Нейросеть не достучалась через прокси: сразу перепроверить (не чаще раза в минуту)."""
+    @property
+    def healthy(self) -> bool:
+        """Через прокси можно ходить: Xray запущен и недавно не ронял соединения."""
+        return self.ready and time.time() >= self.broken_until
+
+    def report_failure(self, *, region: bool = False, connection: bool = False) -> None:
+        """Нейросеть не достучалась через прокси: сразу перепроверить (не чаще раза в минуту).
+
+        connection=True — прокси не установил соединение: пока проверка не найдёт рабочий сервер,
+        запросы идут напрямую (Groq и другие работают и из России), а не ждут таймаутов.
+        """
         if not self.started:
             return
         now = time.time()
+        if connection and self.current is not None:
+            if now >= self.broken_until:
+                log.warning("VPN: сервер «%s» не довёз запрос — пока хожу напрямую, проверяю серверы", self.current.name)
+            self.broken_until = now + BROKEN_PAUSE
         if region and self.current is not None:
             # Выход сервера в стране, куда нейросеть не пускает, — этот сервер больше не выбираем.
             self.state.data["blacklist"][self.current.fingerprint] = now
@@ -596,6 +614,7 @@ class VPN:
             log.info("VPN: текущий сервер «%s» перестал подходить — проверяю остальные", current.name)
             return False
         self.current = result
+        self.broken_until = 0.0
         self.state.select(result)
         await self.state.save()
         log.debug("VPN: «%s» в порядке (%s, %.0f мс)", result.name, result.country, result.latency_ms or 0)

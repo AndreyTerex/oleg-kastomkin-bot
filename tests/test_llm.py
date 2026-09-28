@@ -193,3 +193,57 @@ def test_seconds_until_google_reset_is_within_a_day():
     import llm
 
     assert 60 <= llm.seconds_until_google_reset() <= 25 * 3600
+
+
+def test_broken_vpn_sends_next_models_direct(monkeypatch):
+    import asyncio
+
+    import aiohttp
+
+    import config
+    import llm
+
+    vpn_url = "http://127.0.0.1:10809"
+    monkeypatch.setattr(config, "VPN_PROXY_URL", vpn_url)
+
+    class FakeVpn:
+        healthy = True
+        reports = []
+
+        def report_failure(self, **kwargs):
+            self.reports.append(kwargs)
+            if kwargs.get("connection"):
+                self.healthy = False
+
+    fake = FakeVpn()
+    monkeypatch.setattr(llm, "VPN_CLIENT", fake)
+
+    class Session:
+        closed = False
+        proxies = []
+
+        def post(self, url, **kwargs):
+            self.proxies.append(kwargs["proxy"])
+            proxy = kwargs["proxy"]
+
+            class Pending:
+                async def __aenter__(self_inner):
+                    if proxy:
+                        raise aiohttp.ClientConnectionError("SSL handshake is taking longer than 8 seconds")
+                    return _FakeResponse(*_ok("ответ напрямую"))
+
+                async def __aexit__(self_inner, *exc):
+                    return False
+
+            return Pending()
+
+    chain = [
+        Provider(name="gemini", url="u", api_key="k", model="gemini-3.8-flash", proxy=vpn_url, scarce=True),
+        Provider(name="groq", url="u", api_key="k", model="oss", proxy=vpn_url),
+    ]
+    client = llm.LLMClient(chain)
+    client._session = Session()
+    reply = asyncio.run(client.complete("s", "u"))
+    assert reply.text == "ответ напрямую" and reply.model == "groq:oss"
+    assert client._session.proxies == [vpn_url, None]  # Groq уже без прокси, без ожидания таймаутов
+    assert fake.reports == [{"connection": True}]
