@@ -9,7 +9,7 @@ import asyncio
 import logging
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
@@ -23,7 +23,7 @@ from champions import POOL, ChampionsUnavailable
 from cogs.scrim import DraftView
 from storage import JsonStore
 from timeparse import parse_when
-from utils import BLUE_SIDE, NEUTRAL, RED_SIDE, format_players, player_name, respond, shuffled
+from utils import BLUE_SIDE, NEUTRAL, RED_SIDE, format_players, lanes_badge, player_name, respond, shuffled
 
 log = logging.getLogger("scrimbot.lobby")
 
@@ -32,7 +32,7 @@ STATUS_SUB = "sub"
 STATUS_OUT = "out"
 
 STATUS_TITLES = {
-    STATUS_IN: "✅ Играют",
+    STATUS_IN: "✅ Основной состав",
     STATUS_SUB: "🕐 Запасные",
     STATUS_OUT: "❌ Не смогут",
 }
@@ -41,8 +41,8 @@ KIND_SCRIM = "scrim"
 KIND_CUSTOM = "custom"
 
 KIND_TITLES = {
-    KIND_SCRIM: "Сбор на скрим",
-    KIND_CUSTOM: "Сбор на кастомку 5×5",
+    KIND_SCRIM: "⚔️ Скрим",
+    KIND_CUSTOM: "🎮 Кастомка 5×5",
 }
 
 # Стадии сбора: по ним включаются кнопки.
@@ -140,21 +140,66 @@ def set_waiting(record: dict, user_id: int, waiting: bool) -> None:
         queue.append(user_id)
 
 
-# Запасных в полоске не больше стольких клеток, чтобы строка не уезжала за край.
-SUB_CELLS_LIMIT = 5
+# Цвет карточки по заполнению: идёт набор → почти собрались → состав полный.
+COLOR_FILLING = NEUTRAL
+COLOR_ALMOST = discord.Color(0xF59E0B)
+COLOR_READY = discord.Color(0x22C55E)
+# С какой доли состава сбор считается «почти собранным».
+ALMOST_SHARE = 0.7
+# Больше стольких игроков — список делится на две колонки.
+SPLIT_AFTER = 5
 
 
-def progress_bar(done: int, total: int, width: int = 10, subs: int = 0) -> str:
-    """Полоска набора: «🟩🟩🟩⬜⬜🟨» — состав, свободные места и запасные в конце.
-
-    При большом сборе клетка — несколько игроков, запасные считаются в том же масштабе.
-    """
+def progress_bar(done: int, total: int, width: int = 10) -> str:
+    """Тонкая полоска набора «▰▰▰▰▰▰▱▱▱▱». При большом сборе клетка — несколько игроков."""
     if total <= 0:
         return ""
     cells = min(total, width)
     filled = min(cells, round(done * cells / total))
-    sub_cells = min(SUB_CELLS_LIMIT, max(1 if subs else 0, round(subs * cells / total)))
-    return "🟩" * filled + "⬜" * (cells - filled) + "🟨" * sub_cells
+    if done and not filled:
+        filled = 1  # хоть кто-то записался — это видно
+    return "▰" * filled + "▱" * (cells - filled)
+
+
+def fill_line(done: int, total: int, subs: int = 0) -> str:
+    """Строка под шапкой: полоска, счёт и сколько не хватает / сколько в запасе."""
+    parts = [f"`{progress_bar(done, total)}` **{done}/{total}**"]
+    if done >= total:
+        parts.append("состав собран")
+    else:
+        parts.append(f"не хватает {total - done}")
+    if subs:
+        parts.append(f"в запасе {subs}")
+    return " · ".join(parts)
+
+
+def fill_color(done: int, total: int) -> discord.Color:
+    if total > 0 and done >= total:
+        return COLOR_READY
+    if total > 0 and done >= total * ALMOST_SHARE:
+        return COLOR_ALMOST
+    return COLOR_FILLING
+
+
+def slot_columns(members, target: int, heading: str) -> list[tuple[str, str]]:
+    """Слоты состава, как в лобби игры: занятые — с игроками, свободные — «свободно».
+
+    До SPLIT_AFTER слотов — одна колонка, больше — две (5 × 2 для кастомки) со сквозной нумерацией.
+    """
+    total = max(target, len(members))
+    lines = []
+    for index in range(total):
+        number = f"`{index + 1:>2}`" if total >= 10 else f"`{index + 1}`"
+        if index < len(members):
+            member = members[index]
+            badge = f" {lanes_badge(member)}".rstrip()
+            lines.append(f"{number} {member.mention}{badge}")
+        else:
+            lines.append(f"{number} ◦ *свободно*")
+    if total <= SPLIT_AFTER:
+        return [(heading, "\n".join(lines) or "—")]
+    half = (total + 1) // 2
+    return [(heading, "\n".join(lines[:half])), ("\u200b", "\n".join(lines[half:]))]
 
 
 class LobbyView(discord.ui.View):
@@ -1447,38 +1492,53 @@ class Lobby(commands.Cog):
         stage = record.get("stage", STAGE_SIGNUP)
         target = record.get("target", config.TEAM_SIZE)
 
+        mode = modes.get_mode(record)
+        series = record.get("series", DEFAULT_SERIES)
         title = KIND_TITLES.get(kind, KIND_TITLES[KIND_SCRIM])
+        if kind != KIND_SCRIM:
+            title += f" · Bo{series}"
         if closed:
-            title += " (отменён)"
+            title += " · отменён"
 
+        # Крупно — когда; мелким серым — подробности: так карточка читается с одного взгляда.
         start_at = record.get("start_at")
         if start_at:
             # Discord сам покажет время в часовом поясе каждого, а «через 2 часа» будет тикать.
-            lines = [f"🕒 **Когда:** <t:{int(start_at)}:F> · <t:{int(start_at)}:R>"]
+            lines = [f"### 🕒 <t:{int(start_at)}:f> · <t:{int(start_at)}:R>"]
         else:
-            lines = [f"🕒 **Когда:** {record['time']}"]
-        if record.get("opponent"):
-            lines.append(f"⚔️ **Соперник:** {record['opponent']}")
-        if record.get("note"):
-            lines.append(f"📝 {record['note']}")
-        mode = modes.get_mode(record)
+            lines = [f"### 🕒 {record['time']}"]
+        details = []
         if kind != KIND_SCRIM:
-            mode_line = f"🎮 **Режим:** {modes.mode_title(mode)} · Bo{record.get('series', DEFAULT_SERIES)}"
+            mode_text = modes.mode_title(mode)
             if modes.find_preset(mode) is None:
-                mode_line += f" — {modes.mode_summary(mode)}"
-            lines.append(mode_line)
-
+                mode_text += f" — {modes.mode_summary(mode)}"
+            details.append(f"Режим {mode_text}")
+        if record.get("opponent"):
+            details.append(f"⚔️ Соперник {record['opponent']}")
+        if details:
+            lines.append("-# " + " · ".join(details))
+        if record.get("note"):
+            lines.append(f"> {record['note']}")
         if record.get("results"):
             lines.append(self.score_line(record))
 
-        embed = discord.Embed(
-            title=title,
-            description="\n".join(lines),
-            color=discord.Color.dark_grey() if closed else NEUTRAL,
-        )
-
+        going = len(self.signed_players(guild, record))
+        members_in = self.members_from_ids(guild, record[STATUS_IN])
+        subs = len(record[STATUS_SUB])
         captains = self.members_from_ids(guild, record.get("captains"))
         teams = [self.members_from_ids(guild, ids) for ids in (record.get("teams") or [])]
+
+        if len(teams) != 2 and not closed:
+            lines.append("")
+            lines.append(fill_line(len(members_in), target, subs))
+        if closed:
+            color = discord.Color.dark_grey()
+        elif len(teams) == 2:
+            color = COLOR_READY
+        else:
+            color = fill_color(len(members_in), target)
+
+        embed = discord.Embed(title=title, description="\n".join(lines), color=color)
 
         lanes = self.deal_lanes(record)
         if len(teams) == 2:
@@ -1489,32 +1549,26 @@ class Lobby(commands.Cog):
                 else:
                     value = format_players(team, numbered=True, show_lanes=False, mention=False, captain=captain)
                 embed.add_field(name=f"{side_name} ({len(team)})", value=value, inline=True)
-            for status in (STATUS_SUB, STATUS_OUT):
-                members = self.members_from_ids(guild, record[status])
-                if members:
-                    embed.add_field(name=STATUS_TITLES[status], value=format_players(members), inline=False)
         else:
-            for status, heading in STATUS_TITLES.items():
-                members = self.members_from_ids(guild, record[status])
-                if status == STATUS_IN:
-                    embed.add_field(
-                        name=f"{heading} {len(members)}/{target}",
-                        value=(
-                            f"{progress_bar(len(members), target, subs=len(record[STATUS_SUB]))}\n"
-                            f"{format_players(members)}"
-                        ),
-                        inline=False,
-                    )
-                else:
-                    embed.add_field(name=heading, value=format_players(members), inline=False)
+            for name, value in slot_columns(members_in, target, STATUS_TITLES[STATUS_IN]):
+                embed.add_field(name=name, value=value, inline=True)
             if len(captains) == 2:
                 embed.add_field(
                     name="👑 Капитаны",
                     value=f"{BLUE_SIDE} — {captains[0].mention}\n{RED_SIDE} — {captains[1].mention}",
                     inline=False,
                 )
+        # Запасные и отказавшиеся — компактно, одной строкой каждые, под основным составом.
+        extra = []
+        for status in (STATUS_SUB, STATUS_OUT):
+            members = self.members_from_ids(guild, record[status])
+            if members:
+                extra.append(f"{STATUS_TITLES[status]} · {len(members)}: " + ", ".join(m.mention for m in members))
+        if extra:
+            embed.add_field(name="\u200b", value="\n".join(extra), inline=False)
+        if start_at and not closed:
+            embed.timestamp = datetime.fromtimestamp(start_at, tz=timezone.utc)
 
-        going = len(self.signed_players(guild, record))
         if closed:
             footer = "Сбор отменён"
         elif len(teams) == 2:
@@ -1533,11 +1587,8 @@ class Lobby(commands.Cog):
                 footer = "Состав собран — можно ролить капитанов"
             else:
                 footer = "Состав собран — можно запускать"
-            waiting = len(record[STATUS_SUB])
-            if waiting:
-                footer += f" · в запасе {waiting}"
         else:
-            footer = f"Не хватает игроков: {target - going}"
+            footer = "Жми «Играю», чтобы попасть в состав, или «Запасной», если не уверен"
         embed.set_footer(text=footer)
         return embed
 
