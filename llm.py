@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -52,7 +53,11 @@ _RETRY_RE = re.compile(r"try again in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s")
 # Google кладёт паузу в подробности ошибки: "retryDelay": "48s".
 _RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*:\s*['\"]([\d.]+)s")
 # Сбои на стороне провайдера («модель перегружена») — пропускаем его ненадолго.
-OVERLOAD_PAUSE = 60.0
+OVERLOAD_PAUSE = 20.0
+# Gemini постоянно отвечает 503 «high demand», но через пару секунд обычно отвечает — и он заметно умнее запасных.
+# Поэтому перегруженную модель переспрашиваем с нарастающей паузой (LLM_OVERLOAD_RETRIES раз за запрос),
+# и только потом идём к следующей.
+OVERLOAD_RETRY_DELAYS = (2.0, 4.0, 8.0)
 # Провайдер не работает в стране, откуда идёт запрос (Gemini из России), — не дёргаем его часами.
 REGION_PAUSE = 6 * 3600.0
 VPN_REGION_PAUSE = 15 * 60.0
@@ -225,7 +230,10 @@ class LLMClient:
             self._session = aiohttp.ClientSession()
 
         last_error = "нет доступных моделей"
-        for provider in self.providers:
+        queue = list(self.providers)
+        overload_retries = 0
+        while queue:
+            provider = queue.pop(0)
             if self._blocked_until.get(provider.label, 0) > time.time():
                 continue
 
@@ -296,6 +304,14 @@ class LLMClient:
                             "Чтобы он заработал, укажите в .env VPN_SUBSCRIPTION или LLM_PROXY.",
                             provider.name, str(payload)[:120], pause / 3600,
                         )
+                        continue
+                    if response.status in (500, 502, 503, 504) and overload_retries < config.LLM_OVERLOAD_RETRIES:
+                        delay = OVERLOAD_RETRY_DELAYS[min(overload_retries, len(OVERLOAD_RETRY_DELAYS) - 1)]
+                        overload_retries += 1
+                        log.info("%s перегружен (HTTP %s), переспрашиваю через %.0f с (%d/%d)",
+                                 provider.label, response.status, delay, overload_retries, config.LLM_OVERLOAD_RETRIES)
+                        await asyncio.sleep(delay)
+                        queue.insert(0, provider)
                         continue
                     if response.status in (500, 502, 503, 504):
                         # «Модель перегружена» — временно: пропускаем её минуту и спрашиваем следующую.

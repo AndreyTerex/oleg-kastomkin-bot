@@ -198,3 +198,15 @@ def test_clean_reply_keeps_inner_quotes():
     assert chat.clean_reply(text) == text
     assert chat.clean_reply("«Весь ответ в кавычках»") == "Весь ответ в кавычках"
     assert chat.clean_reply('"просто текст"') == "просто текст"
+
+
+def test_roast_does_not_repeat_the_name_after_the_mention():
+    from types import SimpleNamespace as NS
+
+    from cogs.chat import strip_leading_name
+
+    member = NS(display_name="Костяныч (Токс)", global_name=None, name="bartlby6832")
+    assert strip_leading_name("Токс, ты так уверенно раздаёшь роли", member) == "ты так уверенно раздаёшь роли"
+    assert strip_leading_name("Костяныч (Токс), Ты опять в лесу", member) == "ты опять в лесу"
+    assert strip_leading_name("ты опять в лесу", member) == "ты опять в лесу"
+    assert strip_leading_name("Токсичный мид — это про тебя", member) == "Токсичный мид — это про тебя"

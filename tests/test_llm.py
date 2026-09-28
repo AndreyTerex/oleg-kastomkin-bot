@@ -64,3 +64,56 @@ def test_builtin_vpn_proxy_is_skipped_when_xray_is_not_running(monkeypatch):
     assert llm.proxy_for(item) is None  # Xray не запущен — напрямую, а не в закрытый порт
     own = Provider(name="groq", url="u", api_key="k", model="m", proxy="http://user:pw@proxy.example:3128")
     assert llm.proxy_for(own) == own.proxy
+
+
+class _FakeResponse:
+    def __init__(self, status, payload):
+        self.status, self._payload, self.headers = status, payload, {}
+
+    async def json(self, content_type=None):
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    closed = False
+
+    def __init__(self, script):
+        self.script, self.calls = list(script), []
+
+    def post(self, url, **kwargs):
+        self.calls.append(kwargs["json"]["model"])
+        status, payload = self.script.pop(0)
+        return _FakeResponse(status, payload)
+
+
+def _ok(text):
+    return 200, {"choices": [{"message": {"content": text}}]}
+
+
+def test_overloaded_gemini_is_asked_again_before_falling_back(monkeypatch):
+    import asyncio
+
+    import config
+    import llm
+
+    async def no_sleep(delay):
+        return None
+
+    monkeypatch.setattr(llm.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(config, "LLM_OVERLOAD_RETRIES", 3)
+    client = llm.LLMClient([provider("gemini", "flash"), provider("groq", "oss")])
+    busy = (503, {"error": {"message": "high demand"}})
+    client._session = _FakeSession([busy, busy, _ok("ответ gemini")])
+    reply = asyncio.run(client.complete("s", "u"))
+    assert reply.text == "ответ gemini" and client._session.calls == ["flash", "flash", "flash"]
+
+    client = llm.LLMClient([provider("gemini", "flash"), provider("groq", "oss")])
+    client._session = _FakeSession([busy, busy, busy, busy, _ok("ответ groq")])
+    reply = asyncio.run(client.complete("s", "u"))
+    assert client._session.calls == ["flash"] * 4 + ["oss"] and reply.text == "ответ groq"
