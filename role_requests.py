@@ -142,3 +142,8 @@ def dangerous(role: discord.Role) -> bool:
 
 def reachable(role: discord.Role, guild: discord.Guild) -> bool:
     return role < guild.me.top_role
+
+
+def author_can_manage(role: discord.Role, author: discord.Member) -> bool:
+    """Роль ниже самой высокой роли автора просьбы — как в самом Discord. Владельцу сервера можно всё."""
+    return author.id == author.guild.owner_id or role < author.top_role

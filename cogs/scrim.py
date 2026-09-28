@@ -118,6 +118,8 @@ class DraftView(discord.ui.View):
         captains: list[discord.Member],
         pool: list[discord.Member],
         on_finish: Callable[[list[list[discord.Member]]], Awaitable[None]] | None = None,
+        on_expire: Callable[[], Awaitable[None]] | None = None,
+        expired_hint: str = "Время на драфт вышло — запустите /draft заново",
     ) -> None:
         super().__init__(timeout=900)
         self.cog = cog
@@ -125,6 +127,9 @@ class DraftView(discord.ui.View):
         self.pool = list(pool)
         # Вызывается, когда драфт закончен: так лобби узнаёт итоговые составы.
         self.on_finish = on_finish
+        # Вызывается, если капитаны не успели: лобби снимает стадию драфта, чтобы его можно было перезапустить.
+        self.on_expire = on_expire
+        self.expired_hint = expired_hint
         self.teams: list[list[discord.Member]] = [[captains[0]], [captains[1]]]
         self.order = draft_order(len(self.pool))
         self.turn = 0
@@ -167,7 +172,9 @@ class DraftView(discord.ui.View):
             )
 
         if finished:
-            embed.set_footer(text="Развести по каналам: /split")
+            embed.set_footer(
+                text="Развести по каналам — кнопка в посте сбора" if self.on_finish else "Развести по каналам: /split"
+            )
         else:
             embed.add_field(
                 name="Свободные игроки",
@@ -215,11 +222,16 @@ class DraftView(discord.ui.View):
 
     async def on_timeout(self) -> None:
         self.select.disabled = True
+        if self.on_expire is not None:
+            try:
+                await self.on_expire()
+            except Exception:
+                log.exception("Не удалось обработать таймаут драфта")
         if self.message is None:
             return
         embed = self.build_embed()
         embed.color = discord.Color.dark_grey()
-        embed.set_footer(text="Время на драфт вышло — запустите /draft заново")
+        embed.set_footer(text=self.expired_hint)
         try:
             await self.message.edit(embed=embed, view=self)
         except discord.HTTPException:
