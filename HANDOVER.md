@@ -50,7 +50,7 @@ docker compose pull && docker compose up -d
 В логах должны появиться строки:
 
 ```
-Олег болтает через: tokenharbor:…, openrouter:…, huggingface:…, mistral:…, groq:…
+Олег болтает через: groq:…, tokenharbor:…, openrouter:…, huggingface:…
 Команд синхронизировано для сервера 720627486534139964: 21
 Бот в сети: Олег Кастомкин#5758 (серверов: 1)
 ```

@@ -8,19 +8,18 @@ def provider(name, model):
 def test_order_providers_follows_llm_order_and_keeps_model_order():
     chain = [
         provider("tokenharbor", "deepseek"),
-        provider("mistral", "mistral-large-latest"),
-        provider("groq", "gpt-oss"),
-        provider("mistral", "mistral-medium-latest"),
+        provider("groq", "gpt-oss-120b"),
+        provider("openrouter", "nemotron"),
+        provider("groq", "qwen"),
         provider("other", "x"),
     ]
-    ordered = order_providers(chain, ["mistral", "groq", "tokenharbor"])
-    assert [p.model for p in ordered] == [
-        "mistral-large-latest", "mistral-medium-latest", "gpt-oss", "deepseek", "x",
-    ]
+    ordered = order_providers(chain, ["groq", "tokenharbor", "openrouter"])
+    assert [p.model for p in ordered] == ["gpt-oss-120b", "qwen", "deepseek", "nemotron", "x"]
 
 
-def test_default_chain_starts_with_mistral_large():
+def test_default_chain_starts_with_groq_gpt_oss():
     import config
 
-    assert config.LLM_ORDER[0] == "mistral"
-    assert config.MISTRAL_MODELS[0] == "mistral-large-latest"
+    assert config.LLM_ORDER[0] == "groq"
+    assert config.GROQ_MODELS[0] == "openai/gpt-oss-120b"
+    assert not hasattr(config, "MISTRAL_API_KEY")

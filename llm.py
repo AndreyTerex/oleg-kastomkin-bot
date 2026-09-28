@@ -19,7 +19,6 @@ log = logging.getLogger("scrimbot.llm")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
 TOKENHARBOR_URL = "https://tokenharbor.ai/v1/chat/completions"
 
@@ -27,13 +26,12 @@ TOKENHARBOR_URL = "https://tokenharbor.ai/v1/chat/completions"
 # чтобы чат не ждал по минуте на каждом сообщении.
 TIMEOUT_PAUSE = 180.0
 ERROR_PAUSE = 60.0
-NO_PLAN_PAUSE = 600.0
 # HTTP 402 — кончились бесплатные кредиты (Hugging Face даёт $0.10 в месяц). Проверяем раз в несколько часов.
 QUOTA_PAUSE = 6 * 3600.0
 
 
 def _message_text(message: dict) -> str:
-    """Текст ответа. Mistral у моделей с размышлениями отдаёт список кусков: мысли отдельно, текст отдельно."""
+    """Текст ответа. Некоторые модели с размышлениями отдают список кусков: мысли отдельно, текст отдельно."""
     content = message.get("content")
     if isinstance(content, list):
         content = "".join(
@@ -84,7 +82,7 @@ class LLMUnavailable(Exception):
 
 
 def build_providers() -> list[Provider]:
-    """Цепочка провайдеров в порядке LLM_ORDER (по умолчанию Mistral → Groq → остальные)."""
+    """Цепочка провайдеров в порядке LLM_ORDER (по умолчанию Groq → остальные)."""
     providers: list[Provider] = []
     for model in config.TOKENHARBOR_MODELS:
         providers.append(Provider(
@@ -110,15 +108,6 @@ def build_providers() -> list[Provider]:
             name="huggingface",
             url=HF_URL,
             api_key=config.HF_TOKEN,
-            model=model,
-            max_tokens=700,
-            timeout=25.0,
-        ))
-    for model in config.MISTRAL_MODELS:
-        providers.append(Provider(
-            name="mistral",
-            url=MISTRAL_URL,
-            api_key=config.MISTRAL_API_KEY,
             model=model,
             max_tokens=700,
             timeout=25.0,
@@ -212,24 +201,15 @@ class LLMClient:
                         # Прокси и балансировщики иногда отдают строку или список вместо объекта.
                         payload = {"error": {"message": str(payload)[:300]}}
                     if response.status == 429:
-                        # OpenRouter и Groq кладут ошибку в error, Mistral — прямо в корень ответа.
+                        # Обычно ошибка лежит в error, у некоторых провайдеров — прямо в корне ответа.
                         error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
                         message = f"{error.get('message', '')} {(error.get('metadata') or {}).get('raw', '')}"
                         daily = bool(re.search(r"per[ -]day|month|week|7-day|allowance|quota", message, re.IGNORECASE))
                         wait = _rate_limit_wait(message, response.headers, daily)
-                        if response.headers.get("x-ratelimit-limit-req-minute") == "0":
-                            # Лимит ноль — у Mistral так выглядит неактивированный бесплатный план.
-                            wait, daily = NO_PLAN_PAUSE, False
-                            log.warning(
-                                "%s: лимит 0 запросов в минуту — похоже, в консоли не активирован "
-                                "бесплатный план. Пропускаем его %.0f с",
-                                provider.label, wait,
-                            )
-                        else:
-                            log.warning(
-                                "Лимит %s (%s), пауза %.0f с",
-                                provider.label, "суточный" if daily else "временный", wait,
-                            )
+                        log.warning(
+                            "Лимит %s (%s), пауза %.0f с",
+                            provider.label, "суточный" if daily else "временный", wait,
+                        )
                         self._blocked_until[provider.label] = time.time() + wait
                         self._blocked_daily[provider.label] = daily
                         continue

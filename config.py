@@ -71,21 +71,12 @@ HF_MODELS: list[str] = [
     if model.strip()
 ]
 
-# Бесплатный ключ Mistral (план Experiment): все модели, включая самую сильную Large, около миллиарда
-# токенов в месяц — почти безлимитный запас. Поэтому Mistral Large — основная модель Олега.
-MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "").strip()
-MISTRAL_MODELS: list[str] = [
-    model.strip()
-    for model in os.getenv("MISTRAL_MODELS", "mistral-large-latest,mistral-medium-latest").split(",")
-    if model.strip()
-]
-
-# Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Сначала те, у кого бесплатный
-# лимит почти бесконечный (Mistral, Groq), — так Олег весь день отвечает одной и той же сильной моделью,
-# а не прыгает между ними. Провайдеры с маленькими лимитами — в запасе.
+# Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Первым — Groq с самым большим
+# бесплатным лимитом (около 1000 ответов в день), чтобы Олег весь день отвечал одной сильной моделью,
+# а не прыгал между ними. Провайдеры с маленькими лимитами — в запасе.
 LLM_ORDER: list[str] = [
     name.strip().lower()
-    for name in os.getenv("LLM_ORDER", "mistral,groq,tokenharbor,openrouter,huggingface").split(",")
+    for name in os.getenv("LLM_ORDER", "groq,tokenharbor,openrouter,huggingface").split(",")
     if name.strip()
 ]
 
