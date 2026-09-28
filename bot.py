@@ -26,7 +26,7 @@ class ScrimBot(commands.Bot):
         intents.voice_states = True
         # Чтение чата нужно только болтовне Олега; без ключа Groq привилегированный интент не запрашиваем.
         intents.message_content = bool(
-            config.GROQ_API_KEY or config.OPENROUTER_API_KEY or config.MISTRAL_API_KEY or config.HF_TOKEN
+            config.GROQ_API_KEY or config.OPENROUTER_API_KEY or config.HF_TOKEN
             or config.TOKENHARBOR_API_KEY
         )
         super().__init__(
