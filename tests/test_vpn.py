@@ -346,3 +346,9 @@ def test_discord_goes_through_vpn_only_when_xray_is_up(monkeypatch):
 
     assert asyncio.run(run(True)) == "http://127.0.0.1:10809"
     assert asyncio.run(run(False)) is None  # Xray нет (запуск без Docker) — Discord напрямую
+
+
+def test_discord_goes_direct_by_default():
+    import config
+
+    assert config.VPN_FOR_DISCORD is False
