@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    container_name: lol-scrim-bot
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      # Сохранённые сборы переживают пересборку образа.
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
