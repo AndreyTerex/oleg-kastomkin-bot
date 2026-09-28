@@ -111,6 +111,12 @@ OWN_NAME = "Олег (ты)"
 # Паузу в разговоре длиннее этой модель видит отдельной строкой.
 PAUSE_VISIBLE = timedelta(minutes=30)
 
+# Прожарка: сколько сообщений канала просмотреть, сколько реплик человека взять и какой длины ответ.
+ROAST_HISTORY_SCAN = 150
+ROAST_QUOTES = 8
+ROAST_SOFT_LIMIT = 420
+ROAST_LIMIT = 600
+
 SPONTANEOUS_COOLDOWN = 12 * 60
 SPONTANEOUS_CHANCE = 0.07
 SPONTANEOUS_TOPIC_BONUS = 2.5
@@ -418,9 +424,13 @@ class Chat(commands.Cog):
         people = []
         for member in speakers.values():
             lanes = ", ".join(lane.label for lane in member_lanes(member)) or "линии не отмечены"
-            people.append(f"- {one_line(member.display_name)}: {lanes}")
+            line = f"- {one_line(member.display_name)}: {lanes}"
+            record = self.player_stats(message.guild.id, member.id)
+            if record is not None and record.games:
+                line += f"; статистика кастомок: {record.describe()}"
+            people.append(line)
         if people:
-            facts.append("Кто в разговоре и какие линии отметил:\n" + "\n".join(people))
+            facts.append("Кто в разговоре, какие линии отметил и как играет на кастомках:\n" + "\n".join(people))
 
         memories = []
         for member in speakers.values():
@@ -697,6 +707,87 @@ class Chat(commands.Cog):
             f"Играют: {names('in')}. Запасные: {names('sub')}. Не смогут: {names('out')}."
         )
 
+    def player_stats(self, guild_id: int, user_id: int):
+        stats_cog = self.bot.get_cog("Stats")
+        return stats_cog.stats.player(guild_id, user_id) if stats_cog is not None else None
+
+    # --- прожарка ----------------------------------------------------------
+
+    async def build_roast_prompt(self, interaction: discord.Interaction, target: discord.Member) -> str:
+        guild = interaction.guild
+        about = [f"Сейчас {now_msk()}.", f"Кого прожариваешь: {one_line(target.display_name)}."]
+        lanes = ", ".join(lane.label for lane in member_lanes(target))
+        about.append(f"Линии: {lanes}." if lanes else "Линии в панели не отмечены — даже тут не определился.")
+        record = self.player_stats(guild.id, target.id)
+        if record is not None:
+            about.append(f"Статистика кастомок: {record.describe()}.")
+        facts = self.memory.about(guild.id, target.id)
+        memory = "\n".join(f"- {fact}" for fact in facts[-6:])
+
+        # Свежие сообщения человека — лучший материал для прожарки.
+        said: list[str] = []
+        channel = interaction.channel
+        if channel is not None and hasattr(channel, "history"):
+            try:
+                async for msg in channel.history(limit=ROAST_HISTORY_SCAN):
+                    if msg.author.id == target.id and describe(msg) != "[пусто]":
+                        said.append(describe(msg))
+                        if len(said) >= ROAST_QUOTES:
+                            break
+            except discord.HTTPException:
+                log.debug("Не удалось прочитать историю для прожарки")
+        said.reverse()
+
+        who_asked = "сам себя" if interaction.user.id == target.id else one_line(interaction.user.display_name)
+        task = persona.TASK_ROAST.format(
+            name=one_line(target.display_name), who=who_asked,
+        ) + " " + persona.VARIANTS
+        sections = [
+            section("context", "\n".join(about)),
+            section("memory", memory) if memory else "",
+            section("chat", "Что он недавно писал в этом канале:\n" + "\n".join(f"- {line}" for line in said))
+            if said else "",
+            section("task", task),
+        ]
+        return "\n\n".join(part for part in sections if part)
+
+    @app_commands.command(name="oleg-roast", description="Олег по-доброму прожаривает игрока")
+    @app_commands.describe(player="Кого прожарить (по умолчанию — вас)")
+    @app_commands.checks.cooldown(1, 90, key=lambda interaction: interaction.user.id)
+    @app_commands.guild_only()
+    async def roast(self, interaction: discord.Interaction, player: discord.Member | None = None) -> None:
+        target = player or interaction.user
+        if target.id == self.bot.user.id:
+            await interaction.response.send_message(random.choice(persona.ROAST_SELF))
+            return
+        if target.bot:
+            await respond(interaction, "Ботов не жарю — у них и так жизнь несладкая 🤖")
+            return
+        if self.opted_out(target.id):
+            await respond(interaction, persona.ROAST_OPTED_OUT.format(who=target.display_name))
+            return
+        if not self.client.enabled:
+            await respond(interaction, "Без ключей нейросети мне нечем шутить — владелец бота не добавил их в .env.")
+            return
+
+        await interaction.response.defer(thinking=True)
+        prompt = await self.build_roast_prompt(interaction, target)
+        try:
+            reply = await self.client.complete(
+                persona.PERSONA, prompt, validate=lambda text: pick_variant(text) is not None
+            )
+        except LLMUnavailable:
+            await interaction.followup.send(random.choice(persona.SLEEPY_LINES))
+            return
+        text = clean_reply(pick_variant(reply.text) or "", soft_limit=ROAST_SOFT_LIMIT, hard_limit=ROAST_LIMIT)
+        if not text:
+            await interaction.followup.send("Слов нет. Буквально — модель промолчала 🙃")
+            return
+        await interaction.followup.send(
+            f"🔥 {target.mention}, {text}", allowed_mentions=discord.AllowedMentions.none()
+        )
+        log.info("Прожарка %s по просьбе %s (%s)", target, interaction.user, reply.model)
+
     # --- команды ---------------------------------------------------------
 
     @app_commands.command(name="oleg-quiet", description="Попросить Олега помолчать в этом канале")
@@ -941,19 +1032,28 @@ def acceptable_reply(text: str) -> bool:
     return not FOREIGN_SCRIPT.search(text) and not PROFANITY.search(text)
 
 
-def clean_reply(text: str) -> str:
+def clean_reply(text: str, *, soft_limit: int = REPLY_SOFT_LIMIT, hard_limit: int = REPLY_LIMIT) -> str:
     """Приводит ответ модели к реплике в чате: одним абзацем, без «Олег:», пингов и простыней."""
     text = INVISIBLE.sub("", text)
     text = " ".join(text.split()).strip("«»\" ")
     text = re.sub(r"^(олег(\s+кастомкин)?\s*(\(ты\))?\s*:)\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"@(everyone|here)", r"\1", text, flags=re.IGNORECASE)
-    if len(text) > REPLY_SOFT_LIMIT:
+    if len(text) > soft_limit:
         sentences = SENTENCE_END.split(text)
-        # Одна содержательная фраза лучше двух: если первая не совсем короткая — только она.
-        text = sentences[0] if len(sentences[0]) >= 40 else " ".join(sentences[:2])
-    if len(text) > REPLY_LIMIT:
-        cut = text[:REPLY_LIMIT]
-        text = cut[: max(cut.rfind(" "), REPLY_LIMIT // 2)].rstrip(",;:— ") + "…"
+        if soft_limit == REPLY_SOFT_LIMIT:
+            # Одна содержательная фраза лучше двух: если первая не совсем короткая — только она.
+            text = sentences[0] if len(sentences[0]) >= 40 else " ".join(sentences[:2])
+        else:
+            # Длинный ответ (прожарка) режем по целым фразам, пока влезает.
+            kept = []
+            for sentence in sentences:
+                if kept and len(" ".join(kept + [sentence])) > soft_limit:
+                    break
+                kept.append(sentence)
+            text = " ".join(kept)
+    if len(text) > hard_limit:
+        cut = text[:hard_limit]
+        text = cut[: max(cut.rfind(" "), hard_limit // 2)].rstrip(",;:— ") + "…"
     return text
 
 

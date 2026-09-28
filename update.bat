@@ -1,6 +1,7 @@
 @echo off
-rem Pulls the latest code from GitHub (if this folder is a git clone), then rebuilds and restarts the bot.
-rem Your .env and the data folder are never touched: they are not in git.
+rem Starts or updates the bot. Normally you only need it once: after that Watchtower
+rem updates the bot by itself every time a new version appears on GitHub.
+rem Your .env and the data folder are never touched.
 cd /d "%~dp0"
 
 if not exist ".env" (
@@ -11,18 +12,13 @@ if not exist ".env" (
     exit /b 1
 )
 
+rem If this folder is a git clone, also refresh docker-compose.yml and the other files.
 if exist ".git" (
     where git >nul 2>&1
-    if errorlevel 1 (
-        echo Git is not installed - skipping the code update, rebuilding the local files.
-    ) else (
-        echo Downloading the latest code from GitHub...
+    if not errorlevel 1 (
+        echo Downloading the latest files from GitHub...
         git pull --ff-only
-        if errorlevel 1 (
-            echo Could not update the code - see the messages above. Local changes? Run: git status
-            pause
-            exit /b 1
-        )
+        if errorlevel 1 echo Could not update the files - continuing with the local ones.
     )
 )
 
@@ -33,11 +29,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Stopping the old version...
-docker compose down
-
-echo Building and starting the new version (first build takes a couple of minutes)...
-docker compose up -d --build
+echo Downloading the ready-made bot image from GitHub...
+docker compose pull
+if errorlevel 1 (
+    echo Could not download the image - building it from the files in this folder instead.
+    docker compose up -d --build --remove-orphans
+) else (
+    docker compose up -d --remove-orphans
+)
 if errorlevel 1 (
     echo Something went wrong - see the messages above.
     pause
@@ -45,6 +44,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo Done. Bot logs (close the window to exit, the bot keeps running):
+echo Done. From now on the bot updates itself (Watchtower checks GitHub every 5 minutes).
+echo Bot logs (close the window to exit, the bot keeps running):
 echo.
-docker compose logs -f --tail 20
+docker compose logs -f --tail 20 bot

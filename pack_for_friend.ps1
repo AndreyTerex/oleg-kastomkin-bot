@@ -12,7 +12,8 @@ New-Item -ItemType Directory -Path $target | Out-Null
 
 $files = @(
     'bot.py', 'config.py', 'utils.py', 'storage.py', 'champions.py', 'modes.py', 'llm.py', 'memory.py',
-    'persona.py', 'role_requests.py', 'requirements.txt', 'Dockerfile', 'docker-compose.yml',
+    'persona.py', 'role_requests.py', 'stats.py', 'timeparse.py', 'portraits.py',
+    'requirements.txt', 'Dockerfile', 'docker-compose.yml',
     '.dockerignore', '.gitignore', '.env', '.env.example', 'README.md', 'HANDOVER.md', 'update.bat'
 )
 foreach ($file in $files) {

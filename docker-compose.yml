@@ -1,14 +1,41 @@
 services:
   bot:
+    # Готовый образ собирается на GitHub при каждом обновлении main.
+    # Если скачать его не получается, `docker compose up -d --build` соберёт образ из файлов в этой папке.
+    image: ghcr.io/andreyterex/oleg-kastomkin-bot:latest
     build: .
     container_name: lol-scrim-bot
     env_file: .env
     restart: unless-stopped
     volumes:
-      # Сохранённые сборы переживают пересборку образа.
+      # Сборы, статистика и память Олега переживают обновления образа.
       - ./data:/app/data
+    labels:
+      # Watchtower обновляет только помеченные контейнеры.
+      com.centurylinklabs.watchtower.enable: "true"
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Раз в 5 минут проверяет, не вышел ли новый образ бота, и если вышел — перезапускает бота на нём.
+  watchtower:
+    image: nickfedor/watchtower:latest
+    container_name: oleg-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_POLL_INTERVAL: "300"
+      WATCHTOWER_CLEANUP: "true"
+      TZ: Europe/Moscow
+      # Нужны, только если образ на GitHub приватный: логин GitHub и токен с правом read:packages.
+      REPO_USER: ${GHCR_USER:-}
+      REPO_PASS: ${GHCR_TOKEN:-}
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

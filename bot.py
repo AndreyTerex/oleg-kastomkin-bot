@@ -10,11 +10,12 @@ from discord.ext import commands
 
 import champions
 import config
+import portraits
 from utils import WARNING, respond
 
 log = logging.getLogger("scrimbot")
 
-EXTENSIONS = ("cogs.roles", "cogs.scrim", "cogs.lobby", "cogs.extras", "cogs.chat")
+EXTENSIONS = ("cogs.roles", "cogs.scrim", "cogs.stats", "cogs.lobby", "cogs.extras", "cogs.chat")
 
 
 class ScrimBot(commands.Bot):
@@ -59,6 +60,7 @@ class ScrimBot(commands.Bot):
 
     async def close(self) -> None:
         await champions.POOL.close()
+        await portraits.close()
         await super().close()
 
     async def on_message(self, message: discord.Message) -> None:

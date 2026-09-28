@@ -76,3 +76,85 @@ def test_scrim_lobby_hides_custom_game_buttons():
 
 def test_team_size_config():
     assert config.TEAM_SIZE == 5
+
+
+def _bare_lobby(records):
+    cog = lobby.Lobby.__new__(lobby.Lobby)
+    cog.store = SimpleNamespace(data=records)
+    cog.drafts = {}
+    sent, saved = [], []
+
+    async def send_reminder(message_id, record):
+        sent.append(message_id)
+
+    async def save():
+        saved.append(True)
+
+    cog.send_reminder = send_reminder
+    cog.save = save
+    return cog, sent, saved
+
+
+def test_remind_due_fires_once_in_window(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(lobby.time, "time", lambda: now)
+    monkeypatch.setattr(config, "REMIND_MINUTES", 15)
+    records = {
+        "soon": {"start_at": now + 10 * 60, "created_at": now - 3600, "reminded": False},
+        "later": {"start_at": now + 60 * 60, "created_at": now - 3600, "reminded": False},
+        "missed": {"start_at": now - 60, "created_at": now - 3600, "reminded": False},
+        "just_created": {"start_at": now + 5 * 60, "created_at": now - 60, "reminded": False},
+        "closed": {"start_at": now + 5 * 60, "created_at": now - 3600, "reminded": False, "closed": True},
+    }
+    cog, sent, saved = _bare_lobby(records)
+    asyncio.run(cog.remind_due())
+    assert sent == ["soon"]
+    assert records["soon"]["reminded"] and records["missed"]["reminded"] and records["just_created"]["reminded"]
+    assert not records["later"]["reminded"] and not records["closed"]["reminded"]
+    asyncio.run(cog.remind_due())
+    assert sent == ["soon"]
+
+
+def test_expire_drafts_picks_stale_and_closed(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(lobby.time, "time", lambda: now)
+    records = {
+        "1": {"stage": lobby.STAGE_DRAFT, "draft": {"expires_at": now - 1}},
+        "2": {"stage": lobby.STAGE_DRAFT, "draft": {"expires_at": now + 100}},
+        "3": {"stage": lobby.STAGE_DRAFT, "closed": True, "draft": {"expires_at": now + 100}},
+        "4": {"stage": lobby.STAGE_DONE},
+    }
+    cog, _sent, _saved = _bare_lobby(records)
+    expired = []
+
+    async def expire_draft(message_id, record):
+        expired.append(message_id)
+
+    cog.expire_draft = expire_draft
+    asyncio.run(cog.expire_drafts())
+    assert expired == ["1", "3"]
+
+
+def test_series_score_and_winner():
+    record = _record(stage=lobby.STAGE_DONE, teams=[[1], [2]], series=3,
+                     results=[{"winner": 0}, {"winner": 1}])
+    assert lobby.Lobby.score_line(record) == "📊 **Серия Bo3:** 🔵 1 : 1 🔴"
+    assert lobby.series_winner(record) is None
+    record["results"].append({"winner": 0})
+    assert lobby.series_winner(record) == 0
+    assert lobby.series_winner(record, drop_last=True) is None
+    assert lobby.Lobby.score_line(record).endswith("серия за 🔵 синими")
+    assert lobby.series_winner({"series": 1, "results": [{"winner": 1}]}) == 1
+    assert lobby.series_winner({"results": [{"winner": 0}]}) is None  # старые сборы — Bo3
+
+
+def test_result_buttons_stay_open_between_games():
+    async def buttons(rec):
+        view = lobby.LobbyView(rec)
+        return {getattr(item, "custom_id", None): item.disabled for item in view.children}
+
+    record = _record(stage=lobby.STAGE_DONE, teams=[[1], [2]], round=2, results=[{"winner": 0}])
+    states = asyncio.run(buttons(record))
+    assert not states[lobby.CUSTOM_ID_WIN_BLUE] and not states[lobby.CUSTOM_ID_WIN_RED]
+    states = asyncio.run(buttons(_record()))
+    assert states[lobby.CUSTOM_ID_WIN_BLUE]
