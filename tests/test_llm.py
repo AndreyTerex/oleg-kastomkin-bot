@@ -20,7 +20,7 @@ def test_order_providers_follows_llm_order_and_keeps_model_order():
 def test_default_chain_starts_with_gemini_then_groq():
     import config
 
-    assert config.LLM_ORDER[:2] == ["gemini", "groq"]
+    assert config.LLM_ORDER[:3] == ["gemini", "puter", "groq"]
     assert config.GEMINI_MODELS[0].startswith("gemini-") and "flash" in config.GEMINI_MODELS[0]
     assert config.GROQ_MODELS[0] == "openai/gpt-oss-120b"
     assert not hasattr(config, "MISTRAL_API_KEY")
@@ -252,3 +252,37 @@ def test_broken_vpn_sends_next_models_direct(monkeypatch):
     assert client._session.proxies == [vpn_url, None]
     assert "gemini:gemini-3.5-flash-lite" not in client._blocked_until  # и не отключаем её надолго
     assert fake.reports == [{"connection": True}]
+
+
+def test_puter_joins_the_chain_only_with_a_token(monkeypatch):
+    import config
+    import llm
+
+    monkeypatch.setattr(config, "PUTER_AUTH_TOKEN", "")
+    assert not [p for p in llm.build_providers() if p.name == "puter"]
+    monkeypatch.setattr(config, "PUTER_AUTH_TOKEN", "t")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "g")
+    monkeypatch.setattr(config, "GROQ_API_KEY", "q")
+    names = [p.label for p in llm.build_providers()]
+    puter = [n for n in names if n.startswith("puter:")]
+    assert puter[0] == "puter:x-ai/grok-4.1-fast"
+    assert names.index(puter[0]) > max(i for i, n in enumerate(names) if n.startswith("gemini:"))
+    assert names.index(puter[-1]) < min(i for i, n in enumerate(names) if n.startswith("groq:"))
+
+
+def test_out_of_credits_pauses_the_whole_provider(monkeypatch):
+    import asyncio
+
+    import llm
+
+    assert llm.is_out_of_credits('{"error": "Insufficient funds: please upgrade to continue"}')
+    assert not llm.is_out_of_credits('{"error": "model overloaded"}')
+    chain = [
+        Provider(name="puter", url="u", api_key="t", model="x-ai/grok-4.1-fast"),
+        Provider(name="puter", url="u", api_key="t", model="x-ai/grok-4.6"),
+        Provider(name="groq", url="u", api_key="k", model="oss"),
+    ]
+    client = llm.LLMClient(chain)
+    client._session = _FakeSession([(402, {"error": {"message": "Insufficient funds"}}), _ok("groq")])
+    assert asyncio.run(client.complete("s", "u")).text == "groq"
+    assert client._session.calls == ["x-ai/grok-4.1-fast", "oss"]  # второй Grok уже не дёргаем

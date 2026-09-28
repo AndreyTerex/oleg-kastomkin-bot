@@ -25,6 +25,7 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 HF_URL = "https://router.huggingface.co/v1/chat/completions"
 TOKENHARBOR_URL = "https://tokenharbor.ai/v1/chat/completions"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+PUTER_URL = "https://api.puter.com/puterai/openai/v1/chat/completions"
 
 # Если модель зависла или недоступна, какое-то время сразу идём к следующей,
 # чтобы чат не ждал по минуте на каждом сообщении.
@@ -68,6 +69,15 @@ _REGION_RE = re.compile(
     r"location is not supported|not available in your (country|region)|unsupported_country|region is not supported",
     re.IGNORECASE,
 )
+
+
+def is_out_of_credits(text: str) -> bool:
+    """Провайдер отказал из-за баланса: «insufficient funds», «not enough credits» и т. п."""
+    return bool(re.search(
+        r"insufficient[ _](funds|balance|credit)|not enough (funds|credits|balance)|out of credits"
+        r"|exceeded your (monthly |free )?(usage|allowance)|upgrade (your plan|to continue)",
+        text or "", re.IGNORECASE,
+    ))
 
 
 def is_region_block(status: int, text: str) -> bool:
@@ -130,6 +140,15 @@ def build_providers() -> list[Provider]:
             max_tokens=1500,  # вместе с размышлениями
             timeout=25.0,
             scarce=is_scarce_gemini(model),
+        ))
+    for model in config.PUTER_MODELS:
+        providers.append(Provider(
+            name="puter",
+            url=PUTER_URL,
+            api_key=config.PUTER_AUTH_TOKEN,
+            model=model,
+            max_tokens=900,
+            timeout=25.0,
         ))
     for model in config.TOKENHARBOR_MODELS:
         providers.append(Provider(
@@ -355,6 +374,17 @@ class LLMClient:
                     self._blocked_until[provider.label] = time.time() + wait
                     self._blocked_daily[provider.label] = daily
                     return f"{provider.label}: лимит"
+                if response.status >= 400 and is_out_of_credits(str(payload)):
+                    # Кончился баланс (у Puter — бесплатная месячная квота): не дёргаем провайдера часами.
+                    for other in self.providers:
+                        if other.name == provider.name:
+                            self._blocked_until[other.label] = time.time() + QUOTA_PAUSE
+                            self._blocked_daily[other.label] = True
+                    log.warning(
+                        "%s: кончился баланс или бесплатная квота (HTTP %s), пропускаем его %.0f ч",
+                        provider.name, response.status, QUOTA_PAUSE / 3600,
+                    )
+                    return f"{provider.name}: кончился баланс"
                 if response.status == 402:
                     self._blocked_until[provider.label] = time.time() + QUOTA_PAUSE
                     self._blocked_daily[provider.label] = True

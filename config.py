@@ -62,6 +62,17 @@ TOKENHARBOR_MODELS: list[str] = [
     if model.strip()
 ]
 
+# Токен Puter (puter.com): сильные модели разных компаний через OpenAI-совместимый API. Платит владелец токена:
+# сначала тратится бесплатная месячная квота аккаунта, потом Puter просит пополнить баланс — бот тогда
+# пропускает Puter и отвечает другими моделями. По умолчанию — Grok: сначала быстрый и недорогой 4.1 Fast
+# (квоты хватает дольше), потом флагманский 4.6, в конце самая дешёвая GPT.
+PUTER_AUTH_TOKEN: str = os.getenv("PUTER_AUTH_TOKEN", "").strip()
+PUTER_MODELS: list[str] = [
+    model.strip()
+    for model in os.getenv("PUTER_MODELS", "x-ai/grok-4.1-fast,x-ai/grok-4.6,gpt-5.4-nano").split(",")
+    if model.strip()
+]
+
 # Токен Hugging Face: сильные модели (по умолчанию DeepSeek V3.2), но всего $0.10 бесплатно в месяц —
 # это около 170 ответов. Суффикс :cheapest выбирает самого дешёвого провайдера модели.
 HF_TOKEN: str = os.getenv("HF_TOKEN", "").strip()
@@ -148,10 +159,11 @@ VPN_CHECK_GEMINI: bool = bool(GEMINI_API_KEY) and ("all" in LLM_PROXY_FOR or "ge
 VPN_FOR_DISCORD: bool = os.getenv("VPN_FOR_DISCORD", "0").strip().lower() not in ("0", "false", "no", "off", "нет")
 
 # Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Первым — Gemini (самые сильные
-# бесплатные модели), за ним Groq с большим лимитом (около 1000 ответов в день), остальные — в запасе.
+# бесплатные модели), за ним Puter (если задан токен), Groq с большим лимитом (около 1000 ответов в день),
+# остальные — в запасе.
 LLM_ORDER: list[str] = [
     name.strip().lower()
-    for name in os.getenv("LLM_ORDER", "gemini,groq,tokenharbor,openrouter,huggingface").split(",")
+    for name in os.getenv("LLM_ORDER", "gemini,puter,groq,tokenharbor,openrouter,huggingface").split(",")
     if name.strip()
 ]
 

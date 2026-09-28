@@ -28,7 +28,7 @@ class ScrimBot(commands.Bot):
         # Чтение чата нужно только болтовне Олега; без ключа Groq привилегированный интент не запрашиваем.
         intents.message_content = bool(
             config.GEMINI_API_KEY or config.GROQ_API_KEY or config.OPENROUTER_API_KEY or config.HF_TOKEN
-            or config.TOKENHARBOR_API_KEY
+            or config.TOKENHARBOR_API_KEY or config.PUTER_AUTH_TOKEN
         )
         super().__init__(
             command_prefix=commands.when_mentioned,
