@@ -140,8 +140,9 @@ ROAST_QUOTES = 8
 ROAST_SOFT_LIMIT = 420
 ROAST_LIMIT = 600
 
-SPONTANEOUS_COOLDOWN = 12 * 60
-SPONTANEOUS_CHANCE = 0.07
+# Олег байтит часто: встревает в живой разговор не реже, чем раз в несколько минут.
+SPONTANEOUS_COOLDOWN = 5 * 60
+SPONTANEOUS_CHANCE = 0.15
 SPONTANEOUS_TOPIC_BONUS = 2.5
 ACTIVITY_WINDOW = 10 * 60
 ACTIVITY_MIN_MESSAGES = 4
@@ -1152,7 +1153,6 @@ def opening(text: str) -> str:
 
 def pick_mood(text: str, last: str) -> tuple[str, str]:
     """Типаж для реплики: не тот же, что в прошлый раз, подходящий к сообщению — с повышенным шансом."""
-    hour = datetime.now(MSK).hour
     options, weights = [], []
     for mood in persona.MOODS:
         name = mood[0]
@@ -1161,8 +1161,6 @@ def pick_mood(text: str, last: str) -> tuple[str, str]:
         weight = 1.0
         trigger = persona.MOOD_TRIGGERS.get(name)
         if trigger is not None and trigger.search(text or ""):
-            weight *= persona.MOOD_BOOST
-        if name == "ленивый" and hour in persona.SLEEPY_HOURS:
             weight *= persona.MOOD_BOOST
         if name == "подражатель" and len(text or "") < persona.MIMIC_MIN_LENGTH:
             weight = 0.0

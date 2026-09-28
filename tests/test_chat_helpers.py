@@ -66,8 +66,8 @@ def test_human_gap():
 
 def test_pick_mood_never_repeats_and_skips_mimic_on_short_text():
     for _ in range(200):
-        mood = chat.pick_mood("гг", last="добряк")
-        assert mood[0] not in ("добряк", "подражатель")
+        mood = chat.pick_mood("гг", last="провокатор")
+        assert mood[0] not in ("провокатор", "подражатель")
 
 
 def test_pick_mood_prefers_matching_mood(monkeypatch):
@@ -75,7 +75,7 @@ def test_pick_mood_prefers_matching_mood(monkeypatch):
     monkeypatch.setattr(chat.random, "choices", lambda options, weights, k: seen.append(dict(zip(options, weights))) or [options[0]])
     chat.pick_mood("опять зафидил 0/9, ужас", last="")
     weights = {mood[0]: weight for mood, weight in seen[0].items()}
-    assert weights["ироничный"] == persona.MOOD_BOOST * weights["хитрый"]
+    assert weights["невозмутимый"] == persona.MOOD_BOOST * weights["стравливатель"]
 
 
 def test_persona_moods_have_known_triggers():
@@ -185,3 +185,9 @@ def test_lanes_topic_only_for_who_questions():
     assert chat.LANES_TOPIC.search("Олег, кто у нас играет на миде?")
     assert chat.LANES_TOPIC.search("какие линии у Васи")
     assert not chat.LANES_TOPIC.search("Олег, как контрить ясуо на миде?")
+
+
+def test_persona_is_about_baiting_not_jokes():
+    assert "байт" in persona.PERSONA and "не шути ради шутки" in persona.PERSONA
+    # Границы троллинга на месте.
+    assert "никогда про внешность" in persona.PERSONA and "не добивай одного человека" in persona.PERSONA
