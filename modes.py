@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 import random
 from dataclasses import dataclass
 from typing import Callable, Sequence
@@ -271,16 +272,23 @@ def assign_lanes(team: Sequence[discord.Member], how: str) -> tuple[dict[int, st
 # --- чемпионы -----------------------------------------------------------------
 
 
+# Какая доля чемпионов линии (самые давно не выпадавшие) участвует в случайном выборе.
+FRESH_SHARE = 0.35
+
+
 def deal_champions(
     teams: Sequence[Sequence[discord.Member]],
     lanes: dict[int, str],
     how: str,
     pool: Sequence[Champion],
+    last_seen: dict[str, float] | None = None,
 ) -> dict[int, list[Champion]]:
     """Раздаёт чемпионов без повторов на всю кастомку.
 
     Игроку без линии достаются чемпионы из всего списка. Если на линии чемпионы
     кончились, недостающие добираются из всех остальных.
+    last_seen — когда чемпион последний раз выпадал на сервере: случайный выбор идёт только
+    среди давно не выпадавших (FRESH_SHARE списка линии), чтобы одни и те же не мелькали подряд.
     """
     if how == CHAMPS_FREE:
         return {}
@@ -292,6 +300,10 @@ def deal_champions(
         fitting = [champion for champion in free if lane is None or lane in champion.lanes]
         if len(fitting) < count:
             fitting += [champion for champion in free if champion not in fitting]
+        if last_seen:
+            # Сначала те, кого давно (или ни разу) не было; среди равных — случайный порядок.
+            fitting.sort(key=lambda champion: (last_seen.get(champion.id, 0.0), random.random()))
+            fitting = fitting[:max(count, math.ceil(len(fitting) * FRESH_SHARE))]
         picked = random.sample(fitting, min(count, len(fitting)))
         used.update(champion.id for champion in picked)
         return picked

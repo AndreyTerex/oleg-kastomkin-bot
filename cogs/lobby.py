@@ -921,6 +921,8 @@ class Lobby(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.store = JsonStore(Path(config.DATA_DIR) / "lobbies.json")
+        # Когда какой чемпион выпадал на сервере: id сервера → {id чемпиона: время}.
+        self.champion_history = JsonStore(Path(config.DATA_DIR) / "champion_history.json")
         self._refresh_task: asyncio.Task | None = None
         # Сборы, где прямо сейчас идёт новая раздача: двойной клик не должен раздать дважды.
         self._rerolling: set[int] = set()
@@ -928,6 +930,7 @@ class Lobby(commands.Cog):
         self.drafts: dict[int, DraftView] = {}
 
     async def cog_load(self) -> None:
+        self.champion_history.load()
         data = self.store.load()
         now = time.time()
         fresh = {
@@ -1445,7 +1448,16 @@ class Lobby(commands.Cog):
             # Если без прошлых чемпионов останется совсем мало — раздаём из всех.
             if len(fresh) >= 60:
                 pool = fresh
-        return modes.deal_champions(teams, lanes, mode["champs"], pool), []
+        guild_id = next((str(member.guild.id) for team in teams for member in team), None)
+        history = self.champion_history.data.setdefault(guild_id, {}) if guild_id else {}
+        dealt = modes.deal_champions(teams, lanes, mode["champs"], pool, last_seen=history)
+        if guild_id:
+            now = time.time()
+            for champions in dealt.values():
+                for champion in champions:
+                    history[champion.id] = now
+            await self.champion_history.save()
+        return dealt, []
 
     @staticmethod
     def pack_deal(lanes: dict[int, str], champions: dict) -> dict:

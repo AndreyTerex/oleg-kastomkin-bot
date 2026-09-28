@@ -80,6 +80,44 @@ def test_deal_champions_mirror_gives_same_champion_per_lane(make_member):
     assert len(Counter(dealt[i][0].id for i in range(5))) == 5
 
 
+def _lane_pool(size=25):
+    champions = []
+    for lane in LANES:
+        champions += [Champion(f"{lane}{n}", f"{lane.title()} {n}", frozenset({lane})) for n in range(size)]
+    return champions
+
+
+def test_recent_champions_do_not_come_back_in_the_next_deal(make_member):
+    teams = [[make_member(i) for i in range(5)], [make_member(i) for i in range(5, 10)]]
+    lanes = {i: LANES[i % 5] for i in range(10)}
+    pool, history = _lane_pool(), {}
+    previous: set[str] = set()
+    for game in range(1, 30):
+        dealt = modes.deal_champions(teams, lanes, modes.CHAMPS_CHOICE, pool, last_seen=history)
+        names = {champion.id for picks in dealt.values() for champion in picks}
+        assert not names & previous  # подряд одни и те же не выпадают
+        for name in names:
+            history[name] = float(game)
+        previous = names
+
+
+def test_lane_champions_do_not_repeat_for_several_games(make_member):
+    teams = [[make_member(i) for i in range(5)], [make_member(i) for i in range(5, 10)]]
+    lanes = {i: LANES[i % 5] for i in range(10)}
+    pool, history = _lane_pool(), {}
+    games: list[set[str]] = []
+    for game in range(1, 41):
+        dealt = modes.deal_champions(teams, lanes, modes.CHAMPS_RANDOM, pool, last_seen=history)
+        names = {champion.id for picks in dealt.values() for champion in picks}
+        for name in names:
+            history[name] = float(game)
+        games.append(names)
+    # По 2 чемпиона линии за игру из 25: в любых 5 играх подряд — ни одного повтора.
+    for start in range(len(games) - 4):
+        window = [name for names in games[start:start + 5] for name in names]
+        assert len(window) == len(set(window))
+
+
 def test_skill_teams_balances_ratings(make_member):
     players = [make_member(i) for i in range(10)]
     # Равно делится, только если сильные (0.9) в разных командах: 0.9 + 4×0.5 = 2.9 с каждой стороны.
