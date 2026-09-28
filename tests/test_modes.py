@@ -82,13 +82,14 @@ def test_deal_champions_mirror_gives_same_champion_per_lane(make_member):
 
 def test_skill_teams_balances_ratings(make_member):
     players = [make_member(i) for i in range(10)]
-    ratings = {i: (0.9 if i < 2 else 0.5 if i < 8 else 0.1) for i in range(10)}
-    teams = modes.skill_teams(players, lambda member: ratings[member.id])
-    assert sorted(len(team) for team in teams) == [5, 5]
-    sums = [sum(ratings[m.id] for m in team) for team in teams]
-    assert abs(sums[0] - sums[1]) <= modes.SKILL_TOLERANCE + 1e-9
-    # Оба сильных игрока не должны оказаться в одной команде.
-    assert all(sum(1 for m in team if m.id < 2) == 1 for team in teams)
+    # Равно делится, только если сильные (0.9) в разных командах: 0.9 + 4×0.5 = 2.9 с каждой стороны.
+    ratings = {i: (0.9 if i < 2 else 0.5) for i in range(10)}
+    for _ in range(50):
+        teams = modes.skill_teams(players, lambda member: ratings[member.id])
+        assert sorted(len(team) for team in teams) == [5, 5]
+        sums = [sum(ratings[m.id] for m in team) for team in teams]
+        assert abs(sums[0] - sums[1]) <= modes.SKILL_TOLERANCE + 1e-9
+        assert all(sum(1 for m in team if m.id < 2) == 1 for team in teams)
 
 
 def test_skill_teams_large_roster_uses_snake(make_member):
