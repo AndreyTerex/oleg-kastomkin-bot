@@ -166,6 +166,7 @@ class ChannelState:
     last_reaction: float = 0.0
     last_tail: str = ""
     last_mood: str = ""
+    last_tactic: str = ""
     burst_notice_at: float = 0.0
     busy: bool = False
     pending: discord.Message | None = None
@@ -402,8 +403,12 @@ class Chat(commands.Cog):
             # Каждый раз новый типаж, два одинаковых подряд не выпадают; подходящий к разговору — чаще.
             mood = pick_mood(message.content, state.last_mood)
             state.last_mood = mood[0]
+            tactic = pick_tactic(message.content, state.last_tactic)
+            state.last_tactic = tactic[0]
             help_mode = called and is_help_question(message.content)
-            prompt, openings = await self.build_prompt(message, called=called, mood=mood, help_mode=help_mode)
+            prompt, openings = await self.build_prompt(
+                message, called=called, mood=mood, tactic=tactic, help_mode=help_mode,
+            )
             allow_skip = not called
 
             def choose(text: str) -> str | None:
@@ -438,7 +443,8 @@ class Chat(commands.Cog):
             state.last_spoke = time.time()
             state.answers.append(state.last_spoke)
             log.info(
-                "Олег ответил в #%s типажом «%s» (%s, %d токенов)", message.channel, mood[0], reply.model, reply.tokens
+                "Олег ответил в #%s: %s, приём «%s» (%s, %d токенов)",
+                message.channel, mood[0], tactic[0], reply.model, reply.tokens,
             )
         except LLMUnavailable as error:
             if error.daily:
@@ -464,6 +470,7 @@ class Chat(commands.Cog):
 
     async def build_prompt(
         self, message: discord.Message, *, called: bool, mood: tuple[str, str] | None = None,
+        tactic: tuple[str, str] | None = None,
         help_mode: bool = False,
     ) -> tuple[str, set[str]]:
         """Запрос к модели по секциям и начала последних реплик Олега, которые не стоит повторять."""
@@ -526,7 +533,12 @@ class Chat(commands.Cog):
         else:
             task_parts.append(persona.SKIP_OPTION)
         if mood is not None:
-            task_parts.insert(0, persona.MOOD_LINE.format(name=mood[0], description=mood[1]))
+            tactic_name, tactic_description = tactic or ("просто ответить", "ответь по ситуации.")
+            task_parts.insert(0, persona.MOOD_LINE.format(
+                name=mood[0], description=mood[1], tactic=tactic_name, tactic_description=tactic_description,
+            ))
+        if getattr(message.channel, "is_nsfw", lambda: False)():
+            task_parts.append(persona.NSFW_LINE)
 
         sections = [
             section("context", "\n\n".join(facts)),
@@ -1166,14 +1178,23 @@ def opening(text: str) -> str:
 
 
 def pick_mood(text: str, last: str) -> tuple[str, str]:
-    """Типаж для реплики: не тот же, что в прошлый раз, подходящий к сообщению — с повышенным шансом."""
+    """Настроение для реплики: не то же, что в прошлый раз, подходящее к сообщению — с повышенным шансом."""
+    return _pick(persona.MOODS, persona.MOOD_TRIGGERS, text, last)
+
+
+def pick_tactic(text: str, last: str) -> tuple[str, str]:
+    """Что Олег делает в реплике (провокатор, подначка…) — по тем же правилам, что и настроение."""
+    return _pick(persona.TACTICS, persona.TACTIC_TRIGGERS, text, last)
+
+
+def _pick(choices, triggers, text: str, last: str) -> tuple[str, str]:
     options, weights = [], []
-    for mood in persona.MOODS:
+    for mood in choices:
         name = mood[0]
         if name == last:
             continue
         weight = 1.0
-        trigger = persona.MOOD_TRIGGERS.get(name)
+        trigger = triggers.get(name)
         if trigger is not None and trigger.search(text or ""):
             weight *= persona.MOOD_BOOST
         if name == "подражатель" and len(text or "") < persona.MIMIC_MIN_LENGTH:

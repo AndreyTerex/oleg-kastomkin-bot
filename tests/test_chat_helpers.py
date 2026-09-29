@@ -64,25 +64,36 @@ def test_human_gap():
     assert chat.human_gap(timedelta(days=2)) == "2 дн"
 
 
-def test_pick_mood_never_repeats_and_skips_mimic_on_short_text():
+def test_pick_mood_and_tactic_never_repeat_and_skip_mimic_on_short_text():
     for _ in range(200):
-        mood = chat.pick_mood("гг", last="провокатор")
-        assert mood[0] not in ("провокатор", "подражатель")
+        assert chat.pick_mood("гг", last="цундере")[0] != "цундере"
+        tactic = chat.pick_tactic("гг", last="провокатор")
+        assert tactic[0] not in ("провокатор", "подражатель")
 
 
 def test_pick_mood_prefers_matching_mood(monkeypatch):
     seen = []
     monkeypatch.setattr(chat.random, "choices", lambda options, weights, k: seen.append(dict(zip(options, weights))) or [options[0]])
-    chat.pick_mood("опять зафидил 0/9, ужас", last="")
+    chat.pick_mood("спасибо, Олег, ты лучший и очень длинное сообщение", last="")
     weights = {mood[0]: weight for mood, weight in seen[0].items()}
+    assert weights["цундере"] == persona.MOOD_BOOST * weights["гэнки"]
+    seen.clear()
+    chat.pick_tactic("опять зафидил 0/9, ужас", last="")
+    weights = {tactic[0]: weight for tactic, weight in seen[0].items()}
     assert weights["невозмутимый"] == persona.MOOD_BOOST * weights["стравливатель"]
 
 
-def test_persona_moods_have_known_triggers():
-    names = {name for name, _description in persona.MOODS}
+def test_persona_has_dere_moods_and_old_tactics():
+    moods = {name for name, _description in persona.MOODS}
+    tactics = {name for name, _description in persona.TACTICS}
+    assert moods == {"цундере", "дэрэдэрэ", "дандэрэ", "кудэрэ", "гэнки"}
+    assert {"провокатор", "подначка", "подражатель"} <= tactics
     # Описания развёрнутые, а готовых реплик-шаблонов в них нет.
-    assert all(len(description) > 150 and "→" not in description for _name, description in persona.MOODS)
-    assert set(persona.MOOD_TRIGGERS) <= names
+    for _name, description in persona.MOODS + persona.TACTICS:
+        assert len(description) > 150 and "→" not in description
+    assert set(persona.MOOD_TRIGGERS) <= moods and set(persona.TACTIC_TRIGGERS) <= tactics
+    line = persona.MOOD_LINE.format(name="цундере", description="d", tactic="подначка", tactic_description="t")
+    assert "цундере" in line and "подначка" in line
 
 
 def test_describe_escapes_section_tags():
@@ -187,10 +198,11 @@ def test_lanes_topic_only_for_who_questions():
     assert not chat.LANES_TOPIC.search("Олег, как контрить ясуо на миде?")
 
 
-def test_persona_is_about_baiting_not_jokes():
-    assert "байт" in persona.PERSONA and "не шути ради шутки" in persona.PERSONA
-    # Границы троллинга на месте.
+def test_persona_is_a_cute_femboy_with_boundaries():
+    assert "фембой" in persona.PERSONA and "цундере" in persona.PERSONA
+    # Границы на месте в любом настроении, а смелые шутки — только в каналах 18+.
     assert "никогда про внешность" in persona.PERSONA and "не добивай одного человека" in persona.PERSONA
+    assert "сексуализации конкретных людей" in persona.PERSONA and "18+" in persona.NSFW_LINE
 
 
 def test_clean_reply_keeps_inner_quotes():
