@@ -20,7 +20,7 @@ def test_order_providers_follows_llm_order_and_keeps_model_order():
 def test_default_chain_starts_with_gemini_then_groq():
     import config
 
-    assert config.LLM_ORDER[:3] == ["gemini", "puter", "zai"] and config.LLM_ORDER[-2:] == ["groq", "huggingface"]
+    assert config.LLM_ORDER[:3] == ["gemini", "puter", "openrouter"] and config.LLM_ORDER[-2:] == ["groq", "huggingface"]
     assert config.GEMINI_MODELS[0].startswith("gemini-") and "flash" in config.GEMINI_MODELS[0]
     assert config.GROQ_MODELS[0] == "openai/gpt-oss-120b"
     assert not hasattr(config, "MISTRAL_API_KEY")
@@ -217,6 +217,9 @@ def test_broken_vpn_sends_next_models_direct(monkeypatch):
                 self.healthy = False
                 self.broken = True
 
+        async def wait_healthy(self, timeout):
+            return False  # VPN так и не починился
+
     fake = FakeVpn()
     monkeypatch.setattr(llm, "VPN_CLIENT", fake)
 
@@ -269,6 +272,9 @@ def test_slow_answer_through_vpn_also_marks_it_broken(monkeypatch):
         def report_failure(self, **kwargs):
             self.reports.append(kwargs)
             self.healthy, self.broken = False, True
+
+        async def wait_healthy(self, timeout):
+            return False
 
     fake = FakeVpn()
     monkeypatch.setattr(llm, "VPN_CLIENT", fake)
@@ -347,3 +353,60 @@ def test_zai_comes_before_groq(monkeypatch):
         monkeypatch.setattr(config, key, "k")
     names = [p.label for p in llm.build_providers()]
     assert names.index("zai:glm-4.7-flash") < min(i for i, n in enumerate(names) if n.startswith("groq:"))
+
+
+
+def test_important_reply_waits_for_vpn_and_still_gets_a_strong_model(monkeypatch):
+    import asyncio
+
+    import aiohttp
+
+    import config
+    import llm
+
+    vpn_url = "http://127.0.0.1:10809"
+    monkeypatch.setattr(config, "VPN_PROXY_URL", vpn_url)
+
+    class FakeVpn:
+        healthy, broken, waits = True, False, []
+
+        def report_failure(self, **kwargs):
+            self.healthy, self.broken = False, True
+
+        async def wait_healthy(self, timeout):
+            self.waits.append(timeout)
+            self.healthy, self.broken = True, False  # VPN сменил сервер
+            return True
+
+    fake = FakeVpn()
+    monkeypatch.setattr(llm, "VPN_CLIENT", fake)
+    calls = []
+
+    class Session:
+        closed = False
+
+        def post(self, url, **kwargs):
+            model = kwargs["json"]["model"]
+            calls.append(model)
+
+            class Pending:
+                async def __aenter__(self_inner):
+                    if model == "gemini-3.8-flash":
+                        raise aiohttp.ClientConnectionError("server disconnected")
+                    return _FakeResponse(*_ok(f"ответ {model}"))
+
+                async def __aexit__(self_inner, *exc):
+                    return False
+
+            return Pending()
+
+    chain = [
+        Provider(name="gemini", url="u", api_key="k", model="gemini-3.8-flash", proxy=vpn_url, scarce=True),
+        Provider(name="gemini", url="u", api_key="k", model="gemini-3.7-flash", proxy=vpn_url, scarce=True),
+        Provider(name="groq", url="u", api_key="k", model="oss", proxy=vpn_url),
+    ]
+    client = llm.LLMClient(chain)
+    client._session = Session()
+    reply = asyncio.run(client.complete("s", "u"))
+    assert reply.model == "gemini:gemini-3.7-flash" and "oss" not in calls
+    assert fake.waits == [config.LLM_VPN_WAIT]

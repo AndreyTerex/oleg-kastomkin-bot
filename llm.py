@@ -294,14 +294,19 @@ class LLMClient:
             self._session = aiohttp.ClientSession()
 
         errors: list[str] = []
+        waited_for_vpn = False
         for provider in self.providers:
             if economy and provider.scarce:
                 continue
             if self._blocked_until.get(provider.label, 0) > time.time():
                 continue
             if provider.name in config.LLM_VPN_ONLY and provider.proxy == config.VPN_PROXY_URL and VPN_CLIENT.broken:
-                # Напрямую из России не пустят, а отказ по региону отключил бы модель надолго — ждём VPN.
-                continue
+                # Сильная модель только через VPN: для важного ответа ждём, пока VPN сменит сервер
+                # (один раз за запрос), и только потом отдаём ответ модели послабее.
+                if economy or waited_for_vpn or not await VPN_CLIENT.wait_healthy(config.LLM_VPN_WAIT):
+                    waited_for_vpn = True
+                    continue
+                waited_for_vpn = True
             # Перегруженную «редкую» модель не переспрашиваем: неудачный запрос тоже съедает её суточный лимит,
             # а следующая модель Gemini в цепочке — со своим лимитом, это и есть повтор.
             retries = 0 if provider.scarce else config.LLM_OVERLOAD_RETRIES

@@ -344,6 +344,7 @@ class VPN:
         self.last_failure_report = 0.0
         self.need_full = False
         self.broken_until = 0.0
+        self.suspect: str | None = None
         self.started = False
 
     # --- настройки
@@ -532,6 +533,8 @@ class VPN:
             return False
         self.current = result
         self.broken_until = 0.0
+        if self.suspect != result.fingerprint:
+            self.suspect = None
         self.state.select(result)
         await self.state.save()
         return True
@@ -587,6 +590,15 @@ class VPN:
 
     # --- перепроверка
 
+    async def wait_healthy(self, timeout: float) -> bool:
+        """Подождать, пока VPN сменит сбойный сервер, — чтобы ответила сильная модель, а не запасная."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.healthy:
+                return True
+            await asyncio.sleep(1.0)
+        return self.healthy
+
     @property
     def broken(self) -> bool:
         """Xray запущен, но сервер только что уронил соединение — ждём, пока проверка найдёт рабочий."""
@@ -608,8 +620,13 @@ class VPN:
         now = time.time()
         if connection and self.current is not None:
             if now >= self.broken_until:
-                log.warning("VPN: сервер «%s» не довёз запрос — пока хожу напрямую, проверяю серверы", self.current.name)
+                log.warning("VPN: сервер «%s» не довёз запрос — меняю сервер", self.current.name)
             self.broken_until = now + BROKEN_PAUSE
+            # Короткая проверка (gstatic) у такого сервера часто проходит, а настоящие запросы рвутся —
+            # поэтому ей не верим: сервер временно в чёрный список, ищем другой.
+            self.suspect = self.current.fingerprint
+            self.state.data["blacklist"][self.current.fingerprint] = now
+            self.state.data["good"].pop(self.current.fingerprint, None)
         if region and self.current is not None:
             # Выход сервера в стране, куда нейросеть не пускает, — этот сервер больше не выбираем.
             self.state.data["blacklist"][self.current.fingerprint] = now
@@ -726,7 +743,8 @@ class VPN:
                 return self.status()  # напрямую: все серверы перебираем только по расписанию (_full_check_due)
             # Сначала — один запрос через текущий сервер: жив — полную проверку (если пора) делаем спокойно,
             # мёртв — быстро ищем замену среди выборки, а не ждём проверки всех сотен серверов.
-            alive = self.current is not None and await self._current_alive()
+            suspect = self.current is not None and self.current.fingerprint == self.suspect
+            alive = self.current is not None and not suspect and await self._current_alive()
             if not full and alive:
                 return self.status()
             quick = self.current is not None and not alive and not self.need_full

@@ -452,3 +452,15 @@ def test_dead_server_is_replaced_from_a_quick_sample(monkeypatch, tmp_path):
     asyncio.run(client.recheck(full=True))  # даже если полная проверка «по расписанию» — сначала быстрая замена
     assert probed == [vpn.QUICK_CHECK_SIZE] and activated == ["S9"]
     assert client.state.data["last_check"] is None  # полная проверка ещё впереди
+
+
+def test_server_that_dropped_a_real_request_is_not_trusted_by_a_light_check(tmp_path, monkeypatch):
+    client = vpn.VPN()
+    client.state = vpn.VpnState(tmp_path / "vpn.json")
+    client.state.load()
+    client.started = True
+    client.current = vpn.ProbeResult("fp", "Finland", True, 600.0, "FI")
+    client.state.data["good"]["fp"] = 600
+    monkeypatch.setattr(type(client), "ready", property(lambda self: True))
+    client.report_failure(connection=True)
+    assert client.suspect == "fp" and "fp" in client.state.data["blacklist"] and "fp" not in client.state.data["good"]
