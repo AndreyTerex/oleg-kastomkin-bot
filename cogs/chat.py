@@ -504,6 +504,10 @@ class Chat(commands.Cog):
             facts.append(self.commands_summary(message.guild))
             if STATS_TOPIC.search(message.content):
                 facts.append(self.leaderboard_summary(message.guild))
+        if STATS_TOPIC.search(message.content):
+            asked = self.asked_stats(message)
+            if asked:
+                facts.append(asked)
             if LANES_TOPIC.search(message.content):
                 facts.append(self.lanes_summary(message.guild))
         optout_names = [
@@ -867,10 +871,30 @@ class Chat(commands.Cog):
         if not ranking:
             return f"Статистика каток: отмечено каток — {games}, для таблицы лидеров пока мало данных (нужно от 3 каток на игрока)."
         lines = []
-        for place, (user_id, record) in enumerate(ranking[:5], start=1):
+        for place, (user_id, record) in enumerate(ranking[:15], start=1):
             member = guild.get_member(user_id)
             lines.append(f"{place}. {one_line(member.display_name) if member else user_id} — {record.describe()}")
         return f"Таблица лидеров кастомок (всего отмечено каток: {games}):\n" + "\n".join(lines)
+
+    def asked_stats(self, message: discord.Message) -> str | None:
+        """Личная статистика тех, о ком спрашивают (тегнули или назвали по имени), — даже если каток мало."""
+        members = [
+            m for m in message.mentions
+            if isinstance(m, discord.Member) and not m.bot and m.id != self.bot.user.id
+        ]
+        members += [m for m in named_members(message.content, message.guild.members) if m not in members]
+        stats_cog = self.bot.get_cog("Stats")
+        if not members or stats_cog is None:
+            return None
+        lines = []
+        for member in members[:3]:
+            record = stats_cog.stats.player(message.guild.id, member.id)
+            note = " — мало, в таблицу лидеров пока не попадает" if 0 < record.games < STATS_MIN_GAMES else ""
+            lines.append(f"- {one_line(member.display_name)}: {record.describe()}{note}")
+        return (
+            "Статистика тех, о ком спрашивают (отвечай про человека по его строке, "
+            "не бери цифры других из таблицы лидеров):\n" + "\n".join(lines)
+        )
 
     def lanes_summary(self, guild: discord.Guild) -> str:
         lines = []
@@ -1273,6 +1297,48 @@ async def typing_if_possible(channel):
     finally:
         if indicator is not None:
             await indicator.__aexit__(None, None, None)
+
+
+NAME_WORD = re.compile(r"[a-zа-яё]+", re.IGNORECASE)
+
+
+def named_members(text: str, members) -> list:
+    """Кого назвали по имени: «винрейт у дениса» → «Føxŷ (Дениска)». Сравнение по общему началу слова,
+    чтобы падежи и уменьшительные («дениса», «дениска») находили одного и того же человека."""
+    words = [w.lower() for w in NAME_WORD.findall(text or "") if len(w) >= 4 and w.lower() not in ("олег", "олежа")]
+    found = []
+    for member in members:
+        if getattr(member, "bot", False):
+            continue
+        names = {getattr(member, "display_name", ""), getattr(member, "name", ""), getattr(member, "global_name", "") or ""}
+        tokens = {t.lower() for name in names for t in NAME_WORD.findall(name) if len(t) >= 3}
+        for word in words:
+            if any(_same_name(word, token) for token in tokens):
+                found.append(member)
+                break
+    return found
+
+
+_TRANSLIT = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i",
+    "й": "i", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
+    "у": "u", "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sh", "ы": "y", "э": "e", "ю": "yu",
+    "я": "ya", "ь": "", "ъ": "",
+})
+
+
+def _same_name(word: str, token: str) -> bool:
+    """Одно имя в разных формах и алфавитах: «кабана» ↔ «Kaban», «дениса» ↔ «Дениска»."""
+    return _common_start(word, token) or _common_start(word.translate(_TRANSLIT), token.translate(_TRANSLIT))
+
+
+def _common_start(word: str, token: str) -> bool:
+    common = 0
+    for a, b in zip(word, token):
+        if a != b:
+            break
+        common += 1
+    return common >= max(4, min(len(word), len(token)) - 2)
 
 
 def deal_summary(guild: discord.Guild, record: dict) -> str | None:

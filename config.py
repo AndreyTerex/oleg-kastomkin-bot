@@ -153,6 +153,8 @@ LLM_PROXY_FOR: list[str] = [
 ]
 # Нейросети, которые из России работают только через VPN: пока VPN сломан, их не спрашивают напрямую
 # (иначе отказ по региону отключил бы их на 15 минут), а пропускают до починки VPN.
+# Сколько секунд ждать, пока VPN сменит сбойный сервер, прежде чем отдать ответ модели без VPN (Z.ai, Groq).
+LLM_VPN_WAIT: int = max(0, _env_int("LLM_VPN_WAIT", 25))
 LLM_VPN_ONLY: list[str] = [
     name.strip().lower() for name in os.getenv("LLM_VPN_ONLY", "gemini").split(",") if name.strip()
 ]
@@ -169,7 +171,7 @@ VPN_FOR_DISCORD: bool = os.getenv("VPN_FOR_DISCORD", "0").strip().lower() not in
 # быстро, но слабее — он почти в самом конце, только когда остальные на лимите.
 LLM_ORDER: list[str] = [
     name.strip().lower()
-    for name in os.getenv("LLM_ORDER", "gemini,puter,zai,tokenharbor,openrouter,groq,huggingface").split(",")
+    for name in os.getenv("LLM_ORDER", "gemini,puter,openrouter,tokenharbor,zai,groq,huggingface").split(",")
     if name.strip()
 ]
 

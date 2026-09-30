@@ -265,3 +265,18 @@ def test_failed_typing_indicator_does_not_break_the_reply():
 
     asyncio.run(run())
     assert done == ["ответ отправлен"]
+
+
+def test_named_members_find_people_by_declined_or_pet_names():
+    from types import SimpleNamespace as NS
+
+    from cogs.chat import named_members
+
+    denis = NS(display_name="Føxŷ (Дениска)", name="foxy", global_name=None, bot=False)
+    havoc = NS(display_name="Havoc (Лешенька)", name="havoc", global_name=None, bot=False)
+    kaban = NS(display_name="Kaban RS 5", name="kaban", global_name=None, bot=False)
+    people = [denis, havoc, kaban]
+    assert named_members("олег какой винрейт у дениса", people) == [denis]
+    assert named_members("а у лешеньки?", people) == [havoc]
+    assert named_members("Олег, какой винрейт у кабана", people) == [kaban]
+    assert named_members("Олег, кто лучший на топе", people) == []
