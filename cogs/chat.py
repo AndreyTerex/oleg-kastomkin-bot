@@ -152,9 +152,9 @@ ROAST_QUOTES = 8
 ROAST_SOFT_LIMIT = 420
 ROAST_LIMIT = 600
 
-# Олег байтит часто: встревает в живой разговор не реже, чем раз в несколько минут.
+# Олег встревает в живой разговор сам, но в меру: не чаще раза в несколько минут и не всегда.
 SPONTANEOUS_COOLDOWN = 5 * 60
-SPONTANEOUS_CHANCE = 0.15
+SPONTANEOUS_CHANCE = 0.1
 SPONTANEOUS_TOPIC_BONUS = 2.5
 ACTIVITY_WINDOW = 10 * 60
 ACTIVITY_MIN_MESSAGES = 4
@@ -1411,7 +1411,7 @@ def _pick(choices, triggers, text: str, last: str) -> tuple[str, str]:
         name = mood[0]
         if name == last:
             continue
-        weight = 1.0
+        weight = persona.TACTIC_WEIGHTS.get(name, 1.0) if choices is persona.TACTICS else 1.0
         trigger = triggers.get(name)
         if trigger is not None and trigger.search(text or ""):
             weight *= persona.MOOD_BOOST

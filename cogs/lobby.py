@@ -624,7 +624,7 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
     round_no = record.get("round", 1)
     if time.time() - record.get("last_report_at", 0) < REPORT_COOLDOWN:
         # Защита от двойного клика: катки не длятся секунды.
-        await respond(interaction, f"Катку {round_no - 1} только что записал. Если это следующая — нажмите через пару секунд.")
+        await respond(interaction, f"Катку {round_no - 1} только что записала. Если это следующая — нажмите через пару секунд.")
         return
     stats_cog = interaction.client.get_cog("Stats")
     if stats_cog is None:
@@ -650,7 +650,7 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
     else:
         channel = interaction.client.get_channel(record["channel_id"]) or interaction.channel
         lobby_message = channel.get_partial_message(lobby_id)
-        await interaction.response.edit_message(content=f"✅ Записал: победа — **{side_name}**.", view=None)
+        await interaction.response.edit_message(content=f"✅ Записала: победа — **{side_name}**.", view=None)
         try:
             await lobby_message.edit(embed=cog.build_embed(interaction.guild, record), view=LobbyView(record))
         except discord.HTTPException:
@@ -662,7 +662,7 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
         lines.append(f"🎉 **Серия Bo{record.get('series', DEFAULT_SERIES)} за {SERIES_WINNERS[side]}!**")
     announce = await interaction.followup.send("\n".join(lines), wait=True)
     await interaction.followup.send(
-        "Записал в статистику. Ошиблись кнопкой — отмените:",
+        "Записала в статистику. Ошиблись кнопкой — отмените:",
         view=UndoResultView(cog, record, lobby_message, game_id, round_no, announce),
         ephemeral=True,
     )

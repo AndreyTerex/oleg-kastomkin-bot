@@ -270,7 +270,7 @@ class Matchday(commands.Cog):
         if guess is not None:
             lines.append(f"Похоже, победили **{(BLUE_SIDE, RED_SIDE)[guess]}**.")
         else:
-            lines.append("Не понял, какая это сторона в сборе, — отметьте кнопкой.")
+            lines.append("Не поняла, какая это сторона в сборе, — отметьте кнопкой.")
         if best is not None:
             lines.append(f"Лучший KDA — **{best.name}** на {best.champion}: {best.kills}/{best.deaths}/{best.assists}.")
         if chat is not None and hasattr(chat, "oleg_line"):
