@@ -90,7 +90,7 @@ def test_pick_mood_prefers_matching_mood(monkeypatch):
 def test_persona_has_dere_moods_and_old_tactics():
     moods = {name for name, _description in persona.MOODS}
     tactics = {name for name, _description in persona.TACTICS}
-    assert moods == {"цундере", "дэрэдэрэ", "дандэрэ", "кудэрэ", "гэнки"}
+    assert moods == {"цундере", "дэрэдэрэ", "дандэрэ", "кудэрэ", "гэнки", "госпожа"}
     assert {"провокатор", "подначка", "подражатель", "болтушка", "заботливый тренер"} <= tactics
     assert set(persona.TACTIC_WEIGHTS) <= tactics
     # Описания развёрнутые, а готовых реплик-шаблонов в них нет.
