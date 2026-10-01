@@ -225,3 +225,60 @@ def test_restart_skips_posts_that_already_look_right():
         assert not lobby.same_render(shown, changed, view)
 
     asyncio.run(build())
+
+
+def test_split_takes_teams_from_lobby_when_newer():
+    from types import SimpleNamespace as NS
+
+    from cogs.scrim import Scrim
+
+    people = {i: NS(id=i) for i in range(1, 5)}
+    guild = NS(id=1, get_member=lambda i: people.get(i))
+    record = {"teams": [[1, 2], [3, 4]], "teams_at": 200.0, "created_at": 100.0}
+    lobby = NS(
+        latest_open_record=lambda g: ("55", record),
+        members_from_ids=lambda g, ids: [people[i] for i in ids],
+    )
+    cog = Scrim.__new__(Scrim)
+    cog.bot = NS(get_cog=lambda name: lobby)
+    cog.last_teams, cog.last_teams_at = {}, {}
+    blue, red = cog.current_teams(guild)
+    assert [m.id for m in blue] == [1, 2] and [m.id for m in red] == [3, 4]
+    # /teams позже поста сбора — берём его
+    cog.last_teams[1] = ([people[4]], [people[1]])
+    cog.last_teams_at[1] = 300.0
+    assert cog.current_teams(guild) == ([people[4]], [people[1]])
+    # сбора нет — только /teams
+    lobby.latest_open_record = lambda g: None
+    assert cog.current_teams(guild) == ([people[4]], [people[1]])
+
+
+def test_deal_is_posted_via_interaction_and_explains_missing_rights():
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    import discord
+
+    from cogs.lobby import Lobby
+
+    sent, warned = [], []
+
+    async def followup_send(*args, **kwargs):
+        if kwargs.get("ephemeral"):
+            warned.append(args[0])
+            return
+        if fail:
+            raise discord.Forbidden(NS(status=403, reason="x"), "Missing Permissions")
+        sent.append(kwargs)
+
+    async def channel_send(**kwargs):
+        raise AssertionError("в канал напрямую писать не должны, раз есть нажатие")
+
+    interaction = NS(followup=NS(send=followup_send), is_expired=lambda: False)
+    cog = Lobby.__new__(Lobby)
+    fail = False
+    asyncio.run(cog.post_deal(NS(send=channel_send), {"embed": "e"}, interaction, "раздачу"))
+    assert sent == [{"embed": "e"}] and not warned
+    fail = True
+    asyncio.run(cog.post_deal(NS(send=channel_send), {"embed": "e"}, interaction, "раздачу"))
+    assert warned and "Прикреплять файлы" in warned[0]

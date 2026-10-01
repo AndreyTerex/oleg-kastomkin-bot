@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from typing import Awaitable, Callable
 
 import discord
@@ -229,8 +230,10 @@ class DraftView(discord.ui.View):
         finished = not self.pool
         if self.on_pick is not None and not finished:
             await self.on_pick(self)
+        # Последнее нажатие: через него сбор публикует раздачу (вебхук не требует прав в канале).
+        self.last_interaction = interaction
         if finished:
-            self.cog.last_teams[interaction.guild.id] = (list(self.teams[0]), list(self.teams[1]))
+            self.cog.remember_teams(interaction.guild.id, list(self.teams[0]), list(self.teams[1]))
             self.select.disabled = True
             self.stop()
         else:
@@ -261,6 +264,7 @@ class Scrim(commands.Cog):
         self.bot = bot
         # Последние составы по серверам — их использует /split.
         self.last_teams: dict[int, tuple[list[discord.Member], list[discord.Member]]] = {}
+        self.last_teams_at: dict[int, float] = {}
 
     async def _players_from_voice(
         self,
@@ -369,7 +373,7 @@ class Scrim(commands.Cog):
             embed.add_field(name="Обратите внимание", value=note, inline=False)
         embed.set_footer(text=f"Канал: {voice.name} · развести по каналам — /split")
 
-        self.last_teams[interaction.guild.id] = (blue, red)
+        self.remember_teams(interaction.guild.id, blue, red)
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="draft", description="Драфт: капитаны по очереди набирают команды")
@@ -408,6 +412,25 @@ class Scrim(commands.Cog):
         await interaction.response.send_message(embed=view.build_embed(), view=view)
         view.message = await interaction.original_response()
 
+    def remember_teams(self, guild_id: int, blue: list[discord.Member], red: list[discord.Member]) -> None:
+        self.last_teams[guild_id] = (blue, red)
+        self.last_teams_at[guild_id] = time.time()
+
+    def current_teams(self, guild: discord.Guild) -> tuple[list[discord.Member], list[discord.Member]] | None:
+        """Последние составы: из /teams и /draft или из поста сбора — что сформировано позже."""
+        teams = self.last_teams.get(guild.id)
+        at = self.last_teams_at.get(guild.id, 0.0)
+        lobby = self.bot.get_cog("Lobby")
+        found = lobby.latest_open_record(guild) if lobby is not None else None
+        if found is not None:
+            record = found[1]
+            if len(record.get("teams") or []) == 2:
+                lobby_at = record.get("teams_at") or record.get("created_at", 0)
+                if teams is None or lobby_at >= at:
+                    blue, red = (lobby.members_from_ids(guild, ids) for ids in record["teams"])
+                    return blue, red
+        return teams
+
     @app_commands.command(name="split", description="Развести составы по голосовым каналам")
     @app_commands.describe(blue="Канал для синей стороны", red="Канал для красной стороны")
     @app_commands.default_permissions(move_members=True)
@@ -418,9 +441,12 @@ class Scrim(commands.Cog):
         blue: discord.VoiceChannel,
         red: discord.VoiceChannel,
     ) -> None:
-        teams = self.last_teams.get(interaction.guild.id)
+        teams = self.current_teams(interaction.guild)
         if not teams:
-            await respond(interaction, "Составы ещё не сформированы — сначала выполните `/teams` или `/draft`.")
+            await respond(
+                interaction,
+                "Составы ещё не сформированы — запустите игру в посте сбора или выполните `/teams` или `/draft`.",
+            )
             return
         if not interaction.guild.me.guild_permissions.move_members:
             await respond(interaction, "Боту нужно право **«Перемещать участников»**.")
