@@ -27,4 +27,8 @@ RUN useradd --create-home --uid 1000 bot \
     && chown -R bot:bot /app
 USER bot
 
+# Бот раз в 20 секунд обновляет data/heartbeat (cogs/ops.py); не обновил 3 минуты — контейнер «unhealthy».
+HEALTHCHECK --interval=60s --timeout=10s --start-period=300s --retries=3 \
+    CMD python -c "import os, sys, time; sys.exit(0 if time.time() - os.path.getmtime('/app/data/heartbeat') < 180 else 1)"
+
 CMD ["python", "-u", "bot.py"]

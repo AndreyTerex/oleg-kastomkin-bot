@@ -178,6 +178,13 @@ LLM_ORDER: list[str] = [
 # Каталог для сохранения состояния (в Docker смонтирован как volume).
 DATA_DIR: str = os.getenv("DATA_DIR", "data")
 
+# Канал для тревог (ошибки, VPN лежит, все нейросети на лимите). Пусто — тревоги не шлются, /oleg-status работает.
+ALERT_CHANNEL_ID: int = _env_int("ALERT_CHANNEL_ID")
+# Сколько ежедневных копий data/ хранить в data/backups.
+BACKUP_KEEP: int = max(1, _env_int("BACKUP_KEEP", 7))
+# Сторожевой таймер: бот перезапускается, если завис или не может подключиться к Discord столько минут.
+WATCHDOG_DISCONNECT_MINUTES: int = max(0, _env_int("WATCHDOG_DISCONNECT_MINUTES", 15))
+
 # Часовой пояс, в котором организаторы пишут время сбора («сегодня 21:00»). Игроки видят его в своём поясе.
 try:
     TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow")
