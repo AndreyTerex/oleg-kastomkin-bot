@@ -434,57 +434,7 @@ class LobbyView(discord.ui.View):
         await self._report(interaction, 1)
 
     async def _report(self, interaction: discord.Interaction, side: int) -> None:
-        cog: "Lobby" = interaction.client.get_cog("Lobby")
-        record = cog.get_record(interaction.message.id)
-        if record is None:
-            await respond(interaction, "Этот сбор больше не отслеживается.")
-            return
-        if not cog.is_organizer(interaction, record):
-            await respond(interaction, "Результат отмечает автор сбора или организатор ивентов.")
-            return
-        if record.get("closed") or len(record.get("teams") or []) != 2:
-            await respond(interaction, "Составов нет — отмечать нечего.")
-            return
-        round_no = record.get("round", 1)
-        if time.time() - record.get("last_report_at", 0) < REPORT_COOLDOWN:
-            # Защита от двойного клика: катки не длятся секунды.
-            await respond(interaction, f"Катку {round_no - 1} только что записал. Если это следующая — нажмите через пару секунд.")
-            return
-        stats_cog = interaction.client.get_cog("Stats")
-        if stats_cog is None:
-            await respond(interaction, "Модуль статистики не загружен — посмотрите логи бота.")
-            return
-
-        winners, losers = record["teams"][side], record["teams"][1 - side]
-        # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
-        record["last_report_at"] = time.time()
-        record["round"] = round_no + 1
-        game_id = await stats_cog.stats.record_game(
-            interaction.guild.id, list(winners), list(losers), lobby_id=interaction.message.id, round_no=round_no,
-            channel_id=interaction.channel_id,
-        )
-        record.setdefault("results", []).append({"round": round_no, "winner": side, "game": game_id})
-        await cog.save()
-        await interaction.response.edit_message(
-            embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
-        )
-
-        side_name = (BLUE_SIDE, RED_SIDE)[side]
-        names = ", ".join(player_name(m) for m in cog.members_from_ids(interaction.guild, winners))
-        lines = [f"🏆 Катка {round_no}: победа — **{side_name}**! {names}", cog.score_line(record)]
-        if series_winner(record) is not None and series_winner(record, drop_last=True) is None:
-            lines.append(f"🎉 **Серия Bo{record.get('series', DEFAULT_SERIES)} за {SERIES_WINNERS[side]}!**")
-        announce = await interaction.followup.send("\n".join(lines), wait=True)
-        await interaction.followup.send(
-            "Записал в статистику. Ошиблись кнопкой — отмените:",
-            view=UndoResultView(cog, record, interaction.message, game_id, round_no, announce),
-            ephemeral=True,
-        )
-        if config.MVP_VOTE_MINUTES:
-            players = cog.members_from_ids(interaction.guild, list(winners) + list(losers))
-            if len(players) >= 2:
-                view = MvpView(stats_cog.stats, interaction.guild.id, game_id, round_no, players, set(winners))
-                view.message = await interaction.followup.send(view.text(), view=view, wait=True)
+        await report_result(interaction, interaction.message.id, side)
 
     # --- режим, запуск, драфт, развод по каналам -----------------------
 
@@ -656,6 +606,71 @@ class LobbyView(discord.ui.View):
             view=MoveView(cog, record),
             ephemeral=True,
         )
+
+
+async def report_result(interaction: discord.Interaction, lobby_id: int, side: int) -> None:
+    """Записать победу стороны в сборе lobby_id: кнопкой в посте сбора или подтверждением по скриншоту."""
+    cog: "Lobby" = interaction.client.get_cog("Lobby")
+    record = cog.get_record(lobby_id)
+    if record is None:
+        await respond(interaction, "Этот сбор больше не отслеживается.")
+        return
+    if not cog.is_organizer(interaction, record):
+        await respond(interaction, "Результат отмечает автор сбора или организатор ивентов.")
+        return
+    if record.get("closed") or len(record.get("teams") or []) != 2:
+        await respond(interaction, "Составов нет — отмечать нечего.")
+        return
+    round_no = record.get("round", 1)
+    if time.time() - record.get("last_report_at", 0) < REPORT_COOLDOWN:
+        # Защита от двойного клика: катки не длятся секунды.
+        await respond(interaction, f"Катку {round_no - 1} только что записал. Если это следующая — нажмите через пару секунд.")
+        return
+    stats_cog = interaction.client.get_cog("Stats")
+    if stats_cog is None:
+        await respond(interaction, "Модуль статистики не загружен — посмотрите логи бота.")
+        return
+
+    winners, losers = record["teams"][side], record["teams"][1 - side]
+    # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
+    record["last_report_at"] = time.time()
+    record["round"] = round_no + 1
+    game_id = await stats_cog.stats.record_game(
+        interaction.guild.id, list(winners), list(losers), lobby_id=lobby_id, round_no=round_no,
+        channel_id=interaction.channel_id,
+    )
+    record.setdefault("results", []).append({"round": round_no, "winner": side, "game": game_id})
+    await cog.save()
+    side_name = (BLUE_SIDE, RED_SIDE)[side]
+    if interaction.message is not None and interaction.message.id == lobby_id:
+        lobby_message = interaction.message
+        await interaction.response.edit_message(
+            embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
+        )
+    else:
+        channel = interaction.client.get_channel(record["channel_id"]) or interaction.channel
+        lobby_message = channel.get_partial_message(lobby_id)
+        await interaction.response.edit_message(content=f"✅ Записал: победа — **{side_name}**.", view=None)
+        try:
+            await lobby_message.edit(embed=cog.build_embed(interaction.guild, record), view=LobbyView(record))
+        except discord.HTTPException:
+            log.warning("Не удалось обновить пост сбора после записи результата по скриншоту")
+
+    names = ", ".join(player_name(m) for m in cog.members_from_ids(interaction.guild, winners))
+    lines = [f"🏆 Катка {round_no}: победа — **{side_name}**! {names}", cog.score_line(record)]
+    if series_winner(record) is not None and series_winner(record, drop_last=True) is None:
+        lines.append(f"🎉 **Серия Bo{record.get('series', DEFAULT_SERIES)} за {SERIES_WINNERS[side]}!**")
+    announce = await interaction.followup.send("\n".join(lines), wait=True)
+    await interaction.followup.send(
+        "Записал в статистику. Ошиблись кнопкой — отмените:",
+        view=UndoResultView(cog, record, lobby_message, game_id, round_no, announce),
+        ephemeral=True,
+    )
+    if config.MVP_VOTE_MINUTES:
+        players = cog.members_from_ids(interaction.guild, list(winners) + list(losers))
+        if len(players) >= 2:
+            view = MvpView(stats_cog.stats, interaction.guild.id, game_id, round_no, players, set(winners))
+            view.message = await interaction.followup.send(view.text(), view=view, wait=True)
 
 
 class UndoResultView(discord.ui.View):
