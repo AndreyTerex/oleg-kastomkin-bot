@@ -81,14 +81,18 @@ def test_pick_mood_prefers_matching_mood(monkeypatch):
     seen.clear()
     chat.pick_tactic("опять зафидил 0/9, ужас", last="")
     weights = {tactic[0]: weight for tactic, weight in seen[0].items()}
-    assert weights["невозмутимый"] == persona.MOOD_BOOST * weights["стравливатель"]
+    base = persona.TACTIC_WEIGHTS
+    assert abs(weights["невозмутимый"] / base["невозмутимый"] - persona.MOOD_BOOST * weights["стравливатель"] / base["стравливатель"]) < 1e-9
+    # Тёплые приёмы выпадают чаще колких, но колкие не исчезают.
+    assert weights["болтушка"] > weights["стравливатель"] > 0
 
 
 def test_persona_has_dere_moods_and_old_tactics():
     moods = {name for name, _description in persona.MOODS}
     tactics = {name for name, _description in persona.TACTICS}
     assert moods == {"цундере", "дэрэдэрэ", "дандэрэ", "кудэрэ", "гэнки"}
-    assert {"провокатор", "подначка", "подражатель"} <= tactics
+    assert {"провокатор", "подначка", "подражатель", "болтушка", "заботливый тренер"} <= tactics
+    assert set(persona.TACTIC_WEIGHTS) <= tactics
     # Описания развёрнутые, а готовых реплик-шаблонов в них нет.
     for _name, description in persona.MOODS + persona.TACTICS:
         assert len(description) > 150 and "→" not in description
@@ -199,8 +203,10 @@ def test_lanes_topic_only_for_who_questions():
     assert not chat.LANES_TOPIC.search("Олег, как контрить ясуо на миде?")
 
 
-def test_persona_is_a_cute_femboy_without_topic_bans():
-    assert "фембой" in persona.PERSONA and "цундере" in persona.PERSONA
+def test_persona_is_a_cute_girl_coach_without_topic_bans():
+    assert "девочка-тренер" in persona.PERSONA and "женском роде" in persona.PERSONA and "цундере" in persona.PERSONA
+    # LoL не в каждой реплике.
+    assert "не своди всё к игре" in persona.PERSONA
     # Пошлости и мат можно во всех каналах, проверки 18+ нет; уважение к /oleg-ignore-me осталось.
     assert "мат — можно" in persona.PERSONA and "никогда про внешность" not in persona.PERSONA
     assert not hasattr(persona, "NSFW_LINE")
