@@ -128,11 +128,6 @@ RETRY_AFTER_FAILURE = 12
 INVISIBLE = re.compile(r"[\u200b-\u200f\u2060-\u206f\ufeff]")
 # Корейские буквы и иероглифы: модели иногда вставляют «탑» вместо «топ» или 艸 в смайлик.
 FOREIGN_SCRIPT = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af\u3400-\u4dbf\u4e00-\u9fff]")
-# Мат в ответах Олега. Корни с границей слова слева, чтобы «оскорбляешь» или «хуже» не попадали.
-PROFANITY = re.compile(
-    r"(?<!\w)(бля|сук[аи]|сучар|ху[йеёяи]|пизд|[её]б[аулн]|нахуй|нахер|похуй|мудак|мудил|пид[оа]?р|долбо|залуп|гандон|шлюх)",
-    re.IGNORECASE,
-)
 SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 
 # Как Олег подписан в переданной модели истории чата: так он узнаёт свои прошлые реплики.
@@ -614,8 +609,6 @@ class Chat(commands.Cog):
             task_parts.insert(0, persona.MOOD_LINE.format(
                 name=mood[0], description=mood[1], tactic=tactic_name, tactic_description=tactic_description,
             ))
-        if getattr(message.channel, "is_nsfw", lambda: False)():
-            task_parts.append(persona.NSFW_LINE)
 
         sections = [
             section("context", "\n\n".join(facts)),
@@ -1447,8 +1440,8 @@ def replied_author(message: discord.Message, me: discord.abc.User) -> str | None
 
 
 def acceptable_reply(text: str) -> bool:
-    """Бракуем мат (в чате ругаются, и модели это повторяют) и корейские буквы с иероглифами."""
-    return not FOREIGN_SCRIPT.search(text) and not PROFANITY.search(text)
+    """Бракуем корейские буквы и иероглифы: модели иногда вставляют «탑» вместо «топ»."""
+    return not FOREIGN_SCRIPT.search(text)
 
 
 def strip_leading_name(text: str, member) -> str:

@@ -13,8 +13,9 @@ def test_pick_variant_prefers_best():
     assert chat.pick_variant(variants("раз", "два", "три", best=1)) == "два"
 
 
-def test_pick_variant_skips_profanity_and_foreign_script():
-    assert chat.pick_variant(variants("ну ты и сука", "탑 лучший", "чистый ответ")) == "чистый ответ"
+def test_pick_variant_skips_foreign_script_but_allows_swearing():
+    assert chat.pick_variant(variants("탑 лучший", "чистый ответ")) == "чистый ответ"
+    assert chat.pick_variant(variants("ну ты и сука", "чистый ответ")) == "ну ты и сука"
 
 
 def test_pick_variant_avoids_repeated_openings():
@@ -198,11 +199,14 @@ def test_lanes_topic_only_for_who_questions():
     assert not chat.LANES_TOPIC.search("Олег, как контрить ясуо на миде?")
 
 
-def test_persona_is_a_cute_femboy_with_boundaries():
+def test_persona_is_a_cute_femboy_without_topic_bans():
     assert "фембой" in persona.PERSONA and "цундере" in persona.PERSONA
-    # Границы на месте в любом настроении, а смелые шутки — только в каналах 18+.
-    assert "никогда про внешность" in persona.PERSONA and "не добивай одного человека" in persona.PERSONA
-    assert "сексуализации конкретных людей" in persona.PERSONA and "18+" in persona.NSFW_LINE
+    # Пошлости и мат можно во всех каналах, проверки 18+ нет; уважение к /oleg-ignore-me осталось.
+    assert "мат — можно" in persona.PERSONA and "никогда про внешность" not in persona.PERSONA
+    assert not hasattr(persona, "NSFW_LINE")
+    assert "/oleg-ignore-me" in persona.PERSONA
+    assert chat.acceptable_reply("бля, ну ты и фидер")
+    assert not chat.acceptable_reply("иди на 탑")
 
 
 def test_clean_reply_keeps_inner_quotes():
