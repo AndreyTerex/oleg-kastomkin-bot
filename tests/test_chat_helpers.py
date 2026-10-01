@@ -91,7 +91,8 @@ def test_persona_has_dere_moods_and_old_tactics():
     moods = {name for name, _description in persona.MOODS}
     tactics = {name for name, _description in persona.TACTICS}
     assert moods == {"цундере", "дэрэдэрэ", "дандэрэ", "кудэрэ", "гэнки", "госпожа"}
-    assert {"провокатор", "подначка", "подражатель", "болтушка", "заботливый тренер"} <= tactics
+    assert {"провокатор", "подначка", "подражатель", "болтушка", "заботливый тренер", "пикми"} <= tactics
+    assert "пикми" in persona.PERSONA and persona.TACTIC_WEIGHTS["пикми"] == max(persona.TACTIC_WEIGHTS.values())
     assert set(persona.TACTIC_WEIGHTS) <= tactics
     # Описания развёрнутые, а готовых реплик-шаблонов в них нет.
     for _name, description in persona.MOODS + persona.TACTICS:
