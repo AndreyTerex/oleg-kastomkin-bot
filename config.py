@@ -185,6 +185,15 @@ BACKUP_KEEP: int = max(1, _env_int("BACKUP_KEEP", 7))
 # Сторожевой таймер: бот перезапускается, если завис или не может подключиться к Discord столько минут.
 WATCHDOG_DISCONNECT_MINUTES: int = max(0, _env_int("WATCHDOG_DISCONNECT_MINUTES", 15))
 
+# Канал для объявлений бота: итоги недели и приглашения на кастомку. Пусто — канал, где отмечали последнюю катку.
+ANNOUNCE_CHANNEL_ID: int = _env_int("ANNOUNCE_CHANNEL_ID")
+# Итоги недели: день (0 — понедельник … 5 — суббота) и час по TIMEZONE. RECAP_HOUR=-1 — не публиковать.
+RECAP_WEEKDAY: int = min(6, max(0, _env_int("RECAP_WEEKDAY", 5)))
+RECAP_HOUR: int = min(23, _env_int("RECAP_HOUR", 11))
+# Сколько минут идёт голосование за MVP после отмеченной катки (до 14 — дольше Discord не даёт
+# обновить сообщение). 0 — не голосовать.
+MVP_VOTE_MINUTES: int = min(14, max(0, _env_int("MVP_VOTE_MINUTES", 10)))
+
 # Часовой пояс, в котором организаторы пишут время сбора («сегодня 21:00»). Игроки видят его в своём поясе.
 try:
     TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow")

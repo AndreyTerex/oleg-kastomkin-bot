@@ -460,7 +460,8 @@ class LobbyView(discord.ui.View):
         record["last_report_at"] = time.time()
         record["round"] = round_no + 1
         game_id = await stats_cog.stats.record_game(
-            interaction.guild.id, list(winners), list(losers), lobby_id=interaction.message.id, round_no=round_no
+            interaction.guild.id, list(winners), list(losers), lobby_id=interaction.message.id, round_no=round_no,
+            channel_id=interaction.channel_id,
         )
         record.setdefault("results", []).append({"round": round_no, "winner": side, "game": game_id})
         await cog.save()
@@ -479,6 +480,11 @@ class LobbyView(discord.ui.View):
             view=UndoResultView(cog, record, interaction.message, game_id, round_no, announce),
             ephemeral=True,
         )
+        if config.MVP_VOTE_MINUTES:
+            players = cog.members_from_ids(interaction.guild, list(winners) + list(losers))
+            if len(players) >= 2:
+                view = MvpView(stats_cog.stats, interaction.guild.id, game_id, round_no, players, set(winners))
+                view.message = await interaction.followup.send(view.text(), view=view, wait=True)
 
     # --- режим, запуск, драфт, развод по каналам -----------------------
 
@@ -688,6 +694,98 @@ class UndoResultView(discord.ui.View):
         button.disabled = True
         await interaction.response.edit_message(content="Результат отменён, статистика исправлена.", view=self)
         self.stop()
+
+
+def mvp_winners(votes: dict[int, int]) -> list[int]:
+    """Кто набрал больше всех голосов (при равенстве — все лидеры)."""
+    if not votes:
+        return []
+    counts: dict[int, int] = {}
+    for candidate in votes.values():
+        counts[candidate] = counts.get(candidate, 0) + 1
+    best = max(counts.values())
+    return sorted(user_id for user_id, count in counts.items() if count == best)
+
+
+class MvpView(discord.ui.View):
+    """Голосование за MVP катки: голосуют только её участники, за себя нельзя."""
+
+    def __init__(
+        self, stats, guild_id: int, game_id: int, round_no: int, players: list[discord.Member], winners: set[int],
+    ) -> None:
+        super().__init__(timeout=config.MVP_VOTE_MINUTES * 60)
+        self.stats = stats
+        self.guild_id = guild_id
+        self.game_id = game_id
+        self.round_no = round_no
+        self.players = {member.id: member for member in players}
+        self.votes: dict[int, int] = {}
+        self.message: discord.Message | None = None
+        self.finished = False
+        self.ends = int(time.time() + config.MVP_VOTE_MINUTES * 60)
+        select = discord.ui.Select(
+            placeholder="Кто MVP этой катки?",
+            options=[
+                discord.SelectOption(
+                    label=player_name(member)[:100], value=str(member.id),
+                    emoji="🏆" if member.id in winners else "💀",
+                )
+                for member in players[:25]
+            ],
+        )
+        select.callback = self.vote
+        self.add_item(select)
+
+    def text(self) -> str:
+        line = (
+            f"⭐ **Кто MVP катки {self.round_no}?** Голосуют только игравшие, за себя нельзя. "
+            f"Итоги <t:{self.ends}:R>."
+        )
+        return line + f"\n-# Проголосовало {len(self.votes)} из {len(self.players)}"
+
+    async def vote(self, interaction: discord.Interaction) -> None:
+        voter = interaction.user.id
+        if voter not in self.players:
+            await interaction.response.send_message("Голосуют только те, кто играл эту катку.", ephemeral=True)
+            return
+        candidate = int(interaction.data["values"][0])
+        if candidate == voter:
+            await interaction.response.send_message("За себя нельзя, хитрюшка 😼", ephemeral=True)
+            return
+        changed = voter in self.votes
+        self.votes[voter] = candidate
+        if len(self.votes) >= len(self.players):
+            await interaction.response.defer()
+            await self.finish()
+            return
+        await interaction.response.edit_message(content=self.text(), view=self)
+        await interaction.followup.send(
+            ("Голос изменён" if changed else "Голос принят") + f": {player_name(self.players[candidate])}.",
+            ephemeral=True,
+        )
+
+    async def on_timeout(self) -> None:
+        await self.finish()
+
+    async def finish(self) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        self.stop()
+        winners = mvp_winners(self.votes)
+        if not winners:
+            content = f"⭐ MVP катки {self.round_no}: никто не проголосовал."
+        elif not await self.stats.set_mvp(self.guild_id, self.game_id, winners):
+            content = f"⭐ Голосование за MVP катки {self.round_no} закрыто: результат катки отменили."
+        else:
+            names = ", ".join(f"**{player_name(self.players[u])}**" for u in winners if u in self.players)
+            count = sum(1 for c in self.votes.values() if c == winners[0])
+            content = f"⭐ MVP катки {self.round_no} — {names} ({count} из {len(self.votes)} голосов)!"
+        if self.message is not None:
+            try:
+                await self.message.edit(content=content, view=None)
+            except discord.HTTPException:
+                log.warning("Не удалось подвести итоги голосования за MVP")
 
 
 class ModeView(discord.ui.View):
@@ -1434,7 +1532,7 @@ class Lobby(commands.Cog):
             guild_id = players[0].guild.id
 
             def rating(member: discord.Member) -> float:
-                return stats_cog.stats.player(guild_id, member.id).rating if stats_cog else 0.5
+                return stats_cog.stats.player(guild_id, member.id).elo if stats_cog else 1000.0
 
             teams = modes.skill_teams(players, rating)
             lanes, lane_notes = self.assign_team_lanes(teams, mode["lanes"])
@@ -1444,8 +1542,8 @@ class Lobby(commands.Cog):
             else:
                 strength = [sum(rating(m) for m in team) / len(team) for team in teams if team]
                 notes.append(
-                    "Команды уравнены по статистике: средний рейтинг "
-                    + " против ".join(f"{value:.0%}" for value in strength) + "."
+                    "Команды уравнены по Elo: в среднем "
+                    + " против ".join(f"{value:.0f}" for value in strength) + "."
                 )
         else:
             teams = modes.random_teams(players)

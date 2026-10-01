@@ -1,15 +1,18 @@
-"""Статистика каток: /stats и /leaderboard. Результаты отмечаются кнопками в посте сбора."""
+"""Статистика каток: /stats, /leaderboard и итоги недели по субботам. Результаты отмечаются кнопками в посте сбора."""
 from __future__ import annotations
 
 import logging
+import time
+from datetime import datetime
 from pathlib import Path
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import config
-from stats import Stats, plural
+from stats import Stats, plural, week_highlights, week_lines
+from storage import JsonStore
 from utils import NEUTRAL, player_name, respond
 
 log = logging.getLogger("scrimbot.stats")
@@ -18,15 +21,117 @@ log = logging.getLogger("scrimbot.stats")
 LEADERBOARD_MIN_GAMES = 3
 LEADERBOARD_SIZE = 10
 MEDALS = ("🥇", "🥈", "🥉")
+RECAP_MIN_GAMES = 3
+
+
+def week_key(now: datetime) -> str:
+    year, week, _ = now.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def recap_due(now: datetime, posted: str | None) -> bool:
+    """Пора ли публиковать итоги: нужный день, не раньше нужного часа, на этой неделе ещё не публиковали."""
+    if config.RECAP_HOUR < 0:
+        return False
+    return now.weekday() == config.RECAP_WEEKDAY and now.hour >= config.RECAP_HOUR and posted != week_key(now)
+
+
+def recap_fields(highlights: dict, name) -> list[tuple[str, str]]:
+    """Номинации недели строками для embed; name(user_id) → имя."""
+    fields = []
+    if "most_games" in highlights:
+        user_id, line = highlights["most_games"]
+        fields.append(("🎮 Больше всех каток", f"**{name(user_id)}** — {line.games}"))
+    if "best_winrate" in highlights:
+        user_id, line = highlights["best_winrate"]
+        fields.append(("📈 Лучший винрейт", f"**{name(user_id)}** — {line.wins}/{line.games} ({line.wins / line.games:.0%})"))
+    if "streak" in highlights:
+        user_id, line = highlights["streak"]
+        fields.append(("🔥 Серия побед", f"**{name(user_id)}** — {line.best_streak} подряд"))
+    if "climber" in highlights:
+        user_id, line = highlights["climber"]
+        fields.append(("🚀 Больше всех поднял Elo", f"**{name(user_id)}** — +{line.elo:.0f}"))
+    if "mvp" in highlights:
+        user_id, line = highlights["mvp"]
+        fields.append(("⭐ Чаще всех MVP", f"**{name(user_id)}** — {line.mvp}"))
+    return fields
 
 
 class StatsCog(commands.Cog, name="Stats"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.stats = Stats(Path(config.DATA_DIR) / "stats.json")
+        self.recaps = JsonStore(Path(config.DATA_DIR) / "recap.json")
 
     async def cog_load(self) -> None:
         self.stats.load()
+        self.recaps.load()
+        self.recap_loop.start()
+
+    async def cog_unload(self) -> None:
+        self.recap_loop.cancel()
+
+    # --- итоги недели --------------------------------------------------------
+
+    def announce_channel(self, guild_id: int):
+        channel_id = config.ANNOUNCE_CHANNEL_ID or self.stats.last_channel(guild_id)
+        channel = self.bot.get_channel(channel_id) if channel_id else None
+        if channel is not None and getattr(channel, "guild", None) and channel.guild.id == guild_id:
+            return channel
+        return None
+
+    @tasks.loop(minutes=10)
+    async def recap_loop(self) -> None:
+        now = datetime.now(config.TIMEZONE)
+        for guild in self.bot.guilds:
+            posted = self.recaps.data.get(str(guild.id))
+            if not recap_due(now, posted):
+                continue
+            self.recaps.data[str(guild.id)] = week_key(now)
+            await self.recaps.save()
+            try:
+                await self.post_recap(guild)
+            except Exception:
+                log.exception("Не удалось опубликовать итоги недели на %s", guild)
+
+    @recap_loop.before_loop
+    async def _before_recap(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def post_recap(self, guild: discord.Guild) -> None:
+        games = self.stats.games_since(guild.id, time.time() - 7 * 86400)
+        if not games:
+            log.info("Итоги недели на %s: каток не было — молчу", guild)
+            return
+        channel = self.announce_channel(guild.id)
+        if channel is None:
+            log.info("Итоги недели на %s: некуда писать (задайте ANNOUNCE_CHANNEL_ID)", guild)
+            return
+
+        def name(user_id: int) -> str:
+            member = guild.get_member(user_id)
+            return player_name(member) if member else "кто-то ушедший"
+
+        highlights = week_highlights(week_lines(games), RECAP_MIN_GAMES)
+        fields = recap_fields(highlights, name)
+        count = f"{len(games)} {plural(len(games), 'катка', 'катки', 'каток')}"
+        embed = discord.Embed(title="🗓 Итоги недели на кастомках", color=NEUTRAL)
+        for title, value in fields:
+            embed.add_field(name=title, value=value, inline=False)
+        embed.set_footer(text=f"За неделю сыграно {count} · полная таблица — /leaderboard")
+
+        comment = None
+        chat = self.bot.get_cog("Chat")
+        if chat is not None and hasattr(chat, "oleg_line"):
+            facts = "\n".join(f"- {title}: {value.replace('**', '')}" for title, value in fields)
+            comment = await chat.oleg_line(
+                "Подведи итоги недели на кастомках сервера для всех в канале: за неделю " + count + ". "
+                "Номинации:\n" + facts + "\nПоздравь победителей номинаций по именам, подколи по-доброму, "
+                "позови на кастомки на выходных. 2–4 предложения, цифры не выдумывай — только эти."
+            )
+        embed.description = comment or f"Неделя пролетела: {count}. Вот кто отличился 👇"
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        log.info("Итоги недели опубликованы на %s (%s)", guild, count)
 
     @app_commands.command(name="stats", description="Статистика каток игрока на этом сервере")
     @app_commands.describe(player="Чья статистика (по умолчанию — ваша)")
@@ -41,6 +146,9 @@ class StatsCog(commands.Cog, name="Stats"):
             embed.add_field(name="Каток", value=str(record.games))
             embed.add_field(name="Победы", value=f"{record.wins} ({record.winrate:.0%})")
             embed.add_field(name="Поражения", value=str(record.losses))
+            embed.add_field(name="Elo", value=f"{record.elo:.0f}")
+            if record.mvp:
+                embed.add_field(name="MVP", value=f"⭐ ×{record.mvp}")
             place = self.place_of(interaction.guild.id, member.id)
             if place:
                 embed.set_footer(text=f"{place} место на сервере по рейтингу")
@@ -53,7 +161,7 @@ class StatsCog(commands.Cog, name="Stats"):
             for user_id, record in self.stats.all_players(guild_id).items()
             if record.games >= LEADERBOARD_MIN_GAMES
         ]
-        return sorted(players, key=lambda item: (-item[1].rating, -item[1].games))
+        return sorted(players, key=lambda item: (-item[1].elo, -item[1].games))
 
     def place_of(self, guild_id: int, user_id: int) -> int | None:
         for index, (other_id, _record) in enumerate(self.ranking(guild_id), start=1):
@@ -77,12 +185,15 @@ class StatsCog(commands.Cog, name="Stats"):
             member = interaction.guild.get_member(user_id)
             name = player_name(member) if member else f"<@{user_id}>"
             prefix = MEDALS[index - 1] if index <= len(MEDALS) else f"`{index}.`"
-            lines.append(f"{prefix} **{name}** — {record.wins}/{record.games} ({record.winrate:.0%})")
+            mvp = f" · ⭐{record.mvp}" if record.mvp else ""
+            lines.append(
+                f"{prefix} **{name}** — **{record.elo:.0f}** Elo · {record.wins}/{record.games} ({record.winrate:.0%}){mvp}"
+            )
         games = self.stats.games_count(interaction.guild.id)
         embed = discord.Embed(title="🏆 Таблица лидеров", description="\n".join(lines), color=NEUTRAL)
         embed.set_footer(
             text=f"Сыграно {games} {plural(games, 'катка', 'катки', 'каток')} · "
-            f"в таблице — от {LEADERBOARD_MIN_GAMES} каток · порядок по сглаженному винрейту"
+            f"в таблице — от {LEADERBOARD_MIN_GAMES} каток · порядок по Elo"
         )
         await interaction.response.send_message(embed=embed)
 
