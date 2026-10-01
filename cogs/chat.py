@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -112,8 +113,17 @@ MEMORY_SYSTEM = (
     'Если запомнить нечего, ответь {"fact": null}.'
 )
 
-# Если Олега звали, пока он думал над другим ответом, он ответит на последний зов, если тот не старше этого.
-PENDING_MAX_AGE = 120
+# Если Олега звали, пока он думал над другим ответом, он ответит на эти зовы по очереди, если они не старше этого.
+PENDING_MAX_AGE = 180
+PENDING_LIMIT = 5
+# «Олег» отдельным сообщением, а вопрос следом: ждём продолжение от того же человека столько секунд.
+FOLLOWUP_WAIT = 6
+# Сколько символов кроме имени должно быть, чтобы считать сообщение не просто зовом.
+BARE_CALL_MAX = 3
+# Подряд идущие сообщения человека за это время Олег читает как один вопрос.
+QUESTION_JOIN_WINDOW = timedelta(seconds=90)
+# Нейросети временно не ответили на прямой зов — ещё одна попытка через столько секунд.
+RETRY_AFTER_FAILURE = 12
 
 INVISIBLE = re.compile(r"[\u200b-\u200f\u2060-\u206f\ufeff]")
 # Корейские буквы и иероглифы: модели иногда вставляют «탑» вместо «топ» или 艸 в смайлик.
@@ -169,7 +179,9 @@ class ChannelState:
     last_tactic: str = ""
     burst_notice_at: float = 0.0
     busy: bool = False
-    pending: discord.Message | None = None
+    # Зовы, пришедшие, пока Олег думал: по одному (последнему) сообщению от человека, отвечает по очереди.
+    pending: deque = field(default_factory=lambda: deque(maxlen=PENDING_LIMIT))
+    answered: deque = field(default_factory=lambda: deque(maxlen=50))
     answers: deque = field(default_factory=lambda: deque(maxlen=BURST_LIMIT))
 
 
@@ -269,6 +281,12 @@ class Chat(commands.Cog):
         """Просьбу про роль часто пишут с опечаткой и тут же исправляют — исправленную тоже выполняем."""
         if after.author.bot or after.guild is None or before.content == after.content:
             return
+        # Исправили вопрос, пока он ждёт в очереди, — ответим на исправленный.
+        state = self.channels.get(after.channel.id)
+        if state is not None:
+            for index, queued in enumerate(state.pending):
+                if queued.id == after.id:
+                    state.pending[index] = after
         if (discord.utils.utcnow() - after.created_at).total_seconds() > EDIT_WINDOW:
             return
         if self.mode_for(after.channel) == MODE_OFF or not self.is_called(after):
@@ -348,6 +366,21 @@ class Chat(commands.Cog):
                 return True
         return False
 
+    async def unreact(self, message: discord.Message, emoji: str) -> None:
+        try:
+            await message.remove_reaction(emoji, self.bot.user)
+        except discord.HTTPException:
+            pass
+
+    async def reply_or_send(self, message: discord.Message, text: str) -> None:
+        """Ответ на сообщение; если его успели удалить — просто в канал, с именем спросившего."""
+        try:
+            await message.reply(text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        except discord.NotFound:
+            await message.channel.send(
+                f"{one_line(message.author.display_name)}, {text}", allowed_mentions=discord.AllowedMentions.none()
+            )
+
     @staticmethod
     async def react(message: discord.Message, emoji: str) -> None:
         try:
@@ -360,21 +393,42 @@ class Chat(commands.Cog):
     async def answer(self, message: discord.Message, *, called: bool, queued: bool = False) -> None:
         state = self.state(message.channel.id)
         if state.busy:
-            # Пока Олег думает, зовы не теряются: ответит на последний, когда освободится.
+            # Пока Олег думает, зовы не теряются: встают в очередь, по одному последнему от человека.
             if called:
-                state.pending = message
+                enqueue(state.pending, message)
+                log.info("Олег занят — зов от %s в #%s в очереди (%d)", message.author, message.channel, len(state.pending))
             return
-        await self.answer_once(message, called=called, queued=queued)
+        state.busy = True
+        try:
+            current: discord.Message | None = message
+            while current is not None:
+                if called and not queued:
+                    current = await self.wait_followup(current)
+                await self.answer_once(current, called=called, queued=queued)
+                state.answered.append(current.id)
+                current = next_pending(state)
+                called, queued = True, True
+        finally:
+            state.busy = False
 
-        pending, state.pending = state.pending, None
-        if pending is not None and pending.id != message.id:
-            age = (discord.utils.utcnow() - pending.created_at).total_seconds()
-            if age < PENDING_MAX_AGE:
-                await self.answer(pending, called=True, queued=True)
+    async def wait_followup(self, message: discord.Message) -> discord.Message:
+        """«Олег» отдельным сообщением — вопрос обычно идёт следом: ждём его пару секунд."""
+        if not is_bare_call(message.content):
+            return message
+
+        def same_author(other: discord.Message) -> bool:
+            return other.author.id == message.author.id and other.channel.id == message.channel.id
+
+        try:
+            return await self.bot.wait_for("message", check=same_author, timeout=FOLLOWUP_WAIT)
+        except asyncio.TimeoutError:
+            return message
 
     async def answer_once(self, message: discord.Message, *, called: bool, queued: bool) -> None:
+        """Один ответ. Очередь и флаг «думает» — в answer()."""
         state = self.state(message.channel.id)
         now = time.time()
+        help_mode = called and is_help_question(message.content)
         # Где писать нельзя, туда и не сочиняем — иначе лимит Groq уйдёт впустую.
         if not message.channel.permissions_for(message.guild.me).send_messages:
             if called:
@@ -384,7 +438,8 @@ class Chat(commands.Cog):
             if called:
                 await self.react(message, "😴")
             return
-        if len(state.answers) >= BURST_LIMIT and now - state.answers[0] < BURST_WINDOW:
+        # Настоящие вопросы лимит болтовни не останавливает — только трёп.
+        if not help_mode and len(state.answers) >= BURST_LIMIT and now - state.answers[0] < BURST_WINDOW:
             # Уже наговорился в этом канале — пусть люди пообщаются без него. Но молчит не беззвучно:
             # на первый зов в паузе объясняет, на остальные ставит реакцию.
             if called:
@@ -394,20 +449,22 @@ class Chat(commands.Cog):
                 else:
                     await self.react(message, "🤐")
             return
-        if called and not queued:
-            if now - self.user_last.get(message.author.id, 0) < USER_COOLDOWN or now - state.last_spoke < CHANNEL_COOLDOWN:
-                return
         if called:
-            self.user_last[message.author.id] = now
+            # Зов не выбрасываем из-за частоты: просто чуть подождём, чтобы не тараторить.
+            wait = max(
+                USER_COOLDOWN - (now - self.user_last.get(message.author.id, 0)),
+                CHANNEL_COOLDOWN - (now - state.last_spoke),
+            )
+            if wait > 0:
+                await asyncio.sleep(min(wait, USER_COOLDOWN))
+            self.user_last[message.author.id] = time.time()
 
-        state.busy = True
         try:
             # Каждый раз новый типаж, два одинаковых подряд не выпадают; подходящий к разговору — чаще.
             mood = pick_mood(message.content, state.last_mood)
             state.last_mood = mood[0]
             tactic = pick_tactic(message.content, state.last_tactic)
             state.last_tactic = tactic[0]
-            help_mode = called and is_help_question(message.content)
             prompt, openings = await self.build_prompt(
                 message, called=called, mood=mood, tactic=tactic, help_mode=help_mode,
             )
@@ -417,12 +474,25 @@ class Chat(commands.Cog):
                 return pick_variant(text, allow_skip=allow_skip, avoid_openings=openings)
 
             async with typing_if_possible(message.channel):
-                reply = await self.client.complete(
-                    persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
-                    validate=lambda text: choose(text) is not None,
-                    # Сам встрял — хватит модели попроще: умные Gemini с лимитом 20 в день — для тех, кто позвал.
-                    economy=not called,
-                )
+                try:
+                    reply = await self.client.complete(
+                        persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
+                        validate=lambda text: choose(text) is not None,
+                        # Сам встрял — хватит модели попроще: умные Gemini с лимитом 20 в день — для тех, кто позвал.
+                        economy=not called,
+                    )
+                except LLMUnavailable as error:
+                    # Сбой сети или VPN часто проходит за секунды: на прямой зов пробуем ещё раз, а не молчим.
+                    if not called or error.daily:
+                        raise
+                    log.info("Олегу не ответили (%s), пробую ещё раз через %d с", error, RETRY_AFTER_FAILURE)
+                    await self.react(message, "⏳")
+                    await asyncio.sleep(RETRY_AFTER_FAILURE)
+                    reply = await self.client.complete(
+                        persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
+                        validate=lambda text: choose(text) is not None,
+                    )
+                    await self.unreact(message, "⏳")
             # Модель поняла просьбу, которую пропустил код: выполняет бот, со своими проверками прав.
             action = llm_actions.parse(parse_json(reply.text)) if called else None
             if action is not None and await self.run_action(message, action):
@@ -439,7 +509,7 @@ class Chat(commands.Cog):
                     log.info("Олег решил не встревать в #%s", message.channel)
                 return
             if called:
-                await message.reply(text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+                await self.reply_or_send(message, text)
             else:
                 await message.channel.send(text, allowed_mentions=discord.AllowedMentions.none())
             state.last_spoke = time.time()
@@ -462,11 +532,11 @@ class Chat(commands.Cog):
                     await self.react(message, "😴")
             elif called:
                 await self.react(message, "⏳")
+                await self.react(message, "😵")
             log.warning("Олег не смог ответить: %s", error)
         except discord.HTTPException:
             log.exception("Не удалось отправить ответ Олега")
         finally:
-            state.busy = False
             if now >= self.sleep_until:
                 self.sleep_announced = False
 
@@ -476,7 +546,8 @@ class Chat(commands.Cog):
         help_mode: bool = False,
     ) -> tuple[str, set[str]]:
         """Запрос к модели по секциям и начала последних реплик Олега, которые не стоит повторять."""
-        lines, speakers = await self.collect_history(message)
+        history = await self.fetch_history(message)
+        lines, speakers = await self.collect_history(message, history)
         facts = [f"Сейчас {now_msk()}."]
         people = []
         for member in speakers.values():
@@ -550,20 +621,33 @@ class Chat(commands.Cog):
             section("context", "\n\n".join(facts)),
             section("memory", "\n".join(memories)) if memories else "",
             section("chat", f"Канал #{message.channel}\n" + "\n".join(lines)),
+            section("question", "\n".join(question_lines(message, history, self.bot.user))) if called else "",
             section("task", "\n".join(task_parts)),
         ]
         return "\n\n".join(part for part in sections if part), openings
 
-    async def collect_history(self, message: discord.Message) -> tuple[list[str], dict[int, discord.Member]]:
-        """Последние сообщения канала строками «ник: текст» и кто в них участвует."""
-        channel = message.channel
-        me = self.bot.user
-        oldest = discord.utils.utcnow() - HISTORY_MAX_AGE
+    async def fetch_history(self, message: discord.Message) -> list[discord.Message]:
+        """Последние сообщения канала до вопроса включительно, сверху старые.
 
-        history = [msg async for msg in channel.history(limit=HISTORY_LIMIT, after=oldest, oldest_first=False)]
-        if message.id not in {msg.id for msg in history}:
-            history.insert(0, message)
+        Если Олег отвечает из очереди, сообщения после вопроса не берём: иначе модель отвечает на чужую реплику.
+        """
+        oldest = discord.utils.utcnow() - HISTORY_MAX_AGE
+        history = [
+            msg async for msg in message.channel.history(
+                limit=HISTORY_LIMIT, after=oldest, before=message, oldest_first=False,
+            )
+        ]
+        history.insert(0, message)
         history.reverse()
+        return history
+
+    async def collect_history(
+        self, message: discord.Message, history: list[discord.Message] | None = None,
+    ) -> tuple[list[str], dict[int, discord.Member]]:
+        """Последние сообщения канала строками «ник: текст» и кто в них участвует."""
+        me = self.bot.user
+        if history is None:
+            history = await self.fetch_history(message)
 
         lines: list[str] = []
         speakers: dict[int, discord.Member] = {}
@@ -1210,9 +1294,79 @@ def pick_variant(text: str, *, allow_skip: bool = False, avoid_openings: set[str
         fresh = [candidate for candidate in clean if opening(candidate) not in avoid_openings]
         return (fresh or clean or [None])[0]
     if "{" in text:
-        return None
+        # Обрезанный или кривой JSON: достаём уже дописанные варианты, чтобы не терять ответ целиком.
+        salvaged = [v for v in salvage_variants(text) if acceptable_reply(v)]
+        fresh = [v for v in salvaged if opening(v) not in avoid_openings]
+        return (fresh or salvaged or [None])[0]
     text = text.strip()
     return text if text and acceptable_reply(text) else None
+
+
+def salvage_variants(text: str) -> list[str]:
+    """Законченные строки из массива "variants" в сломанном JSON."""
+    match = re.search(r'"variants"\s*:\s*\[(.*)', text, re.DOTALL)
+    if not match:
+        return []
+    variants, rest = [], match.group(1)
+    item = re.compile(r'\s*,?\s*"((?:[^"\\]|\\.)*)"')
+    while (found := item.match(rest)) is not None:
+        rest = rest[found.end():]
+        raw = found.group(1)
+        try:
+            value = json.loads(f'"{raw}"').strip()
+        except ValueError:
+            continue
+        if len(value) >= 2:
+            variants.append(value)
+    return variants
+
+
+def enqueue(pending: deque, message: discord.Message) -> None:
+    """В очередь зовов: от одного человека — только последнее сообщение (оно же продолжение вопроса)."""
+    for queued in list(pending):
+        if queued.author.id == message.author.id or queued.id == message.id:
+            pending.remove(queued)
+    pending.append(message)
+
+
+def next_pending(state: "ChannelState") -> discord.Message | None:
+    """Следующий зов из очереди: без уже отвеченных и слишком старых."""
+    while state.pending:
+        message = state.pending.popleft()
+        if message.id in state.answered:
+            continue
+        if (discord.utils.utcnow() - message.created_at).total_seconds() > PENDING_MAX_AGE:
+            log.info("Зов от %s в #%s устарел в очереди", message.author, message.channel)
+            continue
+        return message
+    return None
+
+
+def is_bare_call(text: str) -> bool:
+    """Просто «Олег» / «олежа, ...» без вопроса: суть, скорее всего, будет следующим сообщением."""
+    rest = re.sub(r"<@!?\d+>", " ", NAME.sub(" ", text or ""))
+    rest = re.sub(r"[\W_]+", "", rest)
+    return len(rest) <= BARE_CALL_MAX and "?" not in (text or "")
+
+
+def question_lines(message: discord.Message, history: list[discord.Message], me) -> list[str]:
+    """Что именно спросили: сообщение и идущие подряд перед ним реплики того же человека, плюс цитата,
+    если это ответ на чужое сообщение. history — сверху старые."""
+    parts = [message]
+    before = [m for m in history if m.created_at < message.created_at]
+    for previous in reversed(before):
+        if previous.author.id != message.author.id or len(parts) >= 3:
+            break
+        if parts[0].created_at - previous.created_at > QUESTION_JOIN_WINDOW:
+            break
+        parts.insert(0, previous)
+    lines = [f"{one_line(message.author.display_name)}: {describe(part)}" for part in parts]
+    reference = message.reference
+    quoted = getattr(reference, "resolved", None) if reference else None
+    if getattr(quoted, "author", None) is not None:
+        who = OWN_NAME if quoted.author.id == me.id else one_line(quoted.author.display_name)
+        lines.insert(0, f"(в ответ на сообщение {who}: «{describe(quoted)}»)")
+    return lines
 
 
 def is_help_question(text: str) -> bool:
