@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
-from stats import Stats, plural, week_highlights, week_lines
+from stats import Stats, main_rivalry, plural, rivals, week_highlights, week_lines
 from storage import JsonStore
 from utils import NEUTRAL, player_name, respond
 
@@ -22,6 +22,20 @@ LEADERBOARD_MIN_GAMES = 3
 LEADERBOARD_SIZE = 10
 MEDALS = ("🥇", "🥈", "🥉")
 RECAP_MIN_GAMES = 3
+RECENT_GAMES = 5
+WEEK = 7 * 86400
+
+
+def recent_line(won: bool, delta: float, at: float) -> str:
+    sign = "+" if delta >= 0 else "−"
+    return f"{'🟢' if won else '🔴'} `{sign}{abs(delta):.0f}` · <t:{int(at)}:R>"
+
+
+def rival_line(rival, name, nemesis: bool) -> str:
+    score = f"{rival.wins}:{rival.losses}"
+    if nemesis:
+        return f"😈 Неудобный соперник: **{name(rival.user_id)}** — проиграл ему {rival.losses} из {rival.games} ({score})"
+    return f"🎯 Любимая жертва: **{name(rival.user_id)}** — обыграл его {rival.wins} из {rival.games} ({score})"
 
 
 def week_key(now: datetime) -> str:
@@ -114,6 +128,10 @@ class StatsCog(commands.Cog, name="Stats"):
 
         highlights = week_highlights(week_lines(games), RECAP_MIN_GAMES)
         fields = recap_fields(highlights, name)
+        rivalry = main_rivalry(games)
+        if rivalry:
+            a, b, wins_a, wins_b = rivalry
+            fields.append(("⚔️ Главное противостояние", f"**{name(a)}** {wins_a}:{wins_b} **{name(b)}**"))
         count = f"{len(games)} {plural(len(games), 'катка', 'катки', 'каток')}"
         embed = discord.Embed(title="🗓 Итоги недели на кастомках", color=NEUTRAL)
         for title, value in fields:
@@ -149,11 +167,37 @@ class StatsCog(commands.Cog, name="Stats"):
             embed.add_field(name="Elo", value=f"{record.elo:.0f}")
             if record.mvp:
                 embed.add_field(name="MVP", value=f"⭐ ×{record.mvp}")
+            recent = self.stats.recent_games(interaction.guild.id, member.id, RECENT_GAMES)
+            if recent:
+                embed.add_field(
+                    name="Последние катки (изменение Elo)",
+                    value="\n".join(recent_line(won, delta, game.get("at", 0)) for game, won, delta in recent),
+                    inline=False,
+                )
+            rival_text = self.rivals_text(interaction.guild, member.id)
+            if rival_text:
+                embed.add_field(name=rival_text[0], value=rival_text[1], inline=False)
             place = self.place_of(interaction.guild.id, member.id)
             if place:
                 embed.set_footer(text=f"{place} место на сервере по рейтингу")
         embed.set_thumbnail(url=member.display_avatar.url)
         await interaction.response.send_message(embed=embed)
+
+    def rivals_text(self, guild: discord.Guild, user_id: int) -> tuple[str, str] | None:
+        """Соперники за неделю; если за неделю мало каток — за всё время."""
+        def name(other: int) -> str:
+            member = guild.get_member(other)
+            return player_name(member) if member else "кто-то ушедший"
+
+        for title, games in (
+            ("Соперники недели", self.stats.games_since(guild.id, time.time() - WEEK)),
+            ("Соперники за всё время", self.stats.games_since(guild.id, 0)),
+        ):
+            nemesis, victim = rivals(games, user_id)
+            lines = [rival_line(r, name, r is nemesis) for r in (nemesis, victim) if r is not None]
+            if lines:
+                return title, "\n".join(lines)
+        return None
 
     def ranking(self, guild_id: int) -> list[tuple[int, object]]:
         players = [

@@ -109,3 +109,41 @@ def test_render_sizes_follow_picks():
     one = Image.open(io.BytesIO(portraits.render([[[_png("red")]] * 5, [[None]] * 5])))
     assert three.width > one.width
     assert three.height == one.height
+
+
+def test_recent_games_and_rivals(tmp_path):
+    from stats import main_rivalry, rivals
+
+    stats = Stats(tmp_path / "stats.json")
+    stats.load()
+
+    async def scenario():
+        await stats.record_game(1, [10], [20])
+        await stats.record_game(1, [20], [10])
+        await stats.record_game(1, [20], [10])
+        await stats.record_game(1, [10], [30])
+        await stats.record_game(1, [10], [30])
+
+    asyncio.run(scenario())
+    recent = stats.recent_games(1, 10, limit=3)
+    assert [won for _game, won, _delta in recent] == [True, True, False]
+    assert recent[0][2] > 0 and recent[2][2] < 0
+
+    games = stats.games_since(1, 0)
+    nemesis, victim = rivals(games, 10)
+    assert (nemesis.user_id, nemesis.wins, nemesis.losses) == (20, 1, 2)
+    assert (victim.user_id, victim.wins, victim.losses) == (30, 2, 0)
+    assert rivals(games, 10, min_games=5) == (None, None)
+    assert main_rivalry(games) == (10, 20, 1, 2)
+    assert main_rivalry(games[:2]) is None
+
+
+def test_stats_lines():
+    from cogs.stats import recent_line, rival_line
+    from stats import Rival
+
+    assert recent_line(True, 18.4, 100) == "🟢 `+18` · <t:100:R>"
+    assert recent_line(False, -12.0, 100) == "🔴 `−12` · <t:100:R>"
+    name = lambda user_id: f"P{user_id}"
+    assert "проиграл ему 2 из 3 (1:2)" in rival_line(Rival(5, 1, 2), name, True)
+    assert "обыграл его 3 из 3 (3:0)" in rival_line(Rival(5, 3, 0), name, False)

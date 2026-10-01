@@ -204,6 +204,17 @@ class Stats:
         return [int(key) for key in self.store.data if key.isdigit()]
 
 
+    def recent_games(self, guild_id: int, user_id: int, limit: int = 5) -> list[tuple[dict, bool, float]]:
+        """Последние катки игрока, новые сверху: (катка, победил ли, изменение Elo)."""
+        result = []
+        for game in reversed(self._guild(guild_id)["games"]):
+            if user_id in game["winners"] or user_id in game["losers"]:
+                delta = (game.get("elo") or {}).get(str(user_id), 0.0)
+                result.append((game, user_id in game["winners"], delta))
+                if len(result) >= limit:
+                    break
+        return result
+
     def last_channel(self, guild_id: int) -> int | None:
         return self._guild(guild_id).get("last_channel")
 
@@ -257,3 +268,60 @@ def week_highlights(lines: dict[int, WeekLine], min_games: int = 3) -> dict[str,
     if mvp[1].mvp:
         result["mvp"] = mvp
     return result
+
+
+@dataclass(frozen=True)
+class Rival:
+    user_id: int
+    wins: int
+    losses: int
+
+    @property
+    def games(self) -> int:
+        return self.wins + self.losses
+
+
+def head_to_head(games: list[dict], user_id: int) -> dict[int, Rival]:
+    """Счёт игрока против каждого, с кем он играл в разных командах."""
+    wins: dict[int, int] = {}
+    losses: dict[int, int] = {}
+    for game in games:
+        if user_id in game["winners"]:
+            for other in game["losers"]:
+                wins[other] = wins.get(other, 0) + 1
+        elif user_id in game["losers"]:
+            for other in game["winners"]:
+                losses[other] = losses.get(other, 0) + 1
+    return {
+        other: Rival(other, wins.get(other, 0), losses.get(other, 0))
+        for other in set(wins) | set(losses)
+    }
+
+
+def rivals(games: list[dict], user_id: int, min_games: int = 2) -> tuple[Rival | None, Rival | None]:
+    """(неудобный соперник — чаще всего обыгрывает игрока, любимая жертва — чаще всего ему проигрывает)."""
+    table = [r for r in head_to_head(games, user_id).values() if r.games >= min_games]
+    nemesis = max(
+        (r for r in table if r.losses > r.wins), key=lambda r: (r.losses - r.wins, r.losses), default=None,
+    )
+    victim = max(
+        (r for r in table if r.wins > r.losses), key=lambda r: (r.wins - r.losses, r.wins), default=None,
+    )
+    return nemesis, victim
+
+
+def main_rivalry(games: list[dict], min_games: int = 3) -> tuple[int, int, int, int] | None:
+    """Главное противостояние: пара, чаще всех игравшая друг против друга. (a, b, побед a, побед b)."""
+    pairs: dict[tuple[int, int], list[int]] = {}
+    for game in games:
+        for winner in game["winners"]:
+            for loser in game["losers"]:
+                a, b = sorted((winner, loser))
+                score = pairs.setdefault((a, b), [0, 0])
+                score[0 if winner == a else 1] += 1
+    if not pairs:
+        return None
+    (a, b), (wins_a, wins_b) = max(pairs.items(), key=lambda item: (sum(item[1]), -abs(item[1][0] - item[1][1])))
+    if wins_a + wins_b < min_games:
+        return None
+    return a, b, wins_a, wins_b

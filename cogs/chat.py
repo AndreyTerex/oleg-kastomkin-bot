@@ -976,6 +976,11 @@ class Chat(commands.Cog):
         for member in members[:3]:
             record = stats_cog.stats.player(message.guild.id, member.id)
             note = " — мало, в таблицу лидеров пока не попадает" if 0 < record.games < STATS_MIN_GAMES else ""
+            rivals = stats_cog.rivals_text(message.guild, member.id) if hasattr(stats_cog, "rivals_text") else None
+            if rivals:
+                note += "; " + rivals[0].lower() + ": " + "; ".join(
+                    re.sub(r"^\W+\s*", "", line).replace("**", "") for line in rivals[1].splitlines()
+                )
             lines.append(f"- {one_line(member.display_name)}: {record.describe()}{note}")
         return (
             "Статистика тех, о ком спрашивают (отвечай про человека по его строке, "
