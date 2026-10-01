@@ -606,6 +606,7 @@ class Chat(commands.Cog):
         task_parts = [task]
         if openings:
             task_parts.append(persona.AVOID_OPENINGS.format(openings=", ".join(f"«{o}…»" for o in sorted(openings))))
+        task_parts.append(fun_line(own))
         task_parts.append(persona.VARIANTS)
         if called:
             task_parts.append(persona.ACTIONS)
@@ -1043,6 +1044,7 @@ class Chat(commands.Cog):
                 name=mood[0], description=mood[1], tactic=tactic[0], tactic_description=tactic[1],
             ),
             task,
+            fun_line(),
             persona.VARIANTS,
         ])
         try:
@@ -1355,6 +1357,14 @@ def next_pending(state: "ChannelState") -> discord.Message | None:
             continue
         return message
     return None
+
+
+def fun_line(recent: list[str] | None = None) -> str:
+    """Подсказка с горсткой случайных забавных словечек — без тех, что Олежка недавно говорила."""
+    said = " ".join(recent or []).casefold()
+    fresh = [phrase for phrase in persona.FUN_PHRASES if phrase.casefold() not in said]
+    sample = random.sample(fresh, min(persona.FUN_SAMPLE, len(fresh)))
+    return persona.FUN_LINE.format(phrases=", ".join(f"«{phrase}»" for phrase in sample))
 
 
 def is_bare_call(text: str) -> bool:

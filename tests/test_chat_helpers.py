@@ -292,3 +292,13 @@ def test_named_members_find_people_by_declined_or_pet_names():
     assert named_members("а у лешеньки?", people) == [havoc]
     assert named_members("Олег, какой винрейт у кабана", people) == [kaban]
     assert named_members("Олег, кто лучший на топе", people) == []
+
+
+def test_fun_line_samples_fresh_phrases():
+    assert "кружочек-пирожочек" in persona.FUN_PHRASES and "туттачки" in persona.FUN_PHRASES
+    assert len(set(persona.FUN_PHRASES)) == len(persona.FUN_PHRASES)
+    line = chat.fun_line(["ладушки, побежали"])
+    assert line.count("«") == persona.FUN_SAMPLE
+    assert "«ладушки»" not in line
+    # Подсказка не одна и та же каждый раз.
+    assert len({chat.fun_line() for _ in range(10)}) > 1
