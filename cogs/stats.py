@@ -19,7 +19,8 @@ log = logging.getLogger("scrimbot.stats")
 
 # В таблицу лидеров попадают только те, кто сыграл хотя бы столько каток — иначе 1/1 = 100% всех обгонит.
 LEADERBOARD_MIN_GAMES = 3
-LEADERBOARD_SIZE = 10
+# Сколько мест показывать: все, кто набрал минимум каток, но не больше этого (ограничение Discord на длину).
+LEADERBOARD_SIZE = 40
 MEDALS = ("🥇", "🥈", "🥉")
 RECAP_MIN_GAMES = 3
 RECENT_GAMES = 5
@@ -207,17 +208,27 @@ class StatsCog(commands.Cog, name="Stats"):
         ]
         return sorted(players, key=lambda item: (-item[1].elo, -item[1].games))
 
+    def newcomers(self, guild_id: int) -> list[tuple[int, object]]:
+        """Кто уже играл, но меньше LEADERBOARD_MIN_GAMES каток: больше каток — выше."""
+        players = [
+            (user_id, record)
+            for user_id, record in self.stats.all_players(guild_id).items()
+            if 0 < record.games < LEADERBOARD_MIN_GAMES
+        ]
+        return sorted(players, key=lambda item: (-item[1].games, -item[1].elo))
+
     def place_of(self, guild_id: int, user_id: int) -> int | None:
         for index, (other_id, _record) in enumerate(self.ranking(guild_id), start=1):
             if other_id == user_id:
                 return index
         return None
 
-    @app_commands.command(name="leaderboard", description="Лучшие игроки сервера по статистике каток")
+    @app_commands.command(name="leaderboard", description="Таблица лидеров: все игроки по Elo, и кто сыграл меньше 3 каток")
     @app_commands.guild_only()
     async def leaderboard(self, interaction: discord.Interaction) -> None:
         ranking = self.ranking(interaction.guild.id)
-        if not ranking:
+        newcomers = self.newcomers(interaction.guild.id)
+        if not ranking and not newcomers:
             await respond(
                 interaction,
                 f"Таблица пуста: нужны игроки хотя бы с {LEADERBOARD_MIN_GAMES} "
@@ -233,8 +244,21 @@ class StatsCog(commands.Cog, name="Stats"):
             lines.append(
                 f"{prefix} **{name}** — **{record.elo:.0f}** Elo · {record.wins}/{record.games} ({record.winrate:.0%}){mvp}"
             )
+        if len(ranking) > LEADERBOARD_SIZE:
+            lines.append(f"…и ещё {len(ranking) - LEADERBOARD_SIZE} — их место видно в `/stats`")
+        if not lines:
+            lines.append(f"В таблице пока никого: нужно от {LEADERBOARD_MIN_GAMES} каток.")
         games = self.stats.games_count(interaction.guild.id)
-        embed = discord.Embed(title="🏆 Таблица лидеров", description="\n".join(lines), color=NEUTRAL)
+        embed = discord.Embed(title="🏆 Таблица лидеров", description="\n".join(lines)[:4000], color=NEUTRAL)
+        if newcomers:
+            names = []
+            for user_id, record in newcomers:
+                member = interaction.guild.get_member(user_id)
+                names.append(f"{player_name(member) if member else f'<@{user_id}>'} ({record.wins}/{record.games})")
+            embed.add_field(
+                name=f"Ещё играли — меньше {LEADERBOARD_MIN_GAMES} каток",
+                value=", ".join(names)[:1024], inline=False,
+            )
         embed.set_footer(
             text=f"Сыграно {games} {plural(games, 'катка', 'катки', 'каток')} · "
             f"в таблице — от {LEADERBOARD_MIN_GAMES} каток · порядок по Elo"

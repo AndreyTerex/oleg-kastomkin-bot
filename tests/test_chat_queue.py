@@ -115,3 +115,29 @@ def test_reply_falls_back_when_message_deleted():
     asyncio.run(cog.reply_or_send(message, "привет"))
     assert sent == ["P10, привет"]
     assert chat_module.RETRY_AFTER_FAILURE > 0
+
+
+def test_stats_topic_catches_table_questions():
+    from cogs.chat import STATS_TOPIC
+
+    assert STATS_TOPIC.search("дай инфу по остальным трем отдельной табличкой")
+    assert STATS_TOPIC.search("какое у меня место?")
+    assert STATS_TOPIC.search("сколько у меня эло")
+    assert not STATS_TOPIC.search("пойдём вместе на мид")
+
+
+def test_leaderboard_summary_lists_everyone_including_newcomers():
+    from stats import Record
+
+    people = {i: NS(display_name=f"P{i}") for i in range(1, 15)}
+    ranking = [(i, Record(3, 1, 1000 + i)) for i in range(1, 13)]
+    newcomers = [(13, Record(1, 1)), (14, Record(0, 1))]
+    stats_cog = NS(
+        ranking=lambda guild_id: ranking, newcomers=lambda guild_id: newcomers,
+        stats=NS(games_count=lambda guild_id: 20),
+    )
+    cog = Chat.__new__(Chat)
+    cog.bot = NS(get_cog=lambda name: stats_cog)
+    text = cog.leaderboard_summary(NS(id=1, get_member=lambda i: people.get(i)))
+    assert "12. P12" in text
+    assert "меньше 3 каток" in text and "P13" in text and "P14" in text

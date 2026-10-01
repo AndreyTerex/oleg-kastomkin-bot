@@ -147,3 +147,20 @@ def test_stats_lines():
     name = lambda user_id: f"P{user_id}"
     assert "проиграл ему 2 из 3 (1:2)" in rival_line(Rival(5, 1, 2), name, True)
     assert "обыграл его 3 из 3 (3:0)" in rival_line(Rival(5, 3, 0), name, False)
+
+
+def test_leaderboard_ranking_and_newcomers(tmp_path):
+    from cogs.stats import StatsCog
+
+    cog = StatsCog.__new__(StatsCog)
+    cog.stats = Stats(tmp_path / "stats.json")
+    cog.stats.load()
+
+    async def scenario():
+        for _ in range(3):
+            await cog.stats.record_game(1, [10], [20])
+        await cog.stats.record_game(1, [30], [40])
+
+    asyncio.run(scenario())
+    assert [user_id for user_id, _ in cog.ranking(1)] == [10, 20]
+    assert [user_id for user_id, _ in cog.newcomers(1)] == [30, 40]

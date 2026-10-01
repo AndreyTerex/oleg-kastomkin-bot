@@ -73,7 +73,12 @@ HELP_QUESTION = re.compile(
     r"можно ли|посоветуй|подскажи|объясни|расскажи|помоги|напомни|покажи|what|how)(?!\w)",
     re.IGNORECASE,
 )
-STATS_TOPIC = re.compile(r"стат|винрейт|лучш|топ|лидер|побед|рейтинг|сильн|слаб", re.IGNORECASE)
+# Так пост /leaderboard выглядит в истории чата для модели (см. describe).
+LEADERBOARD_POST = "Таблица лидеров"
+STATS_TOPIC = re.compile(
+    r"стат|винрейт|лучш|топ|лидер|побед|рейтинг|сильн|слаб|таблиц|табличк|elo|эло|(?<!в)мест[оаеу]|mvp|мвп",
+    re.IGNORECASE,
+)
 # Вопрос про то, кто на какой линии, а не про игру на линии («как стоять на миде»).
 LANES_TOPIC = re.compile(
     r"кто\b.{0,25}(топ|лес|джанг|мид|адк|стрел|сапп?орт|сапп?\b|лини)|какие (линии|роли)|отметил", re.IGNORECASE
@@ -567,10 +572,12 @@ class Chat(commands.Cog):
             lobby = self.lobby_summary(message.guild)
             if lobby:
                 facts.append(lobby)
+        # Про статистику спрашивают и без слова «статистика»: «где ещё трое?» под постом таблицы лидеров.
+        about_stats = bool(STATS_TOPIC.search(message.content)) or LEADERBOARD_POST in recent_text
         if help_mode:
             # На вопросы — знания о боте и сервере, чтобы отвечать фактами, а не догадками.
             facts.append(self.commands_summary(message.guild))
-            if STATS_TOPIC.search(message.content):
+            if about_stats:
                 facts.append(self.leaderboard_summary(message.guild))
         if STATS_TOPIC.search(message.content):
             asked = self.asked_stats(message)
@@ -947,13 +954,23 @@ class Chat(commands.Cog):
             return "Статистика каток сейчас недоступна."
         ranking = stats_cog.ranking(guild.id)
         games = stats_cog.stats.games_count(guild.id)
-        if not ranking:
+        if not ranking and not (hasattr(stats_cog, "newcomers") and stats_cog.newcomers(guild.id)):
             return f"Статистика каток: отмечено каток — {games}, для таблицы лидеров пока мало данных (нужно от 3 каток на игрока)."
         lines = []
-        for place, (user_id, record) in enumerate(ranking[:15], start=1):
+        for place, (user_id, record) in enumerate(ranking[:40], start=1):
             member = guild.get_member(user_id)
             lines.append(f"{place}. {one_line(member.display_name) if member else user_id} — {record.describe()}")
-        return f"Таблица лидеров кастомок (всего отмечено каток: {games}):\n" + "\n".join(lines)
+        text = (
+            f"Таблица лидеров кастомок, все места (всего отмечено каток: {games}; "
+            f"/leaderboard показывает всех, кто сыграл от 3 каток):\n" + "\n".join(lines)
+        )
+        newcomers = stats_cog.newcomers(guild.id) if hasattr(stats_cog, "newcomers") else []
+        if newcomers:
+            text += "\nЕщё играли, но меньше 3 каток (в таблицу пока не попадают):\n" + "\n".join(
+                f"- {one_line(m.display_name) if (m := guild.get_member(user_id)) else user_id} — {record.describe()}"
+                for user_id, record in newcomers
+            )
+        return text
 
     def asked_stats(self, message: discord.Message) -> str | None:
         """Личная статистика тех, о ком спрашивают (тегнули или назвали по имени), — даже если каток мало."""
