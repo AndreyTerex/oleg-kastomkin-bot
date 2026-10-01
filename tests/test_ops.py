@@ -80,3 +80,35 @@ async def _counter(tmp_path):
     await client.count_request("gemini:m")
     assert client.requests_today("gemini:m") == 1
     assert store.data["day"] == usage_day()
+
+
+def test_recap_schedule(monkeypatch):
+    from datetime import datetime
+
+    import config
+    from cogs.stats import recap_due, recap_fields, week_key
+
+    monkeypatch.setattr(config, "RECAP_WEEKDAY", 5)
+    monkeypatch.setattr(config, "RECAP_HOUR", 11)
+    saturday = datetime(2026, 10, 3, 11, 5)
+    assert recap_due(saturday, None)
+    assert not recap_due(saturday, week_key(saturday))
+    assert not recap_due(datetime(2026, 10, 3, 9), None)
+    assert not recap_due(datetime(2026, 10, 2, 12), None)
+    monkeypatch.setattr(config, "RECAP_HOUR", -1)
+    assert not recap_due(saturday, None)
+
+    from stats import week_highlights, week_lines
+
+    top = week_highlights(week_lines([{"id": 1, "winners": [1], "losers": [2], "elo": {"1": 20, "2": -20}}]))
+    fields = recap_fields(top, lambda user_id: f"P{user_id}")
+    assert ("🎮 Больше всех каток", "**P1** — 1") in fields
+    assert any("+20" in value for _title, value in fields)
+
+
+def test_mvp_winners_ties():
+    from cogs.lobby import mvp_winners
+
+    assert mvp_winners({}) == []
+    assert mvp_winners({1: 5, 2: 5, 3: 6}) == [5]
+    assert mvp_winners({1: 5, 2: 6}) == [5, 6]

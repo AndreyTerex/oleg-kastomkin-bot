@@ -933,6 +933,29 @@ class Chat(commands.Cog):
         stats_cog = self.bot.get_cog("Stats")
         return stats_cog.stats.player(guild_id, user_id) if stats_cog is not None else None
 
+    async def oleg_line(self, task: str, *, economy: bool = False, limit: int = ROAST_LIMIT) -> str | None:
+        """Одна реплика Олега по заданию кода (итоги недели, приглашение на кастомку). None — нейросети молчат."""
+        if not self.client.enabled:
+            return None
+        mood, tactic = pick_mood(task, ""), pick_tactic(task, "")
+        prompt = "\n\n".join([
+            f"Сейчас {now_msk()}.",
+            persona.MOOD_LINE.format(
+                name=mood[0], description=mood[1], tactic=tactic[0], tactic_description=tactic[1],
+            ),
+            task,
+            persona.VARIANTS,
+        ])
+        try:
+            reply = await self.client.complete(
+                persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
+                validate=lambda text: pick_variant(text) is not None, economy=economy,
+            )
+        except LLMUnavailable:
+            return None
+        text = clean_reply(pick_variant(reply.text) or "", soft_limit=ROAST_SOFT_LIMIT, hard_limit=limit)
+        return text or None
+
     # --- прожарка ----------------------------------------------------------
 
     async def build_roast_prompt(self, interaction: discord.Interaction, target: discord.Member) -> str:
