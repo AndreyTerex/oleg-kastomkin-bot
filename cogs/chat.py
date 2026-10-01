@@ -176,7 +176,8 @@ class ChannelState:
 class Chat(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.client = LLMClient(build_providers())
+        self.usage = JsonStore(Path(config.DATA_DIR) / "llm_usage.json")
+        self.client = LLMClient(build_providers(), self.usage)
         self.store = JsonStore(Path(config.DATA_DIR) / "oleg.json")
         self.memory = Memory(Path(config.DATA_DIR) / "memory.json")
         self.channels: dict[int, ChannelState] = {}
@@ -187,6 +188,7 @@ class Chat(commands.Cog):
 
     async def cog_load(self) -> None:
         self.store.load()
+        self.usage.load()
         self.memory.load()
         if self.client.enabled:
             log.info("Олег болтает через: %s", ", ".join(p.label for p in self.client.providers))

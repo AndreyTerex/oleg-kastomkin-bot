@@ -261,12 +261,69 @@ def _rate_limit_wait(message: str, headers, daily: bool) -> float:
     return 3600.0 if daily else 60.0
 
 
+def usage_day(now: float | None = None) -> str:
+    """Сутки для подсчёта запросов — как у Google: от полуночи по тихоокеанскому времени."""
+    return datetime.fromtimestamp(time.time() if now is None else now, timezone.utc).astimezone(
+        _pacific()
+    ).strftime("%Y-%m-%d")
+
+
+def _pacific():
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo("America/Los_Angeles")
+    except Exception:
+        return timezone(timedelta(hours=-8))
+
+
 class LLMClient:
-    def __init__(self, providers: list[Provider]) -> None:
+    def __init__(self, providers: list[Provider], usage_store=None) -> None:
         self.providers = providers
         self._session: aiohttp.ClientSession | None = None
         self._blocked_until: dict[str, float] = {}
         self._blocked_daily: dict[str, bool] = {}
+        # Сколько запросов к каждой модели за сегодня — для /oleg-status (JsonStore, переживает перезапуски).
+        self.usage_store = usage_store
+
+    async def count_request(self, label: str) -> None:
+        if self.usage_store is None:
+            return
+        data = self.usage_store.data
+        day = usage_day()
+        if data.get("day") != day:
+            data.clear()
+            data["day"] = day
+        counts = data.setdefault("counts", {})
+        counts[label] = counts.get(label, 0) + 1
+        try:
+            await self.usage_store.save()
+        except OSError:
+            log.warning("Не удалось сохранить счётчик запросов к нейросетям")
+
+    def requests_today(self, label: str) -> int:
+        if self.usage_store is None or self.usage_store.data.get("day") != usage_day():
+            return 0
+        return self.usage_store.data.get("counts", {}).get(label, 0)
+
+    def provider_states(self) -> list[tuple[Provider, str]]:
+        """Для /oleg-status: модель и её состояние словами."""
+        now = time.time()
+        states = []
+        for provider in self.providers:
+            until = self._blocked_until.get(provider.label, 0)
+            if until <= now:
+                state = "готова"
+            elif self._blocked_daily.get(provider.label):
+                state = f"суточный лимит до <t:{int(until)}:t>"
+            else:
+                state = f"пауза до <t:{int(until)}:t>"
+            states.append((provider, state))
+        return states
+
+    def all_blocked(self) -> bool:
+        now = time.time()
+        return bool(self.providers) and all(self._blocked_until.get(p.label, 0) > now for p in self.providers)
 
     @property
     def enabled(self) -> bool:
@@ -354,6 +411,7 @@ class LLMClient:
         }
         headers = {"Authorization": f"Bearer {provider.api_key}", "X-Title": "Oleg Kastomkin"}
         proxy = proxy_for(provider)
+        await self.count_request(provider.label)
         try:
             async with self._session.post(
                 provider.url, json=body, headers=headers, proxy=proxy,
