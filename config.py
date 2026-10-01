@@ -190,6 +190,8 @@ ANNOUNCE_CHANNEL_ID: int = _env_int("ANNOUNCE_CHANNEL_ID")
 # Итоги недели: день (0 — понедельник … 5 — суббота) и час по TIMEZONE. RECAP_HOUR=-1 — не публиковать.
 RECAP_WEEKDAY: int = min(6, max(0, _env_int("RECAP_WEEKDAY", 5)))
 RECAP_HOUR: int = min(23, _env_int("RECAP_HOUR", 11))
+# С какого часа (по TIMEZONE) Олег зовёт на кастомку, если сегодня сбора нет. -1 — не звать.
+LOBBY_INVITE_HOUR: int = min(22, _env_int("LOBBY_INVITE_HOUR", 17))
 # Сколько минут идёт голосование за MVP после отмеченной катки (до 14 — дольше Discord не даёт
 # обновить сообщение). 0 — не голосовать.
 MVP_VOTE_MINUTES: int = min(14, max(0, _env_int("MVP_VOTE_MINUTES", 10)))

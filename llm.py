@@ -336,16 +336,18 @@ class LLMClient:
     async def complete(
         self,
         system: str,
-        user: str,
+        user: str | list,
         *,
         temperature: float = 1.0,
         validate: Callable[[str], bool] | None = None,
         economy: bool = False,
+        only: set[str] | None = None,
     ) -> Reply:
         """Первый годный ответ по цепочке. `validate` бракует ответ — тогда спрашиваем следующую модель.
 
         economy=True — необязательная реплика (Олег сам встрял, разбор «запомни»): модели с крошечным суточным
         лимитом пропускаем, чтобы они остались для прямых обращений и прожарок.
+        user — текст или список частей OpenAI-формата (текст и картинки); only — только эти провайдеры (по имени).
         """
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
@@ -354,6 +356,8 @@ class LLMClient:
         waited_for_vpn = False
         for provider in self.providers:
             if economy and provider.scarce:
+                continue
+            if only is not None and provider.name not in only:
                 continue
             if self._blocked_until.get(provider.label, 0) > time.time():
                 continue
@@ -522,3 +526,14 @@ class LLMClient:
             return error_text
         tokens = (payload.get("usage") or {}).get("total_tokens", 0)
         return Reply(text, provider.label, tokens)
+
+
+def image_message(text: str, image: bytes, mime: str) -> list:
+    """Сообщение с картинкой для OpenAI-совместимого API (Gemini понимает data:-ссылки)."""
+    import base64
+
+    encoded = base64.b64encode(image).decode("ascii")
+    return [
+        {"type": "text", "text": text},
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+    ]
