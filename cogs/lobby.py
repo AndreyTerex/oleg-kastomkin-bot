@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -110,6 +111,8 @@ SERIES_CHOICES = [
 SERIES_WINNERS = ("🔵 синими", "🔴 красными")
 # Две отметки подряд быстрее этого — почти наверняка двойной клик.
 REPORT_COOLDOWN = 20
+# Сколько после конца голосования за MVP ещё пытаться дописать итоги в пост, если Discord недоступен.
+MVP_RETRY_WINDOW = 6 * 60 * 60
 
 
 def series_score(record: dict, *, drop_last: bool = False) -> tuple[int, int]:
@@ -634,6 +637,13 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
     winners, losers = record["teams"][side], record["teams"][1 - side]
     # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
     record["last_report_at"] = time.time()
+    # Подтверждаем нажатие до записи в статистику: если до Discord не достучаться (сбой сети, DNS),
+    # катка не должна молча попасть в статистику без объявления и кнопки отмены.
+    try:
+        await interaction.response.defer()
+    except Exception:
+        record.pop("last_report_at", None)
+        raise
     record["round"] = round_no + 1
     game_id = await stats_cog.stats.record_game(
         interaction.guild.id, list(winners), list(losers), lobby_id=lobby_id, round_no=round_no,
@@ -644,13 +654,13 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
     side_name = (BLUE_SIDE, RED_SIDE)[side]
     if interaction.message is not None and interaction.message.id == lobby_id:
         lobby_message = interaction.message
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
         )
     else:
         channel = interaction.client.get_channel(record["channel_id"]) or interaction.channel
         lobby_message = channel.get_partial_message(lobby_id)
-        await interaction.response.edit_message(content=f"✅ Записала: победа — **{side_name}**.", view=None)
+        await interaction.edit_original_response(content=f"✅ Записала: победа — **{side_name}**.", view=None)
         try:
             await lobby_message.edit(embed=cog.build_embed(interaction.guild, record), view=LobbyView(record))
         except discord.HTTPException:
@@ -669,8 +679,7 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
     if config.MVP_VOTE_MINUTES:
         players = cog.members_from_ids(interaction.guild, list(winners) + list(losers))
         if len(players) >= 2:
-            view = MvpView(stats_cog.stats, interaction.guild.id, game_id, round_no, players, set(winners))
-            view.message = await interaction.followup.send(view.text(), view=view, wait=True)
+            await cog.start_mvp_poll(interaction, record, lobby_id, game_id, round_no, players, set(winners))
 
 
 class UndoResultView(discord.ui.View):
@@ -709,6 +718,7 @@ class UndoResultView(discord.ui.View):
         button.disabled = True
         await interaction.response.edit_message(content="Результат отменён, статистика исправлена.", view=self)
         self.stop()
+        await self.cog.close_mvp_poll(self.record, self.game_id)
 
 
 def mvp_winners(votes: dict[int, int]) -> list[int]:
@@ -723,84 +733,67 @@ def mvp_winners(votes: dict[int, int]) -> list[int]:
 
 
 class MvpView(discord.ui.View):
-    """Голосование за MVP катки: голосуют только её участники, за себя нельзя."""
+    """Голосование за MVP катки: голосуют только её участники, за себя нельзя.
 
-    def __init__(
-        self, stats, guild_id: int, game_id: int, round_no: int, players: list[discord.Member], winners: set[int],
-    ) -> None:
-        super().__init__(timeout=config.MVP_VOTE_MINUTES * 60)
-        self.stats = stats
-        self.guild_id = guild_id
-        self.game_id = game_id
-        self.round_no = round_no
-        self.players = {member.id: member for member in players}
-        self.votes: dict[int, int] = {}
-        self.message: discord.Message | None = None
-        self.finished = False
-        self.ends = int(time.time() + config.MVP_VOTE_MINUTES * 60)
+    Состояние лежит в записи сбора (poll), срок — фиксированный poll["ends"]: таймаут View
+    сбрасывается каждым голосом и не переживает перезапуск, поэтому итоги подводит фоновая проверка.
+    """
+
+    def __init__(self, cog: "Lobby", record: dict, poll: dict) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.record = record
+        self.poll = poll
+        winners = set(poll["winners"])
         select = discord.ui.Select(
+            custom_id=f"lol:mvp:{poll['lobby']}:{poll['game']}",
             placeholder="Кто MVP этой катки?",
             options=[
                 discord.SelectOption(
-                    label=player_name(member)[:100], value=str(member.id),
-                    emoji="🏆" if member.id in winners else "💀",
+                    label=poll["names"][str(user_id)][:100], value=str(user_id),
+                    emoji="🏆" if user_id in winners else "💀",
                 )
-                for member in players[:25]
+                for user_id in poll["players"][:25]
             ],
         )
         select.callback = self.vote
         self.add_item(select)
 
-    def text(self) -> str:
-        line = (
-            f"⭐ **Кто MVP катки {self.round_no}?** Голосуют только игравшие, за себя нельзя. "
-            f"Итоги <t:{self.ends}:R>."
-        )
-        return line + f"\n-# Проголосовало {len(self.votes)} из {len(self.players)}"
-
     async def vote(self, interaction: discord.Interaction) -> None:
+        poll = self.poll
+        if poll.get("result") is not None or time.time() >= poll["ends"]:
+            await interaction.response.defer()
+            await self.cog.finish_mvp_poll(self.record, poll)
+            return
         voter = interaction.user.id
-        if voter not in self.players:
+        if voter not in poll["players"]:
             await interaction.response.send_message("Голосуют только те, кто играл эту катку.", ephemeral=True)
             return
         candidate = int(interaction.data["values"][0])
         if candidate == voter:
             await interaction.response.send_message("За себя нельзя, хитрюшка 😼", ephemeral=True)
             return
-        changed = voter in self.votes
-        self.votes[voter] = candidate
-        if len(self.votes) >= len(self.players):
+        votes = poll.setdefault("votes", {})
+        changed = str(voter) in votes
+        votes[str(voter)] = candidate
+        await self.cog.save()
+        if len(votes) >= len(poll["players"]):
             await interaction.response.defer()
-            await self.finish()
+            await self.cog.finish_mvp_poll(self.record, poll)
             return
-        await interaction.response.edit_message(content=self.text(), view=self)
+        await interaction.response.edit_message(content=mvp_poll_text(poll), view=self)
         await interaction.followup.send(
-            ("Голос изменён" if changed else "Голос принят") + f": {player_name(self.players[candidate])}.",
+            ("Голос изменён" if changed else "Голос принят") + f": {poll['names'][str(candidate)]}.",
             ephemeral=True,
         )
 
-    async def on_timeout(self) -> None:
-        await self.finish()
 
-    async def finish(self) -> None:
-        if self.finished:
-            return
-        self.finished = True
-        self.stop()
-        winners = mvp_winners(self.votes)
-        if not winners:
-            content = f"⭐ MVP катки {self.round_no}: никто не проголосовал."
-        elif not await self.stats.set_mvp(self.guild_id, self.game_id, winners):
-            content = f"⭐ Голосование за MVP катки {self.round_no} закрыто: результат катки отменили."
-        else:
-            names = ", ".join(f"**{player_name(self.players[u])}**" for u in winners if u in self.players)
-            count = sum(1 for c in self.votes.values() if c == winners[0])
-            content = f"⭐ MVP катки {self.round_no} — {names} ({count} из {len(self.votes)} голосов)!"
-        if self.message is not None:
-            try:
-                await self.message.edit(content=content, view=None)
-            except discord.HTTPException:
-                log.warning("Не удалось подвести итоги голосования за MVP")
+def mvp_poll_text(poll: dict) -> str:
+    line = (
+        f"⭐ **Кто MVP катки {poll['round']}?** Голосуют только игравшие, за себя нельзя. "
+        f"Итоги <t:{int(poll['ends'])}:R>."
+    )
+    return line + f"\n-# Проголосовало {len(poll.get('votes') or {})} из {len(poll['players'])}"
 
 
 class ModeView(discord.ui.View):
@@ -1078,6 +1071,9 @@ class Lobby(commands.Cog):
         self._rerolling: set[int] = set()
         # Живые драфты сборов: id поста сбора → меню драфта.
         self.drafts: dict[int, DraftView] = {}
+        # Живые голосования за MVP: (id сбора, номер катки) → меню.
+        self.mvp_views: dict[tuple[int, int], MvpView] = {}
+        self._mvp_closing: set[tuple[int, int]] = set()
 
     async def cog_load(self) -> None:
         self.champion_history.load()
@@ -1117,10 +1113,12 @@ class Lobby(commands.Cog):
         """После старта перерисовывает посты и восстанавливает драфты, дальше раз в TICK секунд
         напоминает о сборах и закрывает драфты, где капитаны давно не выбирали."""
         await self._refresh_messages()
+        self.restore_mvp_polls()
         while True:
             try:
                 await self.remind_due()
                 await self.expire_drafts()
+                await self.expire_mvp_polls()
             except Exception:
                 log.exception("Ошибка в фоновой проверке сборов")
             await asyncio.sleep(TICK)
@@ -1171,6 +1169,106 @@ class Lobby(commands.Cog):
             record["closed"] = True
             await self.save()
             log.info("Пост сбора %s удалён — сбор закрыт", payload.message_id)
+
+    # --- голосование за MVP, которое переживает перезапуск -----------------
+
+    async def start_mvp_poll(
+        self, interaction: discord.Interaction, record: dict, lobby_id: int, game_id: int, round_no: int,
+        players: list[discord.Member], winners: set[int],
+    ) -> None:
+        poll = {
+            "lobby": lobby_id,
+            "game": game_id,
+            "round": round_no,
+            "guild": interaction.guild.id,
+            "channel_id": interaction.channel_id,
+            "players": [member.id for member in players],
+            "names": {str(member.id): player_name(member) for member in players},
+            "winners": sorted(winners),
+            "votes": {},
+            "ends": time.time() + config.MVP_VOTE_MINUTES * 60,
+        }
+        view = MvpView(self, record, poll)
+        message = await interaction.followup.send(mvp_poll_text(poll), view=view, wait=True)
+        poll["message_id"] = message.id
+        record.setdefault("mvp_polls", []).append(poll)
+        self.mvp_views[(lobby_id, game_id)] = view
+        await self.save()
+
+    def restore_mvp_polls(self) -> None:
+        """После перезапуска снова принимает голоса в незакрытых голосованиях."""
+        restored = 0
+        for record in self.store.data.values():
+            for poll in record.get("mvp_polls") or []:
+                if poll.get("result") is not None or time.time() >= poll["ends"]:
+                    continue  # итоги подведёт фоновая проверка
+                view = MvpView(self, record, poll)
+                self.mvp_views[(poll["lobby"], poll["game"])] = view
+                self.bot.add_view(view, message_id=poll["message_id"])
+                restored += 1
+        if restored:
+            log.info("Голосований за MVP восстановлено: %d", restored)
+
+    async def expire_mvp_polls(self) -> None:
+        now = time.time()
+        for record in list(self.store.data.values()):
+            for poll in list(record.get("mvp_polls") or []):
+                if poll.get("result") is not None or now >= poll["ends"]:
+                    await self.finish_mvp_poll(record, poll)
+
+    async def close_mvp_poll(self, record: dict, game_id: int) -> None:
+        """Результат катки отменили — голосование за её MVP закрывается сразу."""
+        for poll in list(record.get("mvp_polls") or []):
+            if poll["game"] == game_id:
+                await self.finish_mvp_poll(record, poll)
+
+    async def finish_mvp_poll(self, record: dict, poll: dict) -> None:
+        """Подводит итоги один раз; если пост поправить не вышло, фоновая проверка повторит."""
+        key = (poll["lobby"], poll["game"])
+        if key in self._mvp_closing:
+            return
+        self._mvp_closing.add(key)
+        try:
+            view = self.mvp_views.pop(key, None)
+            if view is not None:
+                view.stop()
+            if poll.get("result") is None:
+                poll["result"] = await self.mvp_result(poll)
+                await self.save()
+            if await self._edit_mvp_message(poll) or time.time() - poll["ends"] > MVP_RETRY_WINDOW:
+                record["mvp_polls"] = [p for p in record.get("mvp_polls") or [] if p is not poll]
+                await self.save()
+        finally:
+            self._mvp_closing.discard(key)
+
+    async def mvp_result(self, poll: dict) -> str:
+        votes = {int(voter): candidate for voter, candidate in (poll.get("votes") or {}).items()}
+        winners = mvp_winners(votes)
+        stats_cog = self.bot.get_cog("Stats")
+        if not winners:
+            return f"⭐ MVP катки {poll['round']}: никто не проголосовал."
+        if stats_cog is None or not await stats_cog.stats.set_mvp(poll["guild"], poll["game"], winners):
+            return f"⭐ Голосование за MVP катки {poll['round']} закрыто: результат катки отменили."
+        names = ", ".join(f"**{poll['names'].get(str(u), f'<@{u}>')}**" for u in winners)
+        count = sum(1 for c in votes.values() if c == winners[0])
+        return f"⭐ MVP катки {poll['round']} — {names} ({count} из {len(votes)} голосов)!"
+
+    async def _edit_mvp_message(self, poll: dict) -> bool:
+        """Правит пост от имени бота, а не через вебхук нажатия: токен вебхука живёт всего 15 минут."""
+        channel = self.bot.get_channel(poll["channel_id"])
+        if channel is None:
+            log.warning("Канал голосования за MVP %s недоступен", poll["channel_id"])
+            return False
+        try:
+            await channel.get_partial_message(poll["message_id"]).edit(
+                content=poll["result"], view=None, allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.NotFound:
+            return True  # пост удалили — дописывать некуда
+        except (discord.HTTPException, aiohttp.ClientError, OSError, asyncio.TimeoutError):
+            log.warning("Не удалось подвести итоги голосования за MVP катки %s — повторю позже", poll["round"])
+            return False
+        return True
 
     # --- драфт, который переживает перезапуск ------------------------------
 

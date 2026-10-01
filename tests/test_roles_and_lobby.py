@@ -282,3 +282,73 @@ def test_deal_is_posted_via_interaction_and_explains_missing_rights():
     fail = True
     asyncio.run(cog.post_deal(NS(send=channel_send), {"embed": "e"}, interaction, "раздачу"))
     assert warned and "Прикреплять файлы" in warned[0]
+
+
+def _mvp_lobby(records, *, edit_fails=False, game_exists=True):
+    import discord
+
+    cog, _sent, _saved = _bare_lobby(records)
+    cog.mvp_views = {}
+    cog._mvp_closing = set()
+    edits, mvps = [], []
+
+    async def edit(**kwargs):
+        if edit_fails:
+            raise discord.HTTPException(SimpleNamespace(status=401, reason="x"), "Invalid Webhook Token")
+        edits.append(kwargs["content"])
+
+    async def set_mvp(guild_id, game_id, winners):
+        mvps.append(winners)
+        return game_exists
+
+    channel = SimpleNamespace(get_partial_message=lambda message_id: SimpleNamespace(edit=edit))
+    stats_cog = SimpleNamespace(stats=SimpleNamespace(set_mvp=set_mvp))
+    cog.bot = SimpleNamespace(get_channel=lambda channel_id: channel, get_cog=lambda name: stats_cog)
+    return cog, edits, mvps
+
+
+def _poll(ends, votes):
+    return {
+        "lobby": 1, "game": 7, "round": 1, "guild": 5, "channel_id": 9, "message_id": 11,
+        "players": [1, 2, 3], "names": {"1": "Аня", "2": "Боря", "3": "Вова"}, "winners": [1],
+        "votes": votes, "ends": ends,
+    }
+
+
+def test_mvp_poll_closes_by_deadline_not_by_view_timeout(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(lobby.time, "time", lambda: now)
+    running = _poll(now + 60, {"1": 2})
+    over = _poll(now - 1, {"1": 2, "3": 2})
+    over["game"] = 8
+    records = {"1": {"mvp_polls": [running, over]}}
+    cog, edits, mvps = _mvp_lobby(records)
+    asyncio.run(cog.expire_mvp_polls())
+    assert mvps == [[2]]
+    assert edits == ["⭐ MVP катки 1 — **Боря** (2 из 2 голосов)!"]
+    assert records["1"]["mvp_polls"] == [running]
+
+
+def test_mvp_poll_retries_edit_and_counts_mvp_once(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(lobby.time, "time", lambda: now)
+    poll = _poll(now - 1, {"1": 3})
+    records = {"1": {"mvp_polls": [poll]}}
+    cog, edits, mvps = _mvp_lobby(records, edit_fails=True)
+    asyncio.run(cog.expire_mvp_polls())
+    assert records["1"]["mvp_polls"] == [poll] and poll["result"]
+    asyncio.run(cog.expire_mvp_polls())
+    assert mvps == [[3]]  # сеть отвалилась — итоги дописываем позже, но MVP засчитан один раз
+    monkeypatch.setattr(lobby.time, "time", lambda: now + lobby.MVP_RETRY_WINDOW + 1)
+    asyncio.run(cog.expire_mvp_polls())
+    assert records["1"]["mvp_polls"] == []
+
+
+def test_mvp_poll_closed_when_result_undone(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(lobby.time, "time", lambda: now)
+    record = {"mvp_polls": [_poll(now + 300, {"1": 2})]}
+    cog, edits, _mvps = _mvp_lobby({"1": record}, game_exists=False)
+    asyncio.run(cog.close_mvp_poll(record, 7))
+    assert edits == ["⭐ Голосование за MVP катки 1 закрыто: результат катки отменили."]
+    assert record["mvp_polls"] == []
