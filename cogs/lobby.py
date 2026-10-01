@@ -496,6 +496,7 @@ class LobbyView(discord.ui.View):
 
         record["captains"] = None
         record["teams"] = [[member.id for member in team] for team in teams]
+        record["teams_at"] = time.time()
         record["deal"] = cog.pack_deal(lanes, champions)
         record["round"] = 1
         record["results"] = []
@@ -503,9 +504,8 @@ class LobbyView(discord.ui.View):
         await cog.save()
 
         await interaction.message.edit(embed=cog.build_embed(interaction.guild, record), view=LobbyView(record))
-        await interaction.followup.send(
-            **await cog.deal_message(teams, lanes, champions, mode, notes)
-        )
+        payload = await cog.deal_message(teams, lanes, champions, mode, notes)
+        await cog.post_deal(interaction.channel, payload, interaction, "раздачу")
 
     @discord.ui.button(
         label="Начать драфт", emoji="📋", style=discord.ButtonStyle.primary, custom_id=CUSTOM_ID_DRAFT, row=2
@@ -581,7 +581,7 @@ class LobbyView(discord.ui.View):
         await interaction.response.defer()
         cog._rerolling.add(interaction.message.id)
         try:
-            await cog.reroll_deal(interaction.message, record)
+            await cog.reroll_deal(interaction.message, record, interaction=interaction)
         finally:
             cog._rerolling.discard(interaction.message.id)
 
@@ -1199,7 +1199,7 @@ class Lobby(commands.Cog):
                 return
             record.pop("draft", None)
             self.drafts.pop(key, None)
-            await self.finish_draft(lobby_message, record, teams)
+            await self.finish_draft(lobby_message, record, teams, getattr(view, "last_interaction", None))
 
         view = DraftView(
             self.bot.get_cog("Scrim"), captains, pool,
@@ -1447,7 +1447,8 @@ class Lobby(commands.Cog):
         return self.members_from_ids(guild, record[STATUS_IN])
 
     async def finish_draft(
-        self, message: discord.Message, record: dict, teams: list[list[discord.Member]]
+        self, message: discord.Message, record: dict, teams: list[list[discord.Member]],
+        interaction: discord.Interaction | None = None,
     ) -> None:
         """Сохраняет итог драфта, раздаёт линии и чемпионов по режиму и открывает развод по каналам."""
         mode = modes.get_mode(record)
@@ -1455,6 +1456,7 @@ class Lobby(commands.Cog):
         champions, champion_notes = await self.deal_for(teams, lanes, mode)
 
         record["teams"] = [[member.id for member in team] for team in teams]
+        record["teams_at"] = time.time()
         record["deal"] = self.pack_deal(lanes, champions)
         record["round"] = 1
         record["results"] = []
@@ -1469,12 +1471,8 @@ class Lobby(commands.Cog):
         if mode["lanes"] == modes.LANES_FREE and mode["champs"] == modes.CHAMPS_FREE:
             return
         captains = [team[0] for team in teams]  # драфт начинается с капитанов
-        try:
-            await message.channel.send(
-                **await self.deal_message(teams, lanes, champions, mode, notes + champion_notes, captains=captains)
-            )
-        except discord.HTTPException:
-            log.exception("Не удалось опубликовать раздачу после драфта")
+        payload = await self.deal_message(teams, lanes, champions, mode, notes + champion_notes, captains=captains)
+        await self.post_deal(message.channel, payload, interaction, "раздачу после драфта")
 
     async def deal_message(
         self,
@@ -1493,7 +1491,32 @@ class Lobby(commands.Cog):
         embed.set_image(url=f"attachment://{image.filename}")
         return {"embed": embed, "file": image}
 
-    async def reroll_deal(self, message: discord.Message, record: dict) -> None:
+    async def post_deal(self, channel, payload: dict, interaction: discord.Interaction | None, what: str) -> None:
+        """Публикует раздачу ответом на нажатие (вебхук — прав в канале не нужно), иначе — в канал.
+
+        Если и это не вышло (нет прав писать или прикреплять файлы), говорит нажавшему, что сломалось.
+        """
+        try:
+            if interaction is not None and not interaction.is_expired():
+                await interaction.followup.send(**payload)
+            else:
+                await channel.send(**payload)
+            return
+        except discord.HTTPException:
+            log.exception("Не удалось опубликовать %s", what)
+        if interaction is not None and not interaction.is_expired():
+            try:
+                await interaction.followup.send(
+                    f"Не получилось опубликовать {what}: проверьте, что у бота в этом канале есть права "
+                    "«Отправлять сообщения», «Встраивать ссылки» и «Прикреплять файлы».",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+
+    async def reroll_deal(
+        self, message: discord.Message, record: dict, interaction: discord.Interaction | None = None,
+    ) -> None:
         """Новая раздача после катки: составы те же, линии и чемпионы заново, без чемпионов прошлой катки."""
         guild = message.guild
         mode = modes.get_mode(record)
@@ -1513,15 +1536,10 @@ class Lobby(commands.Cog):
             log.exception("Не удалось обновить сообщение сбора после новой раздачи")
 
         captains = self.members_from_ids(guild, record.get("captains"))
-        try:
-            await message.channel.send(
-                **await self.deal_message(
-                    teams, lanes, champions, mode, notes + champion_notes,
-                    captains=captains, round_no=record["round"],
-                )
-            )
-        except discord.HTTPException:
-            log.exception("Не удалось опубликовать новую раздачу")
+        payload = await self.deal_message(
+            teams, lanes, champions, mode, notes + champion_notes, captains=captains, round_no=record["round"],
+        )
+        await self.post_deal(message.channel, payload, interaction, "новую раздачу")
         log.info("Новая раздача в сборе %s: катка %d", message.id, record["round"])
 
     # --- режимы -----------------------------------------------------------
