@@ -325,8 +325,19 @@ def assign_lanes(
 # --- чемпионы -----------------------------------------------------------------
 
 
-# Какая доля чемпионов линии (самые давно не выпадавшие) участвует в случайном выборе.
-FRESH_SHARE = 0.35
+# Какая доля чемпионов линии участвует в выборе: самые недавние (остальные 40%) отдыхают.
+FRESH_SHARE = 0.6
+# Во сколько раз давно не выпадавший чемпион вероятнее только что «отдохнувшего».
+OLD_BONUS = 2.0
+
+
+def weighted_sample(items: list, weights: list[float], count: int) -> list:
+    """Случайные count без повторов, с весами (Efraimidis–Spirakis)."""
+    keyed = sorted(
+        ((random.random() ** (1.0 / max(weight, 1e-9)), index) for index, weight in enumerate(weights)),
+        reverse=True,
+    )
+    return [items[index] for _key, index in keyed[:count]]
 
 
 def deal_champions(
@@ -340,8 +351,9 @@ def deal_champions(
 
     Игроку без линии достаются чемпионы из всего списка. Если на линии чемпионы
     кончились, недостающие добираются из всех остальных.
-    last_seen — когда чемпион последний раз выпадал на сервере: случайный выбор идёт только
-    среди давно не выпадавших (FRESH_SHARE списка линии), чтобы одни и те же не мелькали подряд.
+    last_seen — когда чемпион последний раз выпадал на сервере: самые недавние отдыхают, а из остальных
+    (FRESH_SHARE списка линии) выбор случайный, давно не выпадавшие — чуть вероятнее. Строгой очереди нет:
+    иначе после первого круга чемпионы ходят одними и теми же группами.
     """
     if how == CHAMPS_FREE:
         return {}
@@ -357,7 +369,11 @@ def deal_champions(
             # Сначала те, кого давно (или ни разу) не было; среди равных — случайный порядок.
             fitting.sort(key=lambda champion: (last_seen.get(champion.id, 0.0), random.random()))
             fitting = fitting[:max(count, math.ceil(len(fitting) * FRESH_SHARE))]
-        picked = random.sample(fitting, min(count, len(fitting)))
+            size = len(fitting)
+            weights = [1.0 + (OLD_BONUS - 1.0) * (1 - index / size) for index in range(size)]
+            picked = weighted_sample(fitting, weights, min(count, size))
+        else:
+            picked = random.sample(fitting, min(count, len(fitting)))
         used.update(champion.id for champion in picked)
         return picked
 

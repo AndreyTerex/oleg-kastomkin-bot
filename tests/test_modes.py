@@ -183,3 +183,38 @@ def test_single_lane_does_not_repeat_in_the_next_game(make_member):
         lanes, _ok = modes.assign_lanes(team, modes.LANES_RANDOM, previous={1: "mid", 2: "top"})
         assert lanes[1] != "mid" and lanes[2] != "top"
         assert lanes[2] in ("mid", "adc")  # у второго ещё есть свои линии кроме прошлой
+
+
+def test_deal_is_not_a_fixed_rotation(make_member):
+    """После первого круга чемпионы не ходят одними и теми же группами."""
+    teams = [[make_member(i) for i in range(5)], [make_member(i) for i in range(5, 10)]]
+    lanes = {i: LANES[i % 5] for i in range(10)}
+    pool = _lane_pool()
+    runs = []
+    for _ in range(2):
+        history: dict[str, float] = {}
+        deals = []
+        for game in range(1, 16):
+            dealt = modes.deal_champions(teams, lanes, modes.CHAMPS_RANDOM, pool, last_seen=history)
+            names = frozenset(champion.id for picks in dealt.values() for champion in picks)
+            for name in names:
+                history[name] = float(game)
+            deals.append(names)
+        runs.append(deals)
+    # Вторая половина (после того как все побывали) не повторяет первую.
+    first, later = runs[0][:5], runs[0][10:15]
+    assert first != later
+    # Разные серии игр дают разные раздачи.
+    assert runs[0] != runs[1]
+
+
+def test_role_rates_add_lanes():
+    from champions import parse_role_rates
+
+    payload = {"data": {
+        "266": {"TOP": {"playRate": 8.0}, "JUNGLE": {"playRate": 0.1}, "MIDDLE": {"playRate": 2.0}},
+        "1": {"UTILITY": {"playRate": 0}},
+        "bad": "x",
+    }}
+    assert parse_role_rates(payload) == {"266": {"top", "mid"}}
+    assert parse_role_rates([]) == {} and parse_role_rates({"data": None}) == {}
