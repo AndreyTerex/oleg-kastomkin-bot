@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
@@ -29,6 +30,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
+import datasync
 from utils import NEUTRAL, WARNING
 from vpn import VPN_CLIENT
 
@@ -343,6 +345,97 @@ class Ops(commands.Cog):
             await interaction.response.send_message("Команда только для администраторов сервера.", ephemeral=True)
             return
         await interaction.response.send_message(embed=self.status_embed(), ephemeral=True)
+
+    # --- перенос данных между установками ---------------------------------------
+
+    @app_commands.command(name="oleg-export", description="Выгрузить статистику, память и настройки Олега архивом")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def export_data(self, interaction: discord.Interaction) -> None:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Команда только для администраторов сервера.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        payload, files = await asyncio.to_thread(
+            datasync.build_archive, config.DATA_DIR, [guild.id for guild in self.bot.guilds],
+        )
+        name = f"oleg-data-{datetime.now(config.TIMEZONE).strftime('%Y-%m-%d_%H-%M')}.zip"
+        await interaction.followup.send(
+            f"Данные Олега: {', '.join(files) or 'пусто'}.\n"
+            "Чтобы перенести их в другого бота, там выполните `/oleg-import` и приложите этот файл. "
+            "Кэша VPN и ключей в архиве нет.",
+            file=discord.File(io.BytesIO(payload), filename=name),
+            ephemeral=True,
+        )
+        log.info("Данные выгружены по просьбе %s (%s)", interaction.user, ", ".join(files))
+
+    @app_commands.command(name="oleg-import", description="Загрузить данные из архива /oleg-export (заменит текущие)")
+    @app_commands.describe(archive="ZIP-файл из /oleg-export")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def import_data(self, interaction: discord.Interaction, archive: discord.Attachment) -> None:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Команда только для администраторов сервера.", ephemeral=True)
+            return
+        if archive.size > datasync.MAX_ARCHIVE_BYTES:
+            await interaction.response.send_message("Архив слишком большой.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            files, meta = datasync.read_archive(await archive.read())
+        except datasync.ImportError_ as error:
+            await interaction.followup.send(f"Не получилось: {error}", ephemeral=True)
+            return
+        except discord.HTTPException:
+            await interaction.followup.send("Не удалось скачать файл из Discord, попробуйте ещё раз.", ephemeral=True)
+            return
+        warning = ""
+        if str(interaction.guild.id) not in (meta.get("guilds") or []):
+            warning = (
+                "\n⚠️ Архив выгружен с другого Discord-сервера: статистика привязана к серверу, "
+                "поэтому здесь её видно не будет."
+            )
+        view = ImportConfirm(self, files, interaction.user.id)
+        await interaction.followup.send(
+            f"Архив {datasync.describe_meta(meta)}.{warning}\n"
+            "Текущие данные будут **заменены** (копия сохранится в `data/backups-import`), "
+            "а бот перезапустится. Продолжить?",
+            view=view, ephemeral=True,
+        )
+
+    def apply_import(self, files: dict[str, bytes]) -> None:
+        """Записывает данные и сразу перезапускает процесс: модули держат старые данные в памяти
+        и иначе перезаписали бы новые. Docker (restart: unless-stopped) поднимает бота заново."""
+        backup = datasync.apply_archive(config.DATA_DIR, files)
+        log.warning("Данные заменены из архива (%s), копия прежних — %s. Перезапускаюсь", ", ".join(files), backup)
+        logging.shutdown()
+        os._exit(0)
+
+
+class ImportConfirm(discord.ui.View):
+    def __init__(self, cog: Ops, files: dict[str, bytes], user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.files = files
+        self.user_id = user_id
+
+    @discord.ui.button(label="Заменить данные и перезапустить", emoji="📥", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Подтверждает тот, кто загрузил архив.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            content="📥 Загружаю данные и перезапускаюсь — через минуту Олег вернётся с новыми данными.", view=None,
+        )
+        self.stop()
+        # Ответ должен уйти до выхода процесса.
+        await asyncio.sleep(1)
+        self.cog.apply_import(self.files)
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Импорт отменён, данные не тронуты.", view=None)
+        self.stop()
 
 
 async def setup(bot: commands.Bot) -> None:
