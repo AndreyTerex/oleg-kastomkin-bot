@@ -11,12 +11,13 @@ from discord.ext import commands
 import champions
 import config
 import portraits
+from sync import Sync
 from vpn import VPN_CLIENT
 from utils import WARNING, respond
 
 log = logging.getLogger("scrimbot")
 
-EXTENSIONS = ("cogs.roles", "cogs.scrim", "cogs.stats", "cogs.lobby", "cogs.extras", "cogs.chat", "cogs.vpn_admin", "cogs.ops", "cogs.matchday")
+EXTENSIONS = ("cogs.roles", "cogs.scrim", "cogs.stats", "cogs.lobby", "cogs.extras", "cogs.chat", "cogs.vpn_admin", "cogs.ops", "cogs.matchday", "cogs.sync")
 
 
 class ScrimBot(commands.Bot):
@@ -47,6 +48,9 @@ class ScrimBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.tree.on_error = self.on_tree_error
+        # До загрузки модулей: если бот уже работает на другом компьютере — ждём; свежие данные — из канала.
+        self.sync = Sync(self)
+        await self.sync.prepare()
 
         for extension in EXTENSIONS:
             await self.load_extension(extension)
@@ -68,6 +72,12 @@ class ScrimBot(commands.Bot):
             )
 
     async def close(self) -> None:
+        sync = getattr(self, "sync", None)
+        if sync is not None and not self.is_closed():
+            try:
+                await sync.push(force=True)
+            except Exception:
+                log.exception("Не удалось выложить снимок данных при выключении")
         await champions.POOL.close()
         await portraits.close()
         await VPN_CLIENT.close()
