@@ -198,6 +198,11 @@ RECAP_WEEKDAY: int = min(6, max(0, _env_int("RECAP_WEEKDAY", 5)))
 RECAP_HOUR: int = min(23, _env_int("RECAP_HOUR", 11))
 # С какого часа (по TIMEZONE) Олег зовёт на кастомку, если сегодня сбора нет. -1 — не звать.
 LOBBY_INVITE_HOUR: int = min(22, _env_int("LOBBY_INVITE_HOUR", 17))
+# Riot API для рангов (/link). Ключ — developer.riotgames.com. Платформа: ru, euw1, eun1, tr1…; регион аккаунтов:
+# europe (для ru/euw/eune/tr), americas, asia.
+RIOT_API_KEY: str = os.getenv("RIOT_API_KEY", "").strip()
+RIOT_PLATFORM: str = os.getenv("RIOT_PLATFORM", "ru").strip().lower() or "ru"
+RIOT_REGION: str = os.getenv("RIOT_REGION", "europe").strip().lower() or "europe"
 # Fearless-драфт: чемпионы прошлых каток серии не выпадают и недоступны никому. 0 — выключить.
 FEARLESS_DRAFT: bool = os.getenv("FEARLESS_DRAFT", "1").strip().lower() not in ("0", "false", "no", "off")
 # Сколько минут после раздачи принимаются ставки на катку.

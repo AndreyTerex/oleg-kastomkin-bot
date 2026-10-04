@@ -20,6 +20,7 @@ import bets
 import config
 import modes
 import portraits
+import riot
 from champions import POOL, ChampionsUnavailable
 from cogs.scrim import DraftView
 from storage import JsonStore
@@ -1835,13 +1836,23 @@ class Lobby(commands.Cog):
             stats_cog = self.bot.get_cog("Stats")
             guild_id = players[0].guild.id
 
+            profile = self.bot.get_cog("Profile")
+
             def rating(member: discord.Member) -> float:
-                return stats_cog.stats.player(guild_id, member.id).elo if stats_cog else 1000.0
+                if stats_cog is None:
+                    return 1000.0
+                record = stats_cog.stats.player(guild_id, member.id)
+                # Новичок без каток на кастомках — по рангу в соло-очереди, если аккаунт привязан.
+                rank = profile.riot.rank(member.id) if profile is not None else None
+                return riot.blended_elo(record.elo, record.games, rank)
 
             teams = modes.skill_teams(players, rating)
             lanes, lane_notes = self.assign_team_lanes(teams, mode["lanes"])
             notes += lane_notes
-            if stats_cog is None or not any(stats_cog.stats.player(guild_id, m.id).games for m in players):
+            has_ranks = profile is not None and any(profile.riot.rank(m.id) for m in players)
+            if stats_cog is None or (
+                not has_ranks and not any(stats_cog.stats.player(guild_id, m.id).games for m in players)
+            ):
                 notes.append("Статистики пока нет — команды поделены случайно. Отмечайте победы кнопками в посте сбора.")
             else:
                 strength = [sum(rating(m) for m in team) / len(team) for team in teams if team]

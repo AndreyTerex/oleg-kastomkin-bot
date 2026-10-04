@@ -169,6 +169,10 @@ class StatsCog(commands.Cog, name="Stats"):
             embed.add_field(name="Победы", value=f"{record.wins} ({record.winrate:.0%})")
             embed.add_field(name="Поражения", value=str(record.losses))
             embed.add_field(name="Elo", value=f"{record.elo:.0f}")
+            profile = self.bot.get_cog("Profile")
+            rank_line = profile.rank_line(member.id) if profile is not None else ""
+            if rank_line:
+                embed.add_field(name="Ранг", value=rank_line)
             if record.mvp:
                 embed.add_field(name="MVP", value=f"⭐ ×{record.mvp}")
             recent = self.stats.recent_games(interaction.guild.id, member.id, RECENT_GAMES)
