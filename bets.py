@@ -60,6 +60,12 @@ class Wallets:
     def balance(self, guild_id: int, user_id: int) -> int:
         return self._user(guild_id, user_id)["coins"]
 
+    def add(self, guild_id: int, user_id: int, amount: int) -> int:
+        """Начислить коины (награда за викторину и т. п.). Возвращает баланс."""
+        user = self._user(guild_id, user_id)
+        user["coins"] += amount
+        return user["coins"]
+
     def claim_daily(self, guild_id: int, user_id: int, today: str | None = None) -> int:
         """Ежедневный бонус: сколько начислено (0 — сегодня уже брал)."""
         user = self._user(guild_id, user_id)
