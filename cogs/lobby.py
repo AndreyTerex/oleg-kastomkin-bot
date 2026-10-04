@@ -16,6 +16,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import bets
 import config
 import modes
 import portraits
@@ -61,11 +62,12 @@ CUSTOM_ID_CANCEL = "lol:lobby:close"
 CUSTOM_ID_WIN_BLUE = "lol:lobby:win:blue"
 CUSTOM_ID_WIN_RED = "lol:lobby:win:red"
 CUSTOM_ID_FINISH = "lol:lobby:finish"
+CUSTOM_ID_BET = "lol:lobby:bet"
 
 # Кнопки, которые нужны только внутренней кастомке.
 CUSTOM_GAME_ONLY = frozenset({
     CUSTOM_ID_MODE, CUSTOM_ID_CAPTAINS, CUSTOM_ID_DRAFT, CUSTOM_ID_REROLL, CUSTOM_ID_MOVE,
-    CUSTOM_ID_WIN_BLUE, CUSTOM_ID_WIN_RED, CUSTOM_ID_FINISH,
+    CUSTOM_ID_WIN_BLUE, CUSTOM_ID_WIN_RED, CUSTOM_ID_FINISH, CUSTOM_ID_BET,
 })
 
 CANCEL_LABELS = {
@@ -130,6 +132,24 @@ def series_winner(record: dict, *, drop_last: bool = False) -> int | None:
     if red >= need and red > blue:
         return 1
     return None
+
+
+def deal_names(champions: dict) -> list[str]:
+    return sorted({champion.name for picks in champions.values() for champion in picks})
+
+
+def remember_round_champions(record: dict, champions: dict) -> None:
+    """Fearless: какие чемпионы выпали на текущую катку серии (новая раздача той же катки — заменяет)."""
+    record.setdefault("round_champs", {})[str(record.get("round", 1))] = deal_names(champions)
+
+
+def fearless_used(record: dict) -> set[str]:
+    """Чемпионы прошлых каток серии — в fearless-драфте их больше не берёт никто."""
+    current = record.get("round", 1)
+    return {
+        name for round_no, names in (record.get("round_champs") or {}).items()
+        if int(round_no) < current for name in names
+    }
 
 
 def set_waiting(record: dict, user_id: int, waiting: bool) -> None:
@@ -296,7 +316,7 @@ class LobbyView(discord.ui.View):
                 child.disabled = not has_teams
             elif custom_id == CUSTOM_ID_MOVE:
                 child.disabled = not has_teams
-            elif custom_id == CUSTOM_ID_FINISH:
+            elif custom_id in (CUSTOM_ID_FINISH, CUSTOM_ID_BET):
                 if not has_teams:
                     self.remove_item(child)
                     continue
@@ -421,6 +441,7 @@ class LobbyView(discord.ui.View):
 
         record["closed"] = True
         await cog.save()
+        await cog.refund_bets(interaction.guild.id, interaction.message.id)
         await interaction.response.edit_message(
             embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
         )
@@ -443,6 +464,29 @@ class LobbyView(discord.ui.View):
         label="Завершить", emoji="🏁", style=discord.ButtonStyle.secondary, custom_id=CUSTOM_ID_FINISH, row=3
     )
     async def finish(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._finish(interaction)
+
+    @discord.ui.button(
+        label="Ставка", emoji="💰", style=discord.ButtonStyle.success, custom_id=CUSTOM_ID_BET, row=3
+    )
+    async def bet(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        cog: "Lobby" = interaction.client.get_cog("Lobby")
+        record = cog.get_record(interaction.message.id)
+        stats_cog = interaction.client.get_cog("Stats")
+        if record is None or record.get("closed") or len(record.get("teams") or []) != 2 or stats_cog is None:
+            await respond(interaction, "Ставки сейчас не принимаются.")
+            return
+        wallets = stats_cog.wallets
+        round_no = record.get("round", 1)
+        pool = wallets.pool(interaction.guild.id, interaction.message.id, round_no)
+        if pool is None or pool.get("settled") is not None or time.time() > pool["open_until"]:
+            await respond(interaction, f"Ставки на катку {round_no} уже не принимаются — ждите следующую раздачу.")
+            return
+        view = BetView(wallets, interaction.guild.id, interaction.message.id, round_no, record["teams"],
+                       interaction.user.id)
+        await interaction.response.send_message(view.text(), view=view, ephemeral=True)
+
+    async def _finish(self, interaction: discord.Interaction) -> None:
         cog: "Lobby" = interaction.client.get_cog("Lobby")
         record = cog.get_record(interaction.message.id)
         if record is None:
@@ -525,8 +569,11 @@ class LobbyView(discord.ui.View):
         record["deal"] = cog.pack_deal(lanes, champions)
         record["round"] = 1
         record["results"] = []
+        record["round_champs"] = {}
+        remember_round_champions(record, champions)
         record["stage"] = STAGE_DONE
         await cog.save()
+        await cog.open_bets(interaction.guild.id, interaction.message.id, record)
 
         await interaction.message.edit(embed=cog.build_embed(interaction.guild, record), view=LobbyView(record))
         payload = await cog.deal_message(teams, lanes, champions, mode, notes)
@@ -666,6 +713,7 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
     )
     record.setdefault("results", []).append({"round": round_no, "winner": side, "game": game_id})
     await cog.save()
+    bet_line = await cog.settle_bets(interaction.guild, lobby_id, round_no, side)
     side_name = (BLUE_SIDE, RED_SIDE)[side]
     if interaction.message is not None and interaction.message.id == lobby_id:
         lobby_message = interaction.message
@@ -685,6 +733,8 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
     lines = [f"🏆 Катка {round_no}: победа — **{side_name}**! {names}", cog.score_line(record)]
     if series_winner(record) is not None and series_winner(record, drop_last=True) is None:
         lines.append(f"🎉 **Серия Bo{record.get('series', DEFAULT_SERIES)} за {SERIES_WINNERS[side]}!**")
+    if bet_line:
+        lines.append(bet_line)
     announce = await interaction.followup.send("\n".join(lines), wait=True)
     await interaction.followup.send(
         "Записала в статистику. Ошиблись кнопкой — отмените:",
@@ -696,6 +746,84 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
         if len(players) >= 2:
             view = MvpView(stats_cog.stats, interaction.guild.id, game_id, round_no, players, set(winners))
             view.message = await interaction.followup.send(view.text(), view=view, wait=True)
+
+
+class BetView(discord.ui.View):
+    """Ставка на катку: сумма из списка и кнопка стороны. Видит только сам игрок."""
+
+    def __init__(self, wallets, guild_id: int, lobby_id: int, round_no: int, teams: list[list[int]],
+                 user_id: int) -> None:
+        super().__init__(timeout=300)
+        self.wallets = wallets
+        self.guild_id = guild_id
+        self.lobby_id = lobby_id
+        self.round_no = round_no
+        self.teams = teams
+        self.user_id = user_id
+        balance = wallets.balance(guild_id, user_id)
+        pool = wallets.pool(guild_id, lobby_id, round_no) or {"bets": {}}
+        current = pool["bets"].get(str(user_id))
+        available = balance + (current["amount"] if current else 0)
+        amounts = [a for a in bets.BET_AMOUNTS if a <= available]
+        if available > 0 and available not in amounts:
+            amounts.append(available)
+        self.amount = current["amount"] if current else (amounts[0] if amounts else 0)
+        select = discord.ui.Select(
+            placeholder="Сколько ставим?",
+            options=[
+                discord.SelectOption(
+                    label=f"{amount} коинов" + (" — всё" if amount == available else ""), value=str(amount),
+                    default=amount == self.amount,
+                )
+                for amount in amounts[:25]
+            ] or [discord.SelectOption(label="Коинов нет", value="0")],
+            disabled=not amounts,
+        )
+        select.callback = self.choose_amount
+        self.add_item(select)
+        mine = next((index for index, team in enumerate(teams) if user_id in team), None)
+        for side, (label, emoji, style) in enumerate((
+            ("На синих", "🔵", discord.ButtonStyle.primary), ("На красных", "🔴", discord.ButtonStyle.danger),
+        )):
+            button = discord.ui.Button(
+                label=label, emoji=emoji, style=style, disabled=not amounts or (mine is not None and mine != side),
+            )
+            button.callback = self._side_callback(side)
+            self.add_item(button)
+
+    def text(self, note: str = "") -> str:
+        pool = self.wallets.pool(self.guild_id, self.lobby_id, self.round_no) or {"bets": {}, "open_until": 0}
+        blue, red = self.wallets.totals(pool)
+        current = pool["bets"].get(str(self.user_id))
+        lines = [
+            f"💰 **Ставки на катку {self.round_no}** · закрытие <t:{int(pool['open_until'])}:R>",
+            f"Банк: 🔵 {blue} · 🔴 {red} коинов. У тебя: **{self.wallets.balance(self.guild_id, self.user_id)}**.",
+        ]
+        if current:
+            lines.append(f"Твоя ставка: {current['amount']} на {'🔵 синих' if current['side'] == 0 else '🔴 красных'}.")
+        lines.append("-# Победители забирают свою ставку и делят банк проигравших. Игроки ставят только на своих.")
+        if note:
+            lines.append(note)
+        return "\n".join(lines)
+
+    async def choose_amount(self, interaction: discord.Interaction) -> None:
+        self.amount = int(interaction.data["values"][0])
+        await interaction.response.defer()
+
+    def _side_callback(self, side: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            try:
+                self.wallets.place(
+                    self.guild_id, self.lobby_id, self.round_no, self.user_id, side, self.amount, self.teams,
+                )
+            except bets.BetError as error:
+                await interaction.response.edit_message(content=self.text(f"⚠️ {error}"), view=self)
+                return
+            await self.wallets.save()
+            await interaction.response.edit_message(content=self.text("✅ Ставка принята!"), view=None)
+            self.stop()
+
+        return callback
 
 
 class FinishView(discord.ui.View):
@@ -722,6 +850,7 @@ class FinishView(discord.ui.View):
         record["closed"] = True
         record["finished"] = True
         await self.cog.save()
+        await self.cog.refund_bets(interaction.guild.id, self.lobby_message.id)
         await interaction.response.edit_message(content="Кастомка завершена.", view=None)
         await self.lobby_message.edit(embed=self.cog.build_embed(interaction.guild, record), view=LobbyView(record))
         try:
@@ -740,6 +869,7 @@ class FinishView(discord.ui.View):
             draft.stop()
         reset_series(record)
         await self.cog.save()
+        await self.cog.refund_bets(interaction.guild.id, self.lobby_message.id)
         await interaction.response.edit_message(
             content="Составы сброшены: поправьте запись («Правка состава»), при желании режим — и снова «Запустить».",
             view=None,
@@ -763,6 +893,7 @@ def reset_series(record: dict) -> None:
     record["captains"] = None
     record["results"] = []
     record["round"] = 1
+    record["round_champs"] = {}
     record["stage"] = STAGE_SIGNUP
     record.pop("draft", None)
     record.pop("last_report_at", None)
@@ -788,6 +919,8 @@ class UndoResultView(discord.ui.View):
         stats_cog = interaction.client.get_cog("Stats")
         if stats_cog is not None:
             await stats_cog.stats.undo_game(interaction.guild.id, self.game_id)
+            stats_cog.wallets.unsettle_pool(interaction.guild.id, self.lobby_message.id, self.round_no)
+            await stats_cog.wallets.save()
         self.record["results"] = [r for r in self.record.get("results", []) if r.get("game") != self.game_id]
         # Номер катки откатываем, только если после этой отметки новых не было.
         if self.record.get("round") == self.round_no + 1:
@@ -1471,6 +1604,38 @@ class Lobby(commands.Cog):
         except discord.HTTPException:
             log.exception("Не удалось позвать поднятых из очереди")
 
+    async def open_bets(self, guild_id: int, lobby_id: int, record: dict) -> None:
+        stats_cog = self.bot.get_cog("Stats")
+        if stats_cog is None or record.get("kind") == KIND_SCRIM:
+            return
+        stats_cog.wallets.open_pool(guild_id, lobby_id, record.get("round", 1))
+        await stats_cog.wallets.save()
+
+    async def settle_bets(self, guild: discord.Guild, lobby_id: int, round_no: int, winner: int) -> str | None:
+        """Рассчитывает ставки катки, возвращает строку для объявления (или None, если ставок не было)."""
+        stats_cog = self.bot.get_cog("Stats")
+        if stats_cog is None:
+            return None
+        wallets = stats_cog.wallets
+        pool = wallets.pool(guild.id, lobby_id, round_no)
+        if not pool or not pool["bets"]:
+            return None
+        payouts = wallets.settle_pool(guild.id, lobby_id, round_no, winner)
+        await wallets.save()
+        if not payouts:
+            return "💸 Ставки: на победителей никто не ставил — банк сгорел."
+        parts = []
+        for uid, amount in sorted(payouts.items(), key=lambda item: -item[1])[:6]:
+            member = guild.get_member(int(uid))
+            profit = amount - pool["bets"][uid]["amount"]
+            parts.append(f"{player_name(member) if member else 'кто-то'} +{profit}")
+        return "💰 Ставки сыграли: " + ", ".join(parts)
+
+    async def refund_bets(self, guild_id: int, lobby_id: int) -> None:
+        stats_cog = self.bot.get_cog("Stats")
+        if stats_cog is not None and stats_cog.wallets.refund_lobby(guild_id, lobby_id):
+            await stats_cog.wallets.save()
+
     @staticmethod
     def score_line(record: dict) -> str:
         blue, red = series_score(record)
@@ -1555,8 +1720,11 @@ class Lobby(commands.Cog):
         record["deal"] = self.pack_deal(lanes, champions)
         record["round"] = 1
         record["results"] = []
+        record["round_champs"] = {}
+        remember_round_champions(record, champions)
         record["stage"] = STAGE_DONE
         await self.save()
+        await self.open_bets(message.guild.id, message.id, record)
         try:
             await message.edit(embed=self.build_embed(message.guild, record), view=LobbyView(record))
         except discord.HTTPException:
@@ -1620,11 +1788,19 @@ class Lobby(commands.Cog):
             name for names in ((record.get("deal") or {}).get("champions") or {}).values() for name in names
         }
         lanes, notes = self.assign_team_lanes(teams, mode["lanes"], previous=self.deal_lanes(record))
-        champions, champion_notes = await self.deal_for(teams, lanes, mode, exclude=previous)
+        banned = fearless_used(record) if config.FEARLESS_DRAFT else set()
+        champions, champion_notes = await self.deal_for(teams, lanes, mode, exclude=previous, banned=banned)
+        if banned and mode["champs"] != modes.CHAMPS_FREE:
+            notes.append(
+                f"Fearless: {len(banned)} чемпионов прошлых каток серии в раздаче нет — их не берёт никто, "
+                "даже если соперники забанили твоих."
+            )
 
         # Номер катки двигает отметка победителя, а не раздача: переразадать можно и посреди катки.
         record["deal"] = self.pack_deal(lanes, champions)
+        remember_round_champions(record, champions)
         await self.save()
+        await self.open_bets(guild.id, message.id, record)
         try:
             await message.edit(embed=self.build_embed(guild, record), view=LobbyView(record))
         except discord.HTTPException:
@@ -1703,8 +1879,10 @@ class Lobby(commands.Cog):
         lanes: dict[int, str],
         mode: dict,
         exclude: set[str] | frozenset[str] = frozenset(),
+        banned: set[str] | frozenset[str] = frozenset(),
     ) -> tuple[dict, list[str]]:
-        """Чемпионы по режиму. exclude — имена, которые не выдавать (чемпионы прошлой катки)."""
+        """Чемпионы по режиму. exclude — имена, которые лучше не выдавать (чемпионы прошлой раздачи; если без них
+        останется мало — выдаются). banned — нельзя никогда (fearless: чемпионы прошлых каток серии)."""
         if mode["champs"] == modes.CHAMPS_FREE:
             return {}, []
         try:
@@ -1712,6 +1890,8 @@ class Lobby(commands.Cog):
         except ChampionsUnavailable:
             log.exception("Не удалось получить список чемпионов для раздачи")
             return {}, ["Список чемпионов сейчас недоступен (Riot Data Dragon не отвечает) — выберите чемпионов сами."]
+        if banned:
+            pool = [champion for champion in pool if champion.name not in banned]
         if exclude:
             fresh = [champion for champion in pool if champion.name not in exclude]
             # Если без прошлых чемпионов останется совсем мало — раздаём из всех.
