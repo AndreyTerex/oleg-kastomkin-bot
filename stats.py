@@ -325,3 +325,30 @@ def main_rivalry(games: list[dict], min_games: int = 3) -> tuple[int, int, int, 
     if wins_a + wins_b < min_games:
         return None
     return a, b, wins_a, wins_b
+
+
+def best_partner(games: list[dict], user_id: int, min_games: int = 2) -> tuple[int, int, int] | None:
+    """С кем в одной команде чаще всего побеждает: (id, побед вместе, каток вместе)."""
+    together: dict[int, list[int]] = {}
+    for game in games:
+        for team, won in ((game["winners"], True), (game["losers"], False)):
+            if user_id not in team:
+                continue
+            for other in team:
+                if other != user_id:
+                    score = together.setdefault(other, [0, 0])
+                    score[0] += int(won)
+                    score[1] += 1
+    candidates = [(other, wins, total) for other, (wins, total) in together.items() if total >= min_games]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[1] / item[2], item[1]))
+
+
+def player_games(games: list[dict], user_id: int) -> list[tuple[bool, float]]:
+    """Катки игрока по порядку: (победил ли, изменение Elo)."""
+    result = []
+    for game in sorted(games, key=lambda g: g["id"]):
+        if user_id in game["winners"] or user_id in game["losers"]:
+            result.append((user_id in game["winners"], (game.get("elo") or {}).get(str(user_id), 0.0)))
+    return result
