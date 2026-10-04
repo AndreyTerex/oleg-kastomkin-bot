@@ -60,11 +60,12 @@ CUSTOM_ID_MODE = "lol:lobby:mode"
 CUSTOM_ID_CANCEL = "lol:lobby:close"
 CUSTOM_ID_WIN_BLUE = "lol:lobby:win:blue"
 CUSTOM_ID_WIN_RED = "lol:lobby:win:red"
+CUSTOM_ID_FINISH = "lol:lobby:finish"
 
 # Кнопки, которые нужны только внутренней кастомке.
 CUSTOM_GAME_ONLY = frozenset({
     CUSTOM_ID_MODE, CUSTOM_ID_CAPTAINS, CUSTOM_ID_DRAFT, CUSTOM_ID_REROLL, CUSTOM_ID_MOVE,
-    CUSTOM_ID_WIN_BLUE, CUSTOM_ID_WIN_RED,
+    CUSTOM_ID_WIN_BLUE, CUSTOM_ID_WIN_RED, CUSTOM_ID_FINISH,
 })
 
 CANCEL_LABELS = {
@@ -295,6 +296,11 @@ class LobbyView(discord.ui.View):
                 child.disabled = not has_teams
             elif custom_id == CUSTOM_ID_MOVE:
                 child.disabled = not has_teams
+            elif custom_id == CUSTOM_ID_FINISH:
+                if not has_teams:
+                    self.remove_item(child)
+                    continue
+                child.disabled = False
             elif custom_id in (CUSTOM_ID_WIN_BLUE, CUSTOM_ID_WIN_RED):
                 # До деления на команды отмечать нечего — не занимаем место в посте.
                 if not has_teams:
@@ -432,6 +438,25 @@ class LobbyView(discord.ui.View):
     )
     async def win_red(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._report(interaction, 1)
+
+    @discord.ui.button(
+        label="Завершить", emoji="🏁", style=discord.ButtonStyle.secondary, custom_id=CUSTOM_ID_FINISH, row=3
+    )
+    async def finish(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        cog: "Lobby" = interaction.client.get_cog("Lobby")
+        record = cog.get_record(interaction.message.id)
+        if record is None:
+            await respond(interaction, "Этот сбор больше не отслеживается.")
+            return
+        if not cog.is_organizer(interaction, record):
+            await respond(interaction, "Завершить кастомку может автор сбора или организатор ивентов.")
+            return
+        played = len(record.get("results") or [])
+        await interaction.response.send_message(
+            f"Сыграно каток: **{played}** из Bo{record.get('series', DEFAULT_SERIES)}. "
+            "Отмеченные катки остаются в статистике. Что делаем?",
+            view=FinishView(cog, interaction.message), ephemeral=True,
+        )
 
     async def _report(self, interaction: discord.Interaction, side: int) -> None:
         await report_result(interaction, interaction.message.id, side)
@@ -671,6 +696,76 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
         if len(players) >= 2:
             view = MvpView(stats_cog.stats, interaction.guild.id, game_id, round_no, players, set(winners))
             view.message = await interaction.followup.send(view.text(), view=view, wait=True)
+
+
+class FinishView(discord.ui.View):
+    """Досрочное завершение: закрыть кастомку совсем или сбросить составы и собрать их заново."""
+
+    def __init__(self, cog: "Lobby", lobby_message: discord.Message) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.lobby_message = lobby_message
+
+    async def _record(self, interaction: discord.Interaction) -> dict | None:
+        record = self.cog.get_record(self.lobby_message.id)
+        if record is None or record.get("closed"):
+            await interaction.response.edit_message(content="Сбор уже закрыт.", view=None)
+            return None
+        return record
+
+    @discord.ui.button(label="Завершить кастомку", emoji="🏁", style=discord.ButtonStyle.danger)
+    async def close_lobby(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        record = await self._record(interaction)
+        if record is None:
+            return
+        score = self.cog.score_line(record) if record.get("results") else "Каток не отмечено."
+        record["closed"] = True
+        record["finished"] = True
+        await self.cog.save()
+        await interaction.response.edit_message(content="Кастомка завершена.", view=None)
+        await self.lobby_message.edit(embed=self.cog.build_embed(interaction.guild, record), view=LobbyView(record))
+        try:
+            await interaction.followup.send(f"🏁 Кастомка завершена досрочно. {score}")
+        except discord.HTTPException:
+            log.warning("Не удалось объявить завершение кастомки")
+        self.stop()
+
+    @discord.ui.button(label="Пересобрать составы", emoji="🔄", style=discord.ButtonStyle.primary)
+    async def rebuild(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        record = await self._record(interaction)
+        if record is None:
+            return
+        draft = self.cog.drafts.pop(self.lobby_message.id, None)
+        if draft is not None:
+            draft.stop()
+        reset_series(record)
+        await self.cog.save()
+        await interaction.response.edit_message(
+            content="Составы сброшены: поправьте запись («Правка состава»), при желании режим — и снова «Запустить».",
+            view=None,
+        )
+        await self.lobby_message.edit(embed=self.cog.build_embed(interaction.guild, record), view=LobbyView(record))
+        self.stop()
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def keep(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Ничего не трогаю — играем дальше.", view=None)
+        self.stop()
+
+
+def reset_series(record: dict) -> None:
+    """Новая серия в том же сборе: составы, раздача и счёт сбрасываются, запись игроков остаётся.
+    Сыгранная серия уходит в историю сбора; катки из статистики не удаляются."""
+    if record.get("results"):
+        record.setdefault("past_series", []).append(list(record["results"]))
+    record["teams"] = None
+    record["deal"] = None
+    record["captains"] = None
+    record["results"] = []
+    record["round"] = 1
+    record["stage"] = STAGE_SIGNUP
+    record.pop("draft", None)
+    record.pop("last_report_at", None)
 
 
 class UndoResultView(discord.ui.View):
@@ -1684,7 +1779,7 @@ class Lobby(commands.Cog):
         if kind != KIND_SCRIM:
             title += f" · Bo{series}"
         if closed:
-            title += " · отменён"
+            title += " · завершён" if record.get("finished") else " · отменён"
 
         # Крупно — когда; мелким серым — подробности: так карточка читается с одного взгляда.
         start_at = record.get("start_at")
@@ -1756,7 +1851,7 @@ class Lobby(commands.Cog):
             embed.timestamp = datetime.fromtimestamp(start_at, tz=timezone.utc)
 
         if closed:
-            footer = "Сбор отменён"
+            footer = "Кастомка завершена — результаты в /stats" if record.get("finished") else "Сбор отменён"
         elif len(teams) == 2:
             footer = "Составы готовы — можно раскидать по каналам"
             footer += f" · катка {record.get('round', 1)}: после игры отметьте победителя"
