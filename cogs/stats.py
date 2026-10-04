@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
+from bets import Wallets
 from stats import Stats, main_rivalry, plural, rivals, week_highlights, week_lines
 from storage import JsonStore
 from utils import NEUTRAL, player_name, respond
@@ -77,10 +78,12 @@ class StatsCog(commands.Cog, name="Stats"):
         self.bot = bot
         self.stats = Stats(Path(config.DATA_DIR) / "stats.json")
         self.recaps = JsonStore(Path(config.DATA_DIR) / "recap.json")
+        self.wallets = Wallets()
 
     async def cog_load(self) -> None:
         self.stats.load()
         self.recaps.load()
+        self.wallets.load()
         self.recap_loop.start()
 
     async def cog_unload(self) -> None:
@@ -222,6 +225,35 @@ class StatsCog(commands.Cog, name="Stats"):
             if other_id == user_id:
                 return index
         return None
+
+    @app_commands.command(name="coins", description="Твои Олежкины коины (раз в сутки — бонус)")
+    @app_commands.guild_only()
+    async def coins(self, interaction: discord.Interaction) -> None:
+        bonus = self.wallets.claim_daily(interaction.guild.id, interaction.user.id)
+        await self.wallets.save()
+        balance = self.wallets.balance(interaction.guild.id, interaction.user.id)
+        text = f"💰 У тебя **{balance}** Олежкиных коинов."
+        if bonus:
+            text += f" Сегодняшний бонус +{bonus} уже на счету ♡"
+        else:
+            text += " Бонус сегодня уже был — приходи завтра~"
+        text += "\n-# Ставки — кнопкой «💰 Ставка» в посте кастомки, после раздачи."
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @app_commands.command(name="richest", description="Самые богатые по Олежкиным коинам")
+    @app_commands.guild_only()
+    async def richest(self, interaction: discord.Interaction) -> None:
+        rows = self.wallets.richest(interaction.guild.id)
+        if not rows:
+            await respond(interaction, "Пока никто не ставил — кошельки пусты.")
+            return
+        lines = []
+        for index, (user_id, coins) in enumerate(rows, start=1):
+            member = interaction.guild.get_member(user_id)
+            prefix = MEDALS[index - 1] if index <= len(MEDALS) else f"`{index}.`"
+            lines.append(f"{prefix} **{player_name(member) if member else f'<@{user_id}>'}** — {coins} 💰")
+        embed = discord.Embed(title="💰 Богачи сервера", description="\n".join(lines), color=NEUTRAL)
+        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="leaderboard", description="Таблица лидеров: все игроки по Elo, и кто сыграл меньше 3 каток")
     @app_commands.guild_only()

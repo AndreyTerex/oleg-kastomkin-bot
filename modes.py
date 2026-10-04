@@ -406,6 +406,13 @@ def deal_champions(
 
 def champion_rules(how: str) -> list[str]:
     """Правила выбора чемпионов для раздачи: баны бот не видит, поэтому они прописаны текстом."""
+    rules = _champion_rules(how)
+    if rules and config.FEARLESS_DRAFT and how != CHAMPS_MIRROR:
+        rules.append("**Fearless:** чемпионы этой катки не выпадут и недоступны никому до конца серии.")
+    return rules
+
+
+def _champion_rules(how: str) -> list[str]:
     if how == CHAMPS_CHOICE:
         return [
             "Каждый берёт одного чемпиона из своей тройки. Лобби — «Турнирный драфт», баны обычные.",
