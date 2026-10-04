@@ -203,6 +203,16 @@ LOBBY_INVITE_HOUR: int = min(22, _env_int("LOBBY_INVITE_HOUR", 17))
 RIOT_API_KEY: str = os.getenv("RIOT_API_KEY", "").strip()
 RIOT_PLATFORM: str = os.getenv("RIOT_PLATFORM", "ru").strip().lower() or "ru"
 RIOT_REGION: str = os.getenv("RIOT_REGION", "europe").strip().lower() or "europe"
+# Викторина в чате: канал (пусто — канал объявлений), как часто (минуты, 0 — только по /quiz), в какие часы,
+# сколько секунд на ответ, сколько коинов за верный ответ и сколько минут канал считается «живым» после сообщения.
+QUIZ_CHANNEL_ID: int = _env_int("QUIZ_CHANNEL_ID")
+QUIZ_MINUTES: int = max(0, _env_int("QUIZ_MINUTES", 45))
+QUIZ_HOURS: str = os.getenv("QUIZ_HOURS", "12-24").strip() or "12-24"
+QUIZ_ANSWER_SECONDS: int = max(20, _env_int("QUIZ_ANSWER_SECONDS", 60))
+QUIZ_COINS: int = max(0, _env_int("QUIZ_COINS", 50))
+QUIZ_ACTIVE_MINUTES: int = max(5, _env_int("QUIZ_ACTIVE_MINUTES", 120))
+# Патчноуты после обновлений бота: 1 — писать в канал объявлений, 0 — нет.
+PATCH_NOTES: bool = os.getenv("PATCH_NOTES", "1").strip().lower() not in ("0", "false", "no", "off")
 # Fearless-драфт: чемпионы прошлых каток серии не выпадают и недоступны никому. 0 — выключить.
 FEARLESS_DRAFT: bool = os.getenv("FEARLESS_DRAFT", "1").strip().lower() not in ("0", "false", "no", "off")
 # Сколько минут после раздачи принимаются ставки на катку.

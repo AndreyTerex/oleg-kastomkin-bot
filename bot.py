@@ -17,7 +17,7 @@ from utils import WARNING, respond
 
 log = logging.getLogger("scrimbot")
 
-EXTENSIONS = ("cogs.roles", "cogs.scrim", "cogs.stats", "cogs.lobby", "cogs.extras", "cogs.chat", "cogs.vpn_admin", "cogs.ops", "cogs.matchday", "cogs.sync", "cogs.profile")
+EXTENSIONS = ("cogs.roles", "cogs.scrim", "cogs.stats", "cogs.lobby", "cogs.extras", "cogs.chat", "cogs.vpn_admin", "cogs.ops", "cogs.matchday", "cogs.sync", "cogs.profile", "cogs.quiz", "cogs.patchnotes")
 
 
 class ScrimBot(commands.Bot):
