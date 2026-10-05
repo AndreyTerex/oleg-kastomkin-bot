@@ -212,6 +212,10 @@ PATCH_NOTES: bool = os.getenv("PATCH_NOTES", "1").strip().lower() not in ("0", "
 FEARLESS_DRAFT: bool = os.getenv("FEARLESS_DRAFT", "1").strip().lower() not in ("0", "false", "no", "off")
 # Сколько минут после раздачи принимаются ставки на катку.
 BET_MINUTES: int = max(1, _env_int("BET_MINUTES", 10))
+# Дуэли (/duel): сколько часов ждать катки, где дуэлянты окажутся в разных командах, потом коины возвращаются.
+DUEL_HOURS: int = max(1, _env_int("DUEL_HOURS", 24))
+# Охота на голову: столько коинов каждому, кто обыграл лидера таблицы по Elo. 0 — выключить.
+BOUNTY_COINS: int = max(0, _env_int("BOUNTY_COINS", 100))
 # Сколько минут идёт голосование за MVP после отмеченной катки (до 14 — дольше Discord не даёт
 # обновить сообщение). 0 — не голосовать.
 MVP_VOTE_MINUTES: int = min(14, max(0, _env_int("MVP_VOTE_MINUTES", 10)))

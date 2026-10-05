@@ -73,9 +73,10 @@ class InviteView(discord.ui.View):
 class ResultView(discord.ui.View):
     """Подтверждение результата по скриншоту. Права проверяет report_result (автор сбора/организатор)."""
 
-    def __init__(self, lobby_id: int, guess: int | None) -> None:
+    def __init__(self, lobby_id: int, guess: int | None, round_no: int | None = None) -> None:
         super().__init__(timeout=30 * 60)
         self.lobby_id = lobby_id
+        self.round_no = round_no
         blue = discord.ui.Button(
             label="Победили синие", emoji="🔵",
             style=discord.ButtonStyle.primary if guess == 0 else discord.ButtonStyle.secondary,
@@ -85,8 +86,8 @@ class ResultView(discord.ui.View):
             style=discord.ButtonStyle.danger if guess == 1 else discord.ButtonStyle.secondary,
         )
         skip = discord.ui.Button(label="Не записывать", style=discord.ButtonStyle.secondary)
-        blue.callback = lambda interaction: report_result(interaction, self.lobby_id, 0)
-        red.callback = lambda interaction: report_result(interaction, self.lobby_id, 1)
+        blue.callback = lambda interaction: report_result(interaction, self.lobby_id, 0, self.round_no)
+        red.callback = lambda interaction: report_result(interaction, self.lobby_id, 1, self.round_no)
         skip.callback = self.skip
         for button in (blue, red, skip):
             self.add_item(button)
@@ -286,7 +287,7 @@ class Matchday(commands.Cog):
                 lines.append(comment)
         lines.append("-# Записывает результат автор сбора или организатор.")
         await message.reply(
-            "\n".join(lines), view=ResultView(lobby_id, guess),
+            "\n".join(lines), view=ResultView(lobby_id, guess, record.get("round", 1)),
             mention_author=False, allowed_mentions=discord.AllowedMentions.none(),
         )
         log.info("Скриншот итогов в #%s разобран (%s), победа: %s", message.channel, reply.model, guess)

@@ -32,6 +32,8 @@ CORRECT_LINES = (
     "{who} угадал(а)! {answer}, конечно~ +{coins} 💰",
     "Ну всё, {who} — знаток! Это {answer} (≧▽≦) +{coins} коинов",
 )
+# /quiz не чаще раза в столько секунд на канал — иначе коины фармятся вопросами подряд.
+MANUAL_COOLDOWN = 5 * 60
 TIMEOUT_LINES = (
     "Никто не угадал (｡•́︿•̀｡) Это был **{answer}**!",
     "Время вышло~ Правильный ответ — **{answer}**. Учим чемпионов, солнышки!",
@@ -63,6 +65,8 @@ class Quiz(commands.Cog):
         self.store = JsonStore(Path(config.DATA_DIR) / "quiz.json")
         self.active: dict[int, Active] = {}
         self.activity: dict[int, float] = {}
+        self.asking: set[int] = set()
+        self.last_manual: dict[int, float] = {}
         self._session: aiohttp.ClientSession | None = None
         self._catalog: tuple[str | None, dict] = (None, {})
 
@@ -153,6 +157,16 @@ class Quiz(commands.Cog):
         await self.bot.wait_until_ready()
 
     async def ask(self, channel) -> bool:
+        # Пока вопрос собирается (сеть), второй /quiz или цикл не должны задать ещё один в тот же канал.
+        if channel.id in self.asking or channel.id in self.active:
+            return False
+        self.asking.add(channel.id)
+        try:
+            return await self._ask(channel)
+        finally:
+            self.asking.discard(channel.id)
+
+    async def _ask(self, channel) -> bool:
         try:
             question = await self.make_question()
         except (aiohttp.ClientError, ChampionsUnavailable, TimeoutError, KeyError) as error:
@@ -229,12 +243,22 @@ class Quiz(commands.Cog):
     @app_commands.command(name="quiz", description="Викторина: Олежка загадает чемпиона прямо сейчас")
     @app_commands.guild_only()
     async def quiz_now(self, interaction: discord.Interaction) -> None:
-        if interaction.channel_id in self.active:
+        channel_id = interaction.channel_id
+        if channel_id in self.active or channel_id in self.asking:
             await respond(interaction, "Вопрос уже висит — отвечайте в чат!")
             return
+        wait = MANUAL_COOLDOWN - (time.time() - self.last_manual.get(channel_id, 0))
+        if wait > 0:
+            await respond(interaction, f"Дай передохнуть~ Следующий вопрос можно <t:{int(time.time() + wait)}:R>.")
+            return
+        self.last_manual[channel_id] = time.time()
         await interaction.response.send_message("Загадываю… 🤔", ephemeral=True)
         if not await self.ask(interaction.channel):
-            await interaction.followup.send("Не получилось собрать вопрос — Data Dragon не отвечает.", ephemeral=True)
+            self.last_manual.pop(channel_id, None)
+            await interaction.followup.send(
+                "Не получилось задать вопрос: Data Dragon не отвечает или мне нельзя писать в этот канал.",
+                ephemeral=True,
+            )
 
     @app_commands.command(name="quiz-top", description="Лучшие знатоки викторины")
     @app_commands.guild_only()

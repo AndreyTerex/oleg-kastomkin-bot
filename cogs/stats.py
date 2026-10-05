@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
-from bets import Wallets
+from bets import BetError, Wallets
 from stats import Stats, main_rivalry, plural, rivals, week_highlights, week_lines
 from storage import JsonStore
 from utils import NEUTRAL, player_name, respond
@@ -26,6 +26,61 @@ MEDALS = ("🥇", "🥈", "🥉")
 RECAP_MIN_GAMES = 3
 RECENT_GAMES = 5
 WEEK = 7 * 86400
+DUEL_ACCEPT_SECONDS = 10 * 60
+
+
+class DuelView(discord.ui.View):
+    """Вызов на дуэль: принять или отказаться может только вызванный."""
+
+    def __init__(self, wallets: Wallets, guild_id: int, challenger: discord.Member, opponent: discord.Member,
+                 amount: int) -> None:
+        super().__init__(timeout=DUEL_ACCEPT_SECONDS)
+        self.wallets = wallets
+        self.guild_id = guild_id
+        self.challenger = challenger
+        self.opponent = opponent
+        self.amount = amount
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.opponent.id:
+            await interaction.response.send_message("Вызов не тебе~ Хочешь подраться — /duel.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Принять", emoji="⚔️", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        try:
+            self.wallets.start_duel(self.guild_id, self.challenger.id, self.opponent.id, self.amount)
+        except BetError as error:
+            await interaction.response.send_message(f"⚠️ {error}", ephemeral=True)
+            return
+        await self.wallets.save()
+        self.stop()
+        until = int(time.time() + config.DUEL_HOURS * 3600)
+        await interaction.response.edit_message(
+            content=(
+                f"⚔️ **Дуэль принята!** {player_name(self.challenger)} против {player_name(self.opponent)}, "
+                f"на кону {self.amount * 2} коинов. Решит ближайшая катка, где вы в разных командах "
+                f"(до <t:{until}:R>, иначе коины вернутся)."
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="Струсить", emoji="🐔", style=discord.ButtonStyle.secondary)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"🐔 {player_name(self.opponent)} отказался(ась) от дуэли с {player_name(self.challenger)}.",
+            view=None,
+        )
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            try:
+                await self.message.edit(content=f"⌛ {player_name(self.opponent)} так и не ответил(а) на вызов.", view=None)
+            except discord.HTTPException:
+                pass
 
 
 def recent_line(won: bool, delta: float, at: float) -> str:
@@ -102,6 +157,8 @@ class StatsCog(commands.Cog, name="Stats"):
     async def recap_loop(self) -> None:
         now = datetime.now(config.TIMEZONE)
         for guild in self.bot.guilds:
+            if self.wallets.expire_duels(guild.id):
+                await self.wallets.save()
             posted = self.recaps.data.get(str(guild.id))
             if not recap_due(now, posted):
                 continue
@@ -237,8 +294,38 @@ class StatsCog(commands.Cog, name="Stats"):
             text += f" Сегодняшний бонус +{bonus} уже на счету ♡"
         else:
             text += " Бонус сегодня уже был — приходи завтра~"
-        text += "\n-# Ставки — кнопкой «💰 Ставка» в посте кастомки, после раздачи."
+        duels = self.wallets.active_duels(interaction.guild.id, interaction.user.id)
+        if duels:
+            def other(duel: dict) -> str:
+                member = interaction.guild.get_member(duel["b"] if duel["a"] == interaction.user.id else duel["a"])
+                return player_name(member) if member else "кто-то"
+
+            text += "\n⚔️ Дуэли: " + ", ".join(f"с {other(d)} на {d['amount']}" for d in duels)
+        text += "\n-# Ставки — кнопкой «💰 Ставка» в посте кастомки, после раздачи. Дуэль 1 на 1 — /duel."
         await interaction.response.send_message(text, ephemeral=True)
+
+    @app_commands.command(name="duel", description="Вызвать игрока на дуэль на коины: решит ближайшая катка друг против друга")
+    @app_commands.describe(player="Кого вызываешь", amount="Сколько коинов ставит каждый")
+    @app_commands.guild_only()
+    async def duel(
+        self, interaction: discord.Interaction, player: discord.Member, amount: app_commands.Range[int, 10, 100_000],
+    ) -> None:
+        guild_id = interaction.guild.id
+        if player.bot or player.id == interaction.user.id:
+            await respond(interaction, "Дуэль — только с живым соперником, не с собой и не с ботом~")
+            return
+        for user_id in (interaction.user.id, player.id):
+            if self.wallets.balance(guild_id, user_id) < amount:
+                who = "тебя" if user_id == interaction.user.id else player_name(player)
+                await respond(interaction, f"У {who} не хватает коинов: есть {self.wallets.balance(guild_id, user_id)}.")
+                return
+        view = DuelView(self.wallets, guild_id, interaction.user, player, amount)
+        await interaction.response.send_message(
+            f"⚔️ {player.mention}, **{player_name(interaction.user)}** вызывает тебя на дуэль на **{amount}** коинов! "
+            "Победит тот, чья команда выиграет ближайшую катку, где вы друг против друга.",
+            view=view, allowed_mentions=discord.AllowedMentions(users=[player]),
+        )
+        view.message = await interaction.original_response()
 
     @app_commands.command(name="richest", description="Самые богатые по Олежкиным коинам")
     @app_commands.guild_only()
