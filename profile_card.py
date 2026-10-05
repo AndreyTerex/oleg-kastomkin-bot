@@ -35,7 +35,6 @@ class CardData:
     mvp: int = 0
     place: int | None = None
     coins: int | None = None
-    rank: str = ""
     lanes: str = ""
     elo_history: list[float] = field(default_factory=list)
     form: list[bool] = field(default_factory=list)
@@ -86,10 +85,10 @@ def render(card: CardData) -> bytes:
     draw = ImageDraw.Draw(image)
     big, mid, small, tiny = _font(46, True), _font(28, True), _font(22), _font(18)
 
-    # Шапка: аватар, имя, ранг и линии.
+    # Шапка: аватар, имя и линии.
     image.paste(_avatar(card.avatar, 140), (40, 36), _avatar(card.avatar, 140))
     draw.text((205, 50), _fit(draw, card.name, big, 760), font=big, fill=TEXT)
-    subtitle = " · ".join(part for part in (card.rank, card.lanes) if part) or "ранг не привязан — /link"
+    subtitle = card.lanes or "линии не отмечены"
     draw.text((207, 115), _fit(draw, subtitle, small, 760), font=small, fill=MUTED)
     if card.place:
         draw.text((207, 148), f"#{card.place} на сервере по Elo", font=small, fill=GOLD)

@@ -20,9 +20,9 @@ import bets
 import config
 import modes
 import portraits
-import riot
 from champions import POOL, ChampionsUnavailable
 from cogs.scrim import DraftView
+from stats import ELO_START, expected_score
 from storage import JsonStore
 from timeparse import parse_when
 from utils import BLUE_SIDE, NEUTRAL, RED_SIDE, format_players, lanes_badge, player_name, respond, shuffled
@@ -114,6 +114,8 @@ SERIES_CHOICES = [
 SERIES_WINNERS = ("🔵 синими", "🔴 красными")
 # Две отметки подряд быстрее этого — почти наверняка двойной клик.
 REPORT_COOLDOWN = 20
+# Победа при прогнозе не выше этого — апсет.
+UPSET_CHANCE = 0.4
 
 
 def series_score(record: dict, *, drop_last: bool = False) -> tuple[int, int]:
@@ -151,6 +153,38 @@ def fearless_used(record: dict) -> set[str]:
         name for round_no, names in (record.get("round_champs") or {}).items()
         if int(round_no) < current for name in names
     }
+
+
+def bet_round(record: dict, round_no: int | None = None) -> int | str:
+    """Ключ пула ставок катки. Новая серия в том же сборе (пересбор, повторный запуск) — свои пулы,
+    иначе катка 1 новой серии попала бы в уже рассчитанный пул прошлой."""
+    round_no = record.get("round", 1) if round_no is None else round_no
+    series_no = record.get("series_no", 0)
+    return f"{series_no}.{round_no}" if series_no else round_no
+
+
+def win_chance(stats, guild_id: int, teams: list[list[int]]) -> float:
+    """Шанс синих по среднему Elo команд — «предсказание Олежки»."""
+    def average(team: list[int]) -> float:
+        return sum(stats.player(guild_id, user_id).elo for user_id in team) / len(team) if team else ELO_START
+
+    return expected_score(average(teams[0]), average(teams[1]))
+
+
+def prediction_line(chance_blue: float) -> str:
+    if abs(chance_blue - 0.5) < 0.05:
+        return f"🔮 Прогноз Олежки: монетка — 🔵 {chance_blue:.0%} : {1 - chance_blue:.0%} 🔴"
+    favourite = "🔵 синие" if chance_blue > 0.5 else "🔴 красные"
+    return f"🔮 Прогноз Олежки: {favourite} — {max(chance_blue, 1 - chance_blue):.0%}"
+
+
+def result_comment(chance_won: float) -> str | None:
+    """Комментарий к результату относительно прогноза: апсет или «как я и говорила»."""
+    if chance_won <= UPSET_CHANCE:
+        return f"🚨 **Апсет!** Олежка давала победителям всего {chance_won:.0%} — вот это камбэк!"
+    if chance_won >= 0.65:
+        return f"🔮 Как Олежка и предсказывала ({chance_won:.0%})~"
+    return None
 
 
 def set_waiting(record: dict, user_id: int, waiting: bool) -> None:
@@ -479,12 +513,12 @@ class LobbyView(discord.ui.View):
             return
         wallets = stats_cog.wallets
         round_no = record.get("round", 1)
-        pool = wallets.pool(interaction.guild.id, interaction.message.id, round_no)
+        pool = wallets.pool(interaction.guild.id, interaction.message.id, bet_round(record))
         if pool is None or pool.get("settled") is not None or time.time() > pool["open_until"]:
             await respond(interaction, f"Ставки на катку {round_no} уже не принимаются — ждите следующую раздачу.")
             return
         view = BetView(wallets, interaction.guild.id, interaction.message.id, round_no, record["teams"],
-                       interaction.user.id)
+                       interaction.user.id, pool_round=bet_round(record))
         await interaction.response.send_message(view.text(), view=view, ephemeral=True)
 
     async def _finish(self, interaction: discord.Interaction) -> None:
@@ -564,6 +598,7 @@ class LobbyView(discord.ui.View):
         await interaction.response.defer()
         teams, lanes, champions, notes = await cog.run_mode(players[:target], mode)
 
+        await cog.start_series(interaction.guild.id, interaction.message.id, record)
         record["captains"] = None
         record["teams"] = [[member.id for member in team] for team in teams]
         record["teams_at"] = time.time()
@@ -681,8 +716,12 @@ class LobbyView(discord.ui.View):
         )
 
 
-async def report_result(interaction: discord.Interaction, lobby_id: int, side: int) -> None:
-    """Записать победу стороны в сборе lobby_id: кнопкой в посте сбора или подтверждением по скриншоту."""
+async def report_result(
+    interaction: discord.Interaction, lobby_id: int, side: int, expect_round: int | None = None,
+) -> None:
+    """Записать победу стороны в сборе lobby_id: кнопкой в посте сбора или подтверждением по скриншоту.
+
+    expect_round — катка, к которой относится скриншот: если её уже отметили, вторая отметка не пишется."""
     cog: "Lobby" = interaction.client.get_cog("Lobby")
     record = cog.get_record(lobby_id)
     if record is None:
@@ -695,6 +734,11 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
         await respond(interaction, "Составов нет — отмечать нечего.")
         return
     round_no = record.get("round", 1)
+    if expect_round is not None and expect_round != round_no:
+        await interaction.response.edit_message(
+            content=f"Катку {expect_round} уже записали — этот скриншот больше не нужен.", view=None,
+        )
+        return
     if time.time() - record.get("last_report_at", 0) < REPORT_COOLDOWN:
         # Защита от двойного клика: катки не длятся секунды.
         await respond(interaction, f"Катку {round_no - 1} только что записала. Если это следующая — нажмите через пару секунд.")
@@ -705,6 +749,12 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
         return
 
     winners, losers = record["teams"][side], record["teams"][1 - side]
+    pool_round = bet_round(record, round_no)
+    # Прогноз и лидер — по Elo до этой катки.
+    chance_blue = win_chance(stats_cog.stats, interaction.guild.id, record["teams"])
+    chance_won = chance_blue if side == 0 else 1 - chance_blue
+    ranking = stats_cog.ranking(interaction.guild.id)
+    leader = ranking[0][0] if len(ranking) >= 3 else None
     # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
     record["last_report_at"] = time.time()
     record["round"] = round_no + 1
@@ -714,7 +764,10 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
     )
     record.setdefault("results", []).append({"round": round_no, "winner": side, "game": game_id})
     await cog.save()
-    bet_line = await cog.settle_bets(interaction.guild, lobby_id, round_no, side)
+    bet_line = await cog.settle_bets(interaction.guild, lobby_id, pool_round, side)
+    bounty = config.BOUNTY_COINS if leader is not None and leader in losers else 0
+    extra_lines = cog.settle_extras(interaction.guild, game_id, list(winners), list(losers), leader, bounty)
+    await stats_cog.wallets.save()
     side_name = (BLUE_SIDE, RED_SIDE)[side]
     if interaction.message is not None and interaction.message.id == lobby_id:
         lobby_message = interaction.message
@@ -734,14 +787,18 @@ async def report_result(interaction: discord.Interaction, lobby_id: int, side: i
     lines = [f"🏆 Катка {round_no}: победа — **{side_name}**! {names}", cog.score_line(record)]
     if series_winner(record) is not None and series_winner(record, drop_last=True) is None:
         lines.append(f"🎉 **Серия Bo{record.get('series', DEFAULT_SERIES)} за {SERIES_WINNERS[side]}!**")
+    comment = result_comment(chance_won)
+    if comment:
+        lines.append(comment)
     if bet_line:
         lines.append(bet_line)
-    announce = await interaction.followup.send("\n".join(lines), wait=True)
-    await interaction.followup.send(
-        "Записала в статистику. Ошиблись кнопкой — отмените:",
-        view=UndoResultView(cog, record, lobby_message, game_id, round_no, announce),
-        ephemeral=True,
+    lines += extra_lines
+    announce = await interaction.followup.send(
+        "\n".join(lines), wait=True, allowed_mentions=discord.AllowedMentions.none(),
     )
+    undo = UndoResultView(cog, record, lobby_message, game_id, round_no, announce, pool_round)
+    undo.bounty = (list(winners), bounty)
+    await interaction.followup.send("Записала в статистику. Ошиблись кнопкой — отмените:", view=undo, ephemeral=True)
     if config.MVP_VOTE_MINUTES:
         players = cog.members_from_ids(interaction.guild, list(winners) + list(losers))
         if len(players) >= 2:
@@ -753,16 +810,17 @@ class BetView(discord.ui.View):
     """Ставка на катку: сумма из списка и кнопка стороны. Видит только сам игрок."""
 
     def __init__(self, wallets, guild_id: int, lobby_id: int, round_no: int, teams: list[list[int]],
-                 user_id: int) -> None:
+                 user_id: int, pool_round: int | str | None = None) -> None:
         super().__init__(timeout=300)
         self.wallets = wallets
         self.guild_id = guild_id
         self.lobby_id = lobby_id
         self.round_no = round_no
+        self.pool_round = round_no if pool_round is None else pool_round
         self.teams = teams
         self.user_id = user_id
         balance = wallets.balance(guild_id, user_id)
-        pool = wallets.pool(guild_id, lobby_id, round_no) or {"bets": {}}
+        pool = wallets.pool(guild_id, lobby_id, self.pool_round) or {"bets": {}}
         current = pool["bets"].get(str(user_id))
         available = balance + (current["amount"] if current else 0)
         amounts = [a for a in bets.BET_AMOUNTS if a <= available]
@@ -793,7 +851,7 @@ class BetView(discord.ui.View):
             self.add_item(button)
 
     def text(self, note: str = "") -> str:
-        pool = self.wallets.pool(self.guild_id, self.lobby_id, self.round_no) or {"bets": {}, "open_until": 0}
+        pool = self.wallets.pool(self.guild_id, self.lobby_id, self.pool_round) or {"bets": {}, "open_until": 0}
         blue, red = self.wallets.totals(pool)
         current = pool["bets"].get(str(self.user_id))
         lines = [
@@ -815,7 +873,7 @@ class BetView(discord.ui.View):
         async def callback(interaction: discord.Interaction) -> None:
             try:
                 self.wallets.place(
-                    self.guild_id, self.lobby_id, self.round_no, self.user_id, side, self.amount, self.teams,
+                    self.guild_id, self.lobby_id, self.pool_round, self.user_id, side, self.amount, self.teams,
                 )
             except bets.BetError as error:
                 await interaction.response.edit_message(content=self.text(f"⚠️ {error}"), view=self)
@@ -905,9 +963,11 @@ class UndoResultView(discord.ui.View):
 
     def __init__(
         self, cog: "Lobby", record: dict, lobby_message: discord.Message, game_id: int, round_no: int,
-        announce: discord.Message,
+        announce: discord.Message, pool_round: int | str | None = None,
     ) -> None:
         super().__init__(timeout=300)
+        self.pool_round = round_no if pool_round is None else pool_round
+        self.bounty: tuple[list[int], int] = ([], 0)
         self.cog = cog
         self.record = record
         self.lobby_message = lobby_message
@@ -920,11 +980,18 @@ class UndoResultView(discord.ui.View):
         stats_cog = interaction.client.get_cog("Stats")
         if stats_cog is not None:
             await stats_cog.stats.undo_game(interaction.guild.id, self.game_id)
-            stats_cog.wallets.unsettle_pool(interaction.guild.id, self.lobby_message.id, self.round_no)
-            await stats_cog.wallets.save()
-        self.record["results"] = [r for r in self.record.get("results", []) if r.get("game") != self.game_id]
-        # Номер катки откатываем, только если после этой отметки новых не было.
-        if self.record.get("round") == self.round_no + 1:
+            wallets = stats_cog.wallets
+            wallets.unsettle_pool(interaction.guild.id, self.lobby_message.id, self.pool_round)
+            wallets.unresolve_duels(interaction.guild.id, self.game_id)
+            winners, bounty = self.bounty
+            if bounty:
+                wallets.take_bounty(interaction.guild.id, winners, bounty)
+            await wallets.save()
+        results = self.record.get("results") or []
+        in_series = any(r.get("game") == self.game_id for r in results)
+        self.record["results"] = [r for r in results if r.get("game") != self.game_id]
+        # Номер катки откатываем, только если катка из текущей серии и после неё новых отметок не было.
+        if in_series and self.record.get("round") == self.round_no + 1:
             self.record["round"] = self.round_no
         self.record.pop("last_report_at", None)
         await self.cog.save()
@@ -1385,6 +1452,7 @@ class Lobby(commands.Cog):
                 if not record.get("closed"):
                     record["closed"] = True
                     closed_missing += 1
+                    await self.refund_bets(channel.guild.id, int(message_id))
                 log.warning("Сообщение сбора %s не найдено — сбор помечен закрытым", message_id)
             except discord.HTTPException:
                 log.exception("Не удалось обновить сообщение сбора %s", message_id)
@@ -1399,6 +1467,8 @@ class Lobby(commands.Cog):
         if record is not None and not record.get("closed"):
             record["closed"] = True
             await self.save()
+            if payload.guild_id:
+                await self.refund_bets(payload.guild_id, payload.message_id)
             log.info("Пост сбора %s удалён — сбор закрыт", payload.message_id)
 
     # --- драфт, который переживает перезапуск ------------------------------
@@ -1609,10 +1679,15 @@ class Lobby(commands.Cog):
         stats_cog = self.bot.get_cog("Stats")
         if stats_cog is None or record.get("kind") == KIND_SCRIM:
             return
-        stats_cog.wallets.open_pool(guild_id, lobby_id, record.get("round", 1))
+        stats_cog.wallets.open_pool(guild_id, lobby_id, bet_round(record))
         await stats_cog.wallets.save()
 
-    async def settle_bets(self, guild: discord.Guild, lobby_id: int, round_no: int, winner: int) -> str | None:
+    async def start_series(self, guild_id: int, lobby_id: int, record: dict) -> None:
+        """Новые составы — новая серия: ставки на старые составы возвращаются, пулы начинаются заново."""
+        await self.refund_bets(guild_id, lobby_id)
+        record["series_no"] = record.get("series_no", 0) + 1
+
+    async def settle_bets(self, guild: discord.Guild, lobby_id: int, round_no: int | str, winner: int) -> str | None:
         """Рассчитывает ставки катки, возвращает строку для объявления (или None, если ставок не было)."""
         stats_cog = self.bot.get_cog("Stats")
         if stats_cog is None:
@@ -1631,6 +1706,31 @@ class Lobby(commands.Cog):
             profit = amount - pool["bets"][uid]["amount"]
             parts.append(f"{player_name(member) if member else 'кто-то'} +{profit}")
         return "💰 Ставки сыграли: " + ", ".join(parts)
+
+    def settle_extras(
+        self, guild: discord.Guild, game_id: int, winners: list[int], losers: list[int], leader: int | None,
+        bounty: int,
+    ) -> list[str]:
+        """Охота на голову и дуэли после отмеченной катки. Строки для объявления (сохраняет вызывающий)."""
+        stats_cog = self.bot.get_cog("Stats")
+        wallets = stats_cog.wallets
+
+        def name(user_id: int) -> str:
+            member = guild.get_member(user_id)
+            return player_name(member) if member else "кто-то"
+
+        lines = []
+        if bounty:
+            wallets.pay_bounty(guild.id, winners, bounty)
+            lines.append(
+                f"🎯 **Охота на голову:** свалили лидера таблицы **{name(leader)}** — победителям по +{bounty} коинов!"
+            )
+        for duel in wallets.resolve_duels(guild.id, game_id, winners, losers):
+            loser = duel["b"] if duel["winner"] == duel["a"] else duel["a"]
+            lines.append(
+                f"⚔️ Дуэль: **{name(duel['winner'])}** уделал(а) **{name(loser)}** и забирает {duel['amount'] * 2} коинов"
+            )
+        return lines
 
     async def refund_bets(self, guild_id: int, lobby_id: int) -> None:
         stats_cog = self.bot.get_cog("Stats")
@@ -1716,6 +1816,7 @@ class Lobby(commands.Cog):
         lanes, notes = self.assign_team_lanes(teams, mode["lanes"])
         champions, champion_notes = await self.deal_for(teams, lanes, mode)
 
+        await self.start_series(message.guild.id, message.id, record)
         record["teams"] = [[member.id for member in team] for team in teams]
         record["teams_at"] = time.time()
         record["deal"] = self.pack_deal(lanes, champions)
@@ -1748,6 +1849,10 @@ class Lobby(commands.Cog):
         **options,
     ) -> dict:
         """Эмбед раздачи и, если есть чемпионы, картинка с их портретами."""
+        stats_cog = self.bot.get_cog("Stats")
+        if stats_cog is not None and len(teams) == 2 and all(teams):
+            ids = [[member.id for member in team] for team in teams]
+            notes = [*notes, prediction_line(win_chance(stats_cog.stats, teams[0][0].guild.id, ids))]
         embed = modes.deal_embed(teams, lanes, champions, mode, notes, patch=POOL.version, **options)
         image = await portraits.deal_image(teams, champions, lambda team: modes.order_by_lane(team, lanes))
         if image is None:
@@ -1836,23 +1941,15 @@ class Lobby(commands.Cog):
             stats_cog = self.bot.get_cog("Stats")
             guild_id = players[0].guild.id
 
-            profile = self.bot.get_cog("Profile")
-
             def rating(member: discord.Member) -> float:
                 if stats_cog is None:
                     return 1000.0
-                record = stats_cog.stats.player(guild_id, member.id)
-                # Новичок без каток на кастомках — по рангу в соло-очереди, если аккаунт привязан.
-                rank = profile.riot.rank(member.id) if profile is not None else None
-                return riot.blended_elo(record.elo, record.games, rank)
+                return stats_cog.stats.player(guild_id, member.id).elo
 
             teams = modes.skill_teams(players, rating)
             lanes, lane_notes = self.assign_team_lanes(teams, mode["lanes"])
             notes += lane_notes
-            has_ranks = profile is not None and any(profile.riot.rank(m.id) for m in players)
-            if stats_cog is None or (
-                not has_ranks and not any(stats_cog.stats.player(guild_id, m.id).games for m in players)
-            ):
+            if stats_cog is None or not any(stats_cog.stats.player(guild_id, m.id).games for m in players):
                 notes.append("Статистики пока нет — команды поделены случайно. Отмечайте победы кнопками в посте сбора.")
             else:
                 strength = [sum(rating(m) for m in team) / len(team) for team in teams if team]
