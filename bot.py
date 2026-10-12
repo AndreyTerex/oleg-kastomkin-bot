@@ -12,6 +12,7 @@ import champions
 import config
 import portraits
 from sync import Sync
+from storage import recover_transactions
 from vpn import VPN_CLIENT
 from utils import WARNING, respond
 
@@ -49,6 +50,7 @@ class ScrimBot(commands.Bot):
     async def setup_hook(self) -> None:
         self.tree.on_error = self.on_tree_error
         # До загрузки модулей: если бот уже работает на другом компьютере — ждём; свежие данные — из канала.
+        recover_transactions(config.DATA_DIR)
         self.sync = Sync(self)
         await self.sync.prepare()
 

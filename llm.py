@@ -334,6 +334,20 @@ class LLMClient:
             await self._session.close()
 
     async def complete(
+        self, system: str, user: str | list, *, temperature: float = 1.0,
+        validate: Callable[[str], bool] | None = None, economy: bool = False,
+        only: set[str] | None = None,
+    ) -> Reply:
+        """Общий срок включает VPN, переключение моделей и повторные попытки."""
+        try:
+            return await asyncio.wait_for(
+                self._complete(system, user, temperature=temperature, validate=validate, economy=economy, only=only),
+                timeout=config.LLM_REPLY_TIMEOUT,
+            )
+        except asyncio.TimeoutError as error:
+            raise LLMUnavailable("истекло время ожидания ответа") from error
+
+    async def _complete(
         self,
         system: str,
         user: str | list,
@@ -364,14 +378,23 @@ class LLMClient:
             if provider.name in config.LLM_VPN_ONLY and provider.proxy == config.VPN_PROXY_URL and VPN_CLIENT.broken:
                 # Сильная модель только через VPN: для важного ответа ждём, пока VPN сменит сервер
                 # (один раз за запрос), и только потом отдаём ответ модели послабее.
-                if economy or waited_for_vpn or not await VPN_CLIENT.wait_healthy(config.LLM_VPN_WAIT):
+                if economy or waited_for_vpn or not await VPN_CLIENT.wait_healthy(min(config.LLM_VPN_WAIT, 3)):
                     waited_for_vpn = True
                     continue
                 waited_for_vpn = True
             # Перегруженную «редкую» модель не переспрашиваем: неудачный запрос тоже съедает её суточный лимит,
             # а следующая модель Gemini в цепочке — со своим лимитом, это и есть повтор.
             retries = 0 if provider.scarce else config.LLM_OVERLOAD_RETRIES
-            reply = await self._ask_with_retries(provider, system, user, temperature, validate, retries, errors)
+            try:
+                reply = await asyncio.wait_for(
+                    self._ask_with_retries(provider, system, user, temperature, validate, retries, errors),
+                    timeout=min(provider.timeout, config.LLM_PROVIDER_TIMEOUT),
+                )
+            except asyncio.TimeoutError:
+                self._blocked_until[provider.label] = time.time() + TIMEOUT_PAUSE
+                self._blocked_daily[provider.label] = False
+                errors.append(f"{provider.label}: долго отвечает")
+                continue
             if reply is not None:
                 return reply
         last_error = errors[-1] if errors else "нет доступных моделей"

@@ -34,6 +34,7 @@ from discord.ext import commands
 
 import config
 import persona
+from lobby_state import RosterError
 import llm_actions
 import lobby_requests
 import role_requests
@@ -64,8 +65,8 @@ LINE_LIMIT = 300
 REPLY_SOFT_LIMIT = 200
 REPLY_LIMIT = 300
 # На настоящий вопрос ответ может быть длиннее — два-три предложения по делу.
-HELP_SOFT_LIMIT = 320
-HELP_LIMIT = 450
+HELP_SOFT_LIMIT = 650
+HELP_LIMIT = 900
 
 # Настоящий вопрос к Олегу: тогда сначала точный ответ, а шутка — потом.
 HELP_QUESTION = re.compile(
@@ -460,7 +461,7 @@ class Chat(commands.Cog):
             self.user_last[message.author.id] = time.time()
 
         try:
-            # Каждый раз новый типаж, два одинаковых подряд не выпадают; подходящий к разговору — чаще.
+            # Настроение может продолжаться; приём меняется, чтобы шутки не шли под копирку.
             mood = pick_mood(message.content, state.last_mood)
             state.last_mood = mood[0]
             tactic = pick_tactic(message.content, state.last_tactic)
@@ -474,25 +475,10 @@ class Chat(commands.Cog):
                 return pick_variant(text, allow_skip=allow_skip, avoid_openings=openings)
 
             async with typing_if_possible(message.channel):
-                try:
-                    reply = await self.client.complete(
-                        persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
-                        validate=lambda text: choose(text) is not None,
-                        # Сам встрял — хватит модели попроще: умные Gemini с лимитом 20 в день — для тех, кто позвал.
-                        economy=not called,
-                    )
-                except LLMUnavailable as error:
-                    # Сбой сети или VPN часто проходит за секунды: на прямой зов пробуем ещё раз, а не молчим.
-                    if not called or error.daily:
-                        raise
-                    log.info("Олегу не ответили (%s), пробую ещё раз через %d с", error, RETRY_AFTER_FAILURE)
-                    await self.react(message, "⏳")
-                    await asyncio.sleep(RETRY_AFTER_FAILURE)
-                    reply = await self.client.complete(
-                        persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
-                        validate=lambda text: choose(text) is not None,
-                    )
-                    await self.unreact(message, "⏳")
+                reply = await self.client.complete(
+                    persona.PERSONA, prompt, temperature=REPLY_TEMPERATURE,
+                    validate=lambda text: choose(text) is not None, economy=not called,
+                )
             # Модель поняла просьбу, которую пропустил код: выполняет бот, со своими проверками прав.
             action = llm_actions.parse(parse_json(reply.text)) if called else None
             if action is not None and await self.run_action(message, action):
@@ -531,8 +517,7 @@ class Chat(commands.Cog):
                 elif called:
                     await self.react(message, "😴")
             elif called:
-                await self.react(message, "⏳")
-                await self.react(message, "😵")
+                await self.reply_or_send(message, "Мысль была шикарная, но связь её съела. Попробуй ещё раз чуть позже.")
             log.warning("Олег не смог ответить: %s", error)
         except discord.HTTPException:
             log.exception("Не удалось отправить ответ Олега")
@@ -606,8 +591,7 @@ class Chat(commands.Cog):
         task_parts = [task]
         if openings:
             task_parts.append(persona.AVOID_OPENINGS.format(openings=", ".join(f"«{o}…»" for o in sorted(openings))))
-        task_parts.append(fun_line(own))
-        task_parts.append(persona.VARIANTS)
+        task_parts.append(persona.REPLY_FORMAT)
         if called:
             task_parts.append(persona.ACTIONS)
         else:
@@ -753,7 +737,11 @@ class Chat(commands.Cog):
         status = {
             lobby_requests.STATUS_IN: "in", lobby_requests.STATUS_SUB: "sub", lobby_requests.REMOVE: None,
         }[how]
-        changed, overflow, promoted = lobby_cog.apply_move(guild, record, [t.id for t in targets], status)
+        try:
+            changed, overflow, promoted = lobby_cog.apply_move(guild, record, [t.id for t in targets], status)
+        except RosterError as error:
+            await self.say(message, str(error))
+            return
         await lobby_cog.save()
         await lobby_cog.refresh_post(message_id, record)
 
@@ -1299,6 +1287,12 @@ def pick_variant(text: str, *, allow_skip: bool = False, avoid_openings: set[str
     data = parse_json(text)
     if data is not None and allow_skip and data.get("skip") is True:
         return ""
+    if data is not None and "reply" in data:
+        reply = data["reply"]
+        if not isinstance(reply, str):
+            return None
+        reply = reply.strip()
+        return reply if reply and acceptable_reply(reply) else None
     if data is not None and isinstance(data.get("variants"), list):
         variants = [v.strip() for v in data["variants"] if isinstance(v, str) and v.strip()]
         if not variants:
@@ -1406,7 +1400,7 @@ def opening(text: str) -> str:
 
 
 def pick_mood(text: str, last: str) -> tuple[str, str]:
-    """Настроение для реплики: не то же, что в прошлый раз, подходящее к сообщению — с повышенным шансом."""
+    """Подходящий оттенок характера с инерцией предыдущего настроения."""
     return _pick(persona.MOODS, persona.MOOD_TRIGGERS, text, last)
 
 
@@ -1419,12 +1413,17 @@ def _pick(choices, triggers, text: str, last: str) -> tuple[str, str]:
     options, weights = [], []
     for mood in choices:
         name = mood[0]
-        if name == last:
+        if name == last and choices is persona.TACTICS:
             continue
         weight = persona.TACTIC_WEIGHTS.get(name, 1.0) if choices is persona.TACTICS else 1.0
+        if name == last and choices is persona.MOODS:
+            weight *= 2.5
         trigger = triggers.get(name)
-        if trigger is not None and trigger.search(text or ""):
+        matched = trigger is not None and trigger.search(text or "")
+        if matched:
             weight *= persona.MOOD_BOOST
+        if name == "госпожа" and not matched:
+            weight = 0.0
         if name == "подражатель" and len(text or "") < persona.MIMIC_MIN_LENGTH:
             weight = 0.0
         options.append(mood)

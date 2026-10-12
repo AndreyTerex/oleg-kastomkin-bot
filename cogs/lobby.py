@@ -23,7 +23,8 @@ import portraits
 from champions import POOL, ChampionsUnavailable
 from cogs.scrim import DraftView
 from stats import ELO_START, expected_score
-from storage import JsonStore
+from storage import JsonStore, transaction
+from lobby_state import RosterError, change_roster, set_waiting
 from timeparse import parse_when
 from utils import BLUE_SIDE, NEUTRAL, RED_SIDE, format_players, lanes_badge, player_name, respond, shuffled
 
@@ -64,6 +65,7 @@ CUSTOM_ID_WIN_BLUE = "lol:lobby:win:blue"
 CUSTOM_ID_WIN_RED = "lol:lobby:win:red"
 CUSTOM_ID_FINISH = "lol:lobby:finish"
 CUSTOM_ID_BET = "lol:lobby:bet"
+CUSTOM_ID_MANAGE = "lol:lobby:manage"
 
 # Кнопки, которые нужны только внутренней кастомке.
 CUSTOM_GAME_ONLY = frozenset({
@@ -187,15 +189,6 @@ def result_comment(chance_won: float) -> str | None:
     return None
 
 
-def set_waiting(record: dict, user_id: int, waiting: bool) -> None:
-    """Очередь в состав: кто хотел играть, но не влез. Порядок — кто раньше нажал «Играю»."""
-    queue = record.setdefault("waiting", [])
-    if user_id in queue:
-        queue.remove(user_id)
-    if waiting:
-        queue.append(user_id)
-
-
 # Цвет карточки по заполнению: идёт набор → почти собрались → состав полный.
 COLOR_FILLING = NEUTRAL
 COLOR_ALMOST = discord.Color(0xF59E0B)
@@ -313,6 +306,25 @@ class LobbyView(discord.ui.View):
         for child in list(self.children):
             custom_id = getattr(child, "custom_id", None)
 
+            if custom_id in {CUSTOM_ID_EDIT, CUSTOM_ID_CANCEL, CUSTOM_ID_FINISH, CUSTOM_ID_DRAFT, "lol:lobby:reset"}:
+                self.remove_item(child)
+                continue
+            if custom_id == CUSTOM_ID_CAPTAINS:
+                if stage not in (STAGE_SIGNUP, STAGE_CAPTAINS):
+                    self.remove_item(child)
+                    continue
+                child.label = "Начать"
+                child.emoji = "▶️"
+            if custom_id == CUSTOM_ID_MODE and stage != STAGE_SIGNUP:
+                self.remove_item(child)
+                continue
+            if custom_id in {CUSTOM_ID_REROLL, CUSTOM_ID_MOVE} and not has_teams:
+                self.remove_item(child)
+                continue
+            if custom_id in {"lol:lobby:in", "lol:lobby:sub", "lol:lobby:out"} and stage != STAGE_SIGNUP:
+                self.remove_item(child)
+                continue
+
             # Скрим — это одна команда против соперника: делить её на две и раздавать чемпионов незачем.
             if kind == KIND_SCRIM and custom_id in CUSTOM_GAME_ONLY:
                 self.remove_item(child)
@@ -328,14 +340,9 @@ class LobbyView(discord.ui.View):
                 # Посреди драфта режим не меняем — иначе итог драфта разойдётся с настройками.
                 child.disabled = stage == STAGE_DRAFT
             elif custom_id == CUSTOM_ID_CAPTAINS:
-                if is_draft:
-                    child.label = "Перезаролить капитанов" if has_captains else "Заролить капитанов"
-                    child.emoji = "🎲"
-                else:
-                    child.label = "Перезапустить" if has_teams else "Запустить"
-                    child.emoji = "▶️"
-                # Запускать можно по собранному составу и не посреди драфта.
-                child.disabled = going < target or stage == STAGE_DRAFT
+                child.label = "Начать"
+                child.emoji = "▶️"
+                child.disabled = going < target or stage not in (STAGE_SIGNUP, STAGE_CAPTAINS)
             elif custom_id == CUSTOM_ID_DRAFT:
                 if not is_draft:
                     # В режимах без капитанов кнопка драфта не нужна.
@@ -369,6 +376,20 @@ class LobbyView(discord.ui.View):
             if closed:
                 child.disabled = True
 
+    @discord.ui.button(label="Управление", emoji="⚙️", style=discord.ButtonStyle.secondary,
+                       custom_id=CUSTOM_ID_MANAGE, row=1)
+    async def manage(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        cog = interaction.client.get_cog("Lobby")
+        record = cog.get_record(interaction.message.id)
+        if record is None or record.get("closed"):
+            await respond(interaction, "Сбор уже закрыт.")
+            return
+        if not cog.is_organizer(interaction, record):
+            await respond(interaction, "Управляет автор сбора или организатор.")
+            return
+        await interaction.response.send_message("Настройки и действия со сбором:",
+                                                view=ManageView(cog, interaction.message), ephemeral=True)
+
     # --- запись на сбор -------------------------------------------------
 
     async def _set_status(self, interaction: discord.Interaction, status: str | None) -> None:
@@ -382,42 +403,19 @@ class LobbyView(discord.ui.View):
             await respond(interaction, "Сбор отменён.")
             return
 
-        user_id = interaction.user.id
-        target = record.get("target", config.TEAM_SIZE)
-        note: str | None = None
-
-        # Состав не может быть больше нужного: опоздавшие уходят в запас.
-        if (
-            status == STATUS_IN
-            and user_id not in record[STATUS_IN]
-            and len(record[STATUS_IN]) >= target
-        ):
-            status = STATUS_SUB
-            note = (
-                f"Состав уже собран ({target}/{target}) — записал вас запасным. "
-                "Если кто-то отпишется до деления на команды, вы встанете в состав автоматически."
-            )
-
-        left_roster = user_id in record[STATUS_IN] and status != STATUS_IN
-        for key in (STATUS_IN, STATUS_SUB, STATUS_OUT):
-            if user_id in record[key]:
-                record[key].remove(user_id)
-        if status is not None:
-            record[status].append(user_id)
-        # Своё решение человека важнее очереди: сам выбрал «Запасной» — в состав его не тянем.
-        set_waiting(record, user_id, note is not None)
-
-        promoted = cog.promote_sub(interaction.guild, record) if left_roster else None
-
-        # Сначала ответ Discord (на него 3 секунды), потом запись на диск.
+        try:
+            changed, overflow, promoted = cog.apply_move(interaction.guild, record, [interaction.user.id], status)
+        except RosterError as error:
+            await respond(interaction, str(error))
+            return
+        await cog.save()
         await interaction.response.edit_message(
             embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
         )
-        await cog.save()
-        if note:
-            await interaction.followup.send(note, ephemeral=True)
-        if promoted is not None:
-            await cog.announce_promoted(interaction.followup, [promoted])
+        if overflow:
+            await interaction.followup.send("Состав полон — ты в очереди. Освободится место, позову.", ephemeral=True)
+        if promoted:
+            await cog.announce_promoted(interaction.followup, promoted)
 
     @discord.ui.button(label="Играю", emoji="✅", style=discord.ButtonStyle.success, custom_id="lol:lobby:in")
     async def sign_in(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -571,6 +569,10 @@ class LobbyView(discord.ui.View):
             await respond(interaction, "Запускать игру может только автор сбора или организатор ивентов.")
             return
 
+        if record.get("closed") or record.get("stage", STAGE_SIGNUP) not in (STAGE_SIGNUP, STAGE_CAPTAINS):
+            await respond(interaction, "Игра уже запущена. Для новых составов откройте «Управление».")
+            return
+
         target = record.get("target", config.TEAM_SIZE)
         players = cog.signed_players(interaction.guild, record)
         if len(players) < target:
@@ -588,16 +590,21 @@ class LobbyView(discord.ui.View):
             record["teams"] = None
             record["deal"] = None
             record["stage"] = STAGE_CAPTAINS
-            await cog.save()
-            await interaction.response.edit_message(
-                embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
-            )
+            await self.start_draft.callback(interaction)
             return
 
         # Раздача может сходить за списком чемпионов — подтверждаем нажатие заранее.
+        record["stage"] = "launching"
         await interaction.response.defer()
-        teams, lanes, champions, notes = await cog.run_mode(players[:target], mode)
+        try:
+            teams, lanes, champions, notes = await cog.run_mode(players[:target], mode)
+        except BaseException:
+            record["stage"] = STAGE_SIGNUP
+            raise
 
+        if record.get("closed") or record.get("stage") != "launching":
+            await interaction.followup.send("Запуск отменён: состояние сбора изменилось.", ephemeral=True)
+            return
         await cog.start_series(interaction.guild.id, interaction.message.id, record)
         record["captains"] = None
         record["teams"] = [[member.id for member in team] for team in teams]
@@ -628,6 +635,10 @@ class LobbyView(discord.ui.View):
             await respond(interaction, "Запускать драфт может только автор сбора или организатор ивентов.")
             return
 
+        if record.get("closed") or record.get("stage") != STAGE_CAPTAINS:
+            await respond(interaction, "Драфт уже запущен или сбор закрыт.")
+            return
+
         captains = cog.members_from_ids(interaction.guild, record.get("captains"))
         if len(captains) != 2:
             await respond(interaction, "Сначала заролльте капитанов — кто-то из них покинул сервер.")
@@ -640,8 +651,11 @@ class LobbyView(discord.ui.View):
         target = record.get("target", config.TEAM_SIZE)
         roster = cog.signed_players(interaction.guild, record)[:target]
         pool = [player for player in roster if player not in captains]
-        if not pool:
-            await respond(interaction, "Кроме капитанов в составе никого нет.")
+        if len(roster) < target or any(captain not in roster for captain in captains):
+            record["stage"] = STAGE_SIGNUP
+            record["captains"] = None
+            await cog.save()
+            await respond(interaction, "Состав изменился — проверьте запись и нажмите «Начать».")
             return
 
         # Прошлый драфт этого сбора (если перезапускают) больше не принимает пики.
@@ -656,8 +670,14 @@ class LobbyView(discord.ui.View):
         record["deal"] = None
         record.pop("draft", None)
 
+        if not pool:
+            await interaction.response.defer()
+            await cog.finish_draft(interaction.message, record, [[captains[0]], [captains[1]]], interaction)
+            return
+
         draft = cog.draft_view(interaction.message, record, captains, shuffled(pool))
         cog.store_draft(record, draft)
+        await cog.save()
         await interaction.response.edit_message(
             embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
         )
@@ -755,29 +775,40 @@ async def report_result(
     chance_won = chance_blue if side == 0 else 1 - chance_blue
     ranking = stats_cog.ranking(interaction.guild.id)
     leader = ranking[0][0] if len(ranking) >= 3 else None
-    # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
-    record["last_report_at"] = time.time()
-    record["round"] = round_no + 1
-    game_id = await stats_cog.stats.record_game(
-        interaction.guild.id, list(winners), list(losers), lobby_id=lobby_id, round_no=round_no,
-        channel_id=interaction.channel_id,
-    )
-    record.setdefault("results", []).append({"round": round_no, "winner": side, "game": game_id})
-    await cog.save()
-    bet_line = await cog.settle_bets(interaction.guild, lobby_id, pool_round, side)
-    bounty = config.BOUNTY_COINS if leader is not None and leader in losers else 0
-    extra_lines = cog.settle_extras(interaction.guild, game_id, list(winners), list(losers), leader, bounty)
-    await stats_cog.wallets.save()
+    await interaction.response.defer()
+    # После сетевого defer другая кнопка могла уже отметить этот раунд.
+    if (record.get("closed") or record.get("round", 1) != round_no
+            or record.get("teams") != ([winners, losers] if side == 0 else [losers, winners])
+            or bet_round(record, round_no) != pool_round):
+        await interaction.followup.send("Этот раунд уже обработан или сбор закрыт.", ephemeral=True)
+        return
+    with transaction(cog.store, stats_cog.stats.store, stats_cog.wallets.store):
+        # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
+        record["last_report_at"] = time.time()
+        record["round"] = round_no + 1
+        game_id = await stats_cog.stats.record_game(
+            interaction.guild.id, list(winners), list(losers), lobby_id=lobby_id, round_no=round_no,
+            channel_id=interaction.channel_id,
+        )
+        record.setdefault("results", []).append({"round": round_no, "winner": side, "game": game_id})
+        await cog.save()
+        bet_line = await cog.settle_bets(interaction.guild, lobby_id, pool_round, side)
+        bounty = config.BOUNTY_COINS if leader is not None and leader in losers else 0
+        extra_lines = cog.settle_extras(interaction.guild, game_id, list(winners), list(losers), leader, bounty)
+        await stats_cog.wallets.save()
     side_name = (BLUE_SIDE, RED_SIDE)[side]
     if interaction.message is not None and interaction.message.id == lobby_id:
         lobby_message = interaction.message
-        await interaction.response.edit_message(
-            embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
-        )
+        try:
+            await interaction.message.edit(
+                embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
+            )
+        except discord.HTTPException:
+            log.warning("Результат сохранён, но пост сбора пока не обновился")
     else:
         channel = interaction.client.get_channel(record["channel_id"]) or interaction.channel
         lobby_message = channel.get_partial_message(lobby_id)
-        await interaction.response.edit_message(content=f"✅ Записала: победа — **{side_name}**.", view=None)
+        await interaction.edit_original_response(content=f"✅ Записала: победа — **{side_name}**.", view=None)
         try:
             await lobby_message.edit(embed=cog.build_embed(interaction.guild, record), view=LobbyView(record))
         except discord.HTTPException:
@@ -895,6 +926,9 @@ class FinishView(discord.ui.View):
 
     async def _record(self, interaction: discord.Interaction) -> dict | None:
         record = self.cog.get_record(self.lobby_message.id)
+        if record is not None and not self.cog.is_organizer(interaction, record):
+            await respond(interaction, "Управляет автор сбора или организатор.")
+            return None
         if record is None or record.get("closed"):
             await interaction.response.edit_message(content="Сбор уже закрыт.", view=None)
             return None
@@ -930,7 +964,7 @@ class FinishView(discord.ui.View):
         await self.cog.save()
         await self.cog.refund_bets(interaction.guild.id, self.lobby_message.id)
         await interaction.response.edit_message(
-            content="Составы сброшены: поправьте запись («Правка состава»), при желании режим — и снова «Запустить».",
+            content="Составы сброшены: поправьте запись («Правка состава»), при желании режим — и снова «Начать».",
             view=None,
         )
         await self.lobby_message.edit(embed=self.cog.build_embed(interaction.guild, record), view=LobbyView(record))
@@ -942,11 +976,65 @@ class FinishView(discord.ui.View):
         self.stop()
 
 
+class ManageView(FinishView):
+    """Редкие действия доступны организатору в отдельном меню."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        record = self.cog.get_record(self.lobby_message.id)
+        if record is None or record.get("closed") or not self.cog.is_organizer(interaction, record):
+            await respond(interaction, "Сбор закрыт или у тебя больше нет прав управления.")
+            return False
+        return True
+
+    @discord.ui.button(label="Правка состава", emoji="✏️", style=discord.ButtonStyle.secondary, row=1)
+    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        record = await self._record(interaction)
+        if record is None:
+            return
+        if record.get("stage", STAGE_SIGNUP) != STAGE_SIGNUP:
+            await respond(interaction, "Сначала нажмите «Пересобрать составы» — сыгранные катки сохранятся.")
+            return
+        view = RosterEditView(self.cog, record, self.lobby_message)
+        if not view.has_players:
+            await respond(interaction, "В сборе пока никого нет.")
+            return
+        await interaction.response.edit_message(content="Выберите игроков и действие.", view=view)
+
+    @discord.ui.button(label="Режим", emoji="🎲", style=discord.ButtonStyle.secondary, row=1)
+    async def mode(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        record = await self._record(interaction)
+        if record is None:
+            return
+        if record.get("kind") == KIND_SCRIM:
+            await respond(interaction, "У скрима одна команда — режим кастомки не нужен.")
+            return
+        view = ModeView(self.cog, record, self.lobby_message)
+        await interaction.response.edit_message(content=view.describe(), view=view)
+
+    @discord.ui.button(label="Сбросить капитанов", emoji="🎲", style=discord.ButtonStyle.secondary, row=2)
+    async def captains(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        record = await self._record(interaction)
+        if record is None:
+            return
+        draft = self.cog.drafts.get(self.lobby_message.id)
+        if record.get("stage") != STAGE_DRAFT or draft is None or draft.turn != 0:
+            await respond(interaction, "Капитанов можно перебросить до первого выбора игрока. Позже — «Пересобрать составы».")
+            return
+        # Возвращаем сбор к запуску: следующий «Начать» выберет другую пару случайно.
+        draft.stop()
+        self.cog.drafts.pop(self.lobby_message.id, None)
+        reset_series(record)
+        await self.cog.save()
+        await self.lobby_message.edit(embed=self.cog.build_embed(interaction.guild, record), view=LobbyView(record))
+        await interaction.response.edit_message(content="Капитаны сброшены. Нажмите «Начать» в посте сбора.", view=None)
+
+
 def reset_series(record: dict) -> None:
     """Новая серия в том же сборе: составы, раздача и счёт сбрасываются, запись игроков остаётся.
     Сыгранная серия уходит в историю сбора; катки из статистики не удаляются."""
     if record.get("results"):
         record.setdefault("past_series", []).append(list(record["results"]))
+    record["draft_no"] = record.get("draft_no", 0) + 1
     record["teams"] = None
     record["deal"] = None
     record["captains"] = None
@@ -978,23 +1066,31 @@ class UndoResultView(discord.ui.View):
     @discord.ui.button(label="Отменить результат", emoji="↩️", style=discord.ButtonStyle.secondary)
     async def undo(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         stats_cog = interaction.client.get_cog("Stats")
-        if stats_cog is not None:
-            await stats_cog.stats.undo_game(interaction.guild.id, self.game_id)
-            wallets = stats_cog.wallets
-            wallets.unsettle_pool(interaction.guild.id, self.lobby_message.id, self.pool_round)
-            wallets.unresolve_duels(interaction.guild.id, self.game_id)
-            winners, bounty = self.bounty
-            if bounty:
-                wallets.take_bounty(interaction.guild.id, winners, bounty)
-            await wallets.save()
-        results = self.record.get("results") or []
-        in_series = any(r.get("game") == self.game_id for r in results)
-        self.record["results"] = [r for r in results if r.get("game") != self.game_id]
-        # Номер катки откатываем, только если катка из текущей серии и после неё новых отметок не было.
-        if in_series and self.record.get("round") == self.round_no + 1:
-            self.record["round"] = self.round_no
-        self.record.pop("last_report_at", None)
-        await self.cog.save()
+        if stats_cog is None:
+            await respond(interaction, "Статистика временно недоступна.")
+            return
+        await interaction.response.defer()
+        if stats_cog.stats.game(interaction.guild.id, self.game_id) is None:
+            await interaction.edit_original_response(content="Результат уже отменён.", view=None)
+            return
+        with transaction(self.cog.store, stats_cog.stats.store, stats_cog.wallets.store):
+            if stats_cog is not None:
+                await stats_cog.stats.undo_game(interaction.guild.id, self.game_id)
+                wallets = stats_cog.wallets
+                wallets.unsettle_pool(interaction.guild.id, self.lobby_message.id, self.pool_round)
+                wallets.unresolve_duels(interaction.guild.id, self.game_id)
+                winners, bounty = self.bounty
+                if bounty:
+                    wallets.take_bounty(interaction.guild.id, winners, bounty)
+                await wallets.save()
+            results = self.record.get("results") or []
+            in_series = any(r.get("game") == self.game_id for r in results)
+            self.record["results"] = [r for r in results if r.get("game") != self.game_id]
+            # Номер катки откатываем, только если катка из текущей серии и после неё новых отметок не было.
+            if in_series and self.record.get("round") == self.round_no + 1:
+                self.record["round"] = self.round_no
+            self.record.pop("last_report_at", None)
+            await self.cog.save()
         try:
             await self.lobby_message.edit(
                 embed=self.cog.build_embed(self.lobby_message.guild, self.record), view=LobbyView(self.record)
@@ -1003,7 +1099,7 @@ class UndoResultView(discord.ui.View):
         except discord.HTTPException:
             log.exception("Не удалось обновить сообщения после отмены результата")
         button.disabled = True
-        await interaction.response.edit_message(content="Результат отменён, статистика исправлена.", view=self)
+        await interaction.edit_original_response(content="Результат отменён, статистика исправлена.", view=self)
         self.stop()
 
 
@@ -1181,13 +1277,15 @@ class ModeView(discord.ui.View):
 
     @discord.ui.button(label="Сохранить", emoji="💾", style=discord.ButtonStyle.success, row=4)
     async def save(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if self.record.get("stage") == STAGE_DRAFT:
-            await respond(interaction, "Сейчас идёт драфт — режим можно поменять после него.")
+        if self.record.get("closed") or self.record.get("stage", STAGE_SIGNUP) != STAGE_SIGNUP:
+            await respond(interaction, "Режим меняется до запуска. Для новой игры сначала пересоберите составы.")
             return
 
         mode, notes = modes.normalize(self.mode)
         self.mode = mode
         self.record["mode"] = mode
+        self.cog.preferences.data[str(interaction.guild.id)] = dict(mode)
+        await self.cog.preferences.save()
         # Капитаны, заролленные под драфт, в других режимах не нужны.
         if mode["teams"] != modes.TEAMS_DRAFT and self.record.get("stage") == STAGE_CAPTAINS:
             self.record["captains"] = None
@@ -1261,9 +1359,13 @@ class RosterEditView(discord.ui.View):
 
         guild = self.lobby_message.guild
         limit = self.record.get("target", config.TEAM_SIZE)
-        changed, overflow, promoted = self.cog.apply_move(
-            guild, self.record, [int(value) for value in self.select.values], target_status
-        )
+        try:
+            changed, overflow, promoted = self.cog.apply_move(
+                guild, self.record, [int(value) for value in self.select.values], target_status
+            )
+        except RosterError as error:
+            await respond(interaction, str(error))
+            return
 
         await self.cog.save()
         self.refresh_options()
@@ -1367,6 +1469,7 @@ class Lobby(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.store = JsonStore(Path(config.DATA_DIR) / "lobbies.json")
+        self.preferences = JsonStore(Path(config.DATA_DIR) / "lobby_preferences.json")
         # Когда какой чемпион выпадал на сервере: id сервера → {id чемпиона: время}.
         self.champion_history = JsonStore(Path(config.DATA_DIR) / "champion_history.json")
         self._refresh_task: asyncio.Task | None = None
@@ -1377,6 +1480,7 @@ class Lobby(commands.Cog):
 
     async def cog_load(self) -> None:
         self.champion_history.load()
+        self.preferences.load()
         data = self.store.load()
         now = time.time()
         fresh = {
@@ -1390,6 +1494,9 @@ class Lobby(commands.Cog):
         # Сборы, созданные до появления дат: время разбираем относительно момента создания поста.
         dated = 0
         for record in fresh.values():
+            if record.get("stage") == "launching":
+                record["stage"] = STAGE_SIGNUP
+                dated += 1
             if "start_at" not in record:
                 created = datetime.fromtimestamp(record.get("created_at", now), config.TIMEZONE)
                 start = parse_when(record.get("time", ""), created)
@@ -1486,7 +1593,8 @@ class Lobby(commands.Cog):
         key = lobby_message.id
 
         def is_current() -> bool:
-            return record.get("draft_no") == draft_no and not record.get("closed")
+            return (record.get("draft_no") == draft_no and not record.get("closed")
+                    and record.get("stage") == STAGE_DRAFT)
 
         async def on_pick(view: DraftView) -> None:
             if is_current():
@@ -1503,7 +1611,7 @@ class Lobby(commands.Cog):
         view = DraftView(
             self.bot.get_cog("Scrim"), captains, pool,
             on_finish=on_finish, on_pick=on_pick, teams=teams,
-            expired_hint="Время на драфт вышло — нажмите «Перезапустить драфт» в посте сбора",
+            expired_hint="Время на драфт вышло — нажмите «Начать» в посте сбора",
             custom_id=f"lol:draft:{key}:{draft_no}", timeout=None,
         )
         self.drafts[key] = view
@@ -1766,23 +1874,7 @@ class Lobby(commands.Cog):
     ) -> tuple[list[int], list[int], list[discord.Member]]:
         """Переносит игроков (None — убрать из сбора). Возвращает перенесённых, не влезших в состав
         (они в запасе и в очереди) и поднятых из очереди на освободившиеся места."""
-        limit = record.get("target", config.TEAM_SIZE)
-        changed: list[int] = []
-        overflow: list[int] = []
-        for user_id in user_ids:
-            for key in (STATUS_IN, STATUS_SUB, STATUS_OUT):
-                if user_id in record[key]:
-                    record[key].remove(user_id)
-            # В состав больше нужного не пускаем даже организатора — иначе счётчик врёт.
-            overflowed = target_status == STATUS_IN and len(record[STATUS_IN]) >= limit
-            set_waiting(record, user_id, overflowed)
-            if overflowed:
-                record[STATUS_SUB].append(user_id)
-                overflow.append(user_id)
-                continue
-            if target_status is not None:
-                record[target_status].append(user_id)
-            changed.append(user_id)
+        changed, overflow = change_roster(record, user_ids, target_status, default_target=config.TEAM_SIZE)
         promoted = []
         while (member := self.promote_sub(guild, record)) is not None:
             promoted.append(member)
@@ -1812,10 +1904,14 @@ class Lobby(commands.Cog):
         interaction: discord.Interaction | None = None,
     ) -> None:
         """Сохраняет итог драфта, раздаёт линии и чемпионов по режиму и открывает развод по каналам."""
+        generation = record.get("draft_no", 0)
         mode = modes.get_mode(record)
         lanes, notes = self.assign_team_lanes(teams, mode["lanes"])
         champions, champion_notes = await self.deal_for(teams, lanes, mode)
 
+        if (record.get("closed") or record.get("stage") != STAGE_DRAFT
+                or record.get("draft_no", 0) != generation):
+            return
         await self.start_series(message.guild.id, message.id, record)
         record["teams"] = [[member.id for member in team] for team in teams]
         record["teams_at"] = time.time()
@@ -2217,7 +2313,7 @@ class Lobby(commands.Cog):
             "stage": STAGE_SIGNUP,
             "captains": None,
             "teams": None,
-            "mode": modes.DEFAULT_PRESET.mode,
+            "mode": modes.get_mode({"mode": self.preferences.data.get(str(interaction.guild.id))}),
             "series": series,
             "deal": None,
             STATUS_IN: [],

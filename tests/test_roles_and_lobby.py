@@ -291,7 +291,8 @@ def test_finish_button_and_series_reset():
 
     record = _record(stage=lobby.STAGE_DONE, teams=[[1], [2]], round=2, results=[{"winner": 0, "game": 5}],
                      deal={"lanes": {}}, captains=[1, 2], last_report_at=1.0)
-    assert lobby.CUSTOM_ID_FINISH in asyncio.run(buttons(record))
+    assert lobby.CUSTOM_ID_MANAGE in asyncio.run(buttons(record))
+    assert lobby.CUSTOM_ID_FINISH not in asyncio.run(buttons(record))
     assert lobby.CUSTOM_ID_FINISH not in asyncio.run(buttons(_record()))  # до команд — нечего завершать
     assert lobby.CUSTOM_ID_FINISH not in asyncio.run(buttons(_record(kind=lobby.KIND_SCRIM, teams=[[1], [2]])))
 
@@ -301,3 +302,50 @@ def test_finish_button_and_series_reset():
     assert record["past_series"] == [[{"winner": 0, "game": 5}]]
     assert "last_report_at" not in record
     assert record[lobby.STATUS_IN] == [1, 2]  # запись игроков остаётся
+
+
+def test_begin_selects_captains_and_opens_draft_in_one_click(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    async def scenario():
+        guild = FakeGuild(range(1, 11))
+        guild.id = 1
+        scrim = NS(remember_teams=lambda *args: None)
+        cogs = {"Scrim": scrim}
+        bot = NS(get_cog=cogs.get)
+        cog = lobby.Lobby(bot)
+        cogs["Lobby"] = cog
+        record = _record(target=10, **{"in": list(range(1, 11))}, author_id=1,
+                         guild_id=1, channel_id=9, time="сегодня 21:00")
+        cog.store.data["777"] = record
+        message = NS(id=777, guild=guild, channel=NS(), edit=AsyncMock())
+        response = NS(edit_message=AsyncMock(), send_message=AsyncMock(), defer=AsyncMock(), is_done=lambda: False)
+        followup = NS(send=AsyncMock(return_value=NS(id=888)))
+        interaction = NS(client=bot, guild=guild, message=message, channel_id=9, channel=message.channel,
+                         user=NS(id=1), response=response, followup=followup)
+        view = lobby.LobbyView(record)
+        await view.launch.callback(interaction)
+        assert record["stage"] == lobby.STAGE_DRAFT
+        assert len(record["captains"]) == 2
+        assert len(record["draft"]["pool"]) == 8
+        assert record["draft"]["message_id"] == 888
+        assert followup.send.await_count == 1
+        await view.launch.callback(interaction)
+        assert followup.send.await_count == 1  # старый клик не начинает второй драфт
+        assert response.send_message.await_count == 1
+    asyncio.run(scenario())
+
+
+def test_signup_and_game_panels_only_show_relevant_controls():
+    async def scenario():
+        signup = lobby.LobbyView(_record())
+        ids = {item.custom_id for item in signup.children}
+        assert lobby.CUSTOM_ID_MANAGE in ids and lobby.CUSTOM_ID_CAPTAINS in ids
+        assert not ids & {lobby.CUSTOM_ID_EDIT, lobby.CUSTOM_ID_CANCEL, lobby.CUSTOM_ID_DRAFT, lobby.CUSTOM_ID_MOVE}
+        started = lobby.LobbyView(_record(stage=lobby.STAGE_DONE, teams=[[1], [2]]))
+        ids = {item.custom_id for item in started.children}
+        assert {lobby.CUSTOM_ID_WIN_BLUE, lobby.CUSTOM_ID_WIN_RED, lobby.CUSTOM_ID_MANAGE} <= ids
+        assert not ids & {"lol:lobby:in", "lol:lobby:out", lobby.CUSTOM_ID_CAPTAINS}
+    asyncio.run(scenario())
