@@ -409,7 +409,7 @@ def test_important_reply_waits_for_vpn_and_still_gets_a_strong_model(monkeypatch
     client._session = Session()
     reply = asyncio.run(client.complete("s", "u"))
     assert reply.model == "gemini:gemini-3.7-flash" and "oss" not in calls
-    assert fake.waits == [config.LLM_VPN_WAIT]
+    assert fake.waits == [min(config.LLM_VPN_WAIT, 3)]
 
 
 def test_total_deadline_cancels_stalled_provider(monkeypatch):

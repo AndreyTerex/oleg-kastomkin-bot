@@ -190,10 +190,11 @@ def test_report_result_pays_bets_bounty_duels_and_undo(tmp_path, monkeypatch):
         asyncio.run(stats_cog.stats.record_game(1, [5, 6], [1, 2]))
         asyncio.run(stats_cog.stats.record_game(1, [3, 4], [7, 8]))
     lobby_cog = lobby.Lobby.__new__(lobby.Lobby)
-    lobby_cog.store = NS(data={})
+    from storage import JsonStore
+    lobby_cog.store = JsonStore(tmp_path / "lobbies.json")
 
     async def save():
-        pass
+        await lobby_cog.store.save()
 
     lobby_cog.save = save
     lobby_cog.build_embed = lambda guild, record: None
@@ -223,14 +224,20 @@ def test_report_result_pays_bets_bounty_duels_and_undo(tmp_path, monkeypatch):
     async def edit_message(**kwargs):
         pass
 
+    async def defer():
+        await asyncio.sleep(0)  # два клика могут пройти первичную проверку до ответа Discord
+
     interaction = NS(
         client=bot, guild=guild, user=NS(id=1, guild_permissions=NS(manage_events=False)),
         message=NS(id=777, guild=guild, edit=edit), channel_id=9, channel=None,
-        response=NS(edit_message=edit_message), followup=NS(send=followup_send),
+        response=NS(edit_message=edit_message, defer=defer), followup=NS(send=followup_send),
+        edit_original_response=edit_message,
     )
 
     async def scenario():
-        await lobby.report_result(interaction, 777, 0)  # синие (1, 2) свалили лидера 5
+        await asyncio.gather(lobby.report_result(interaction, 777, 0), lobby.report_result(interaction, 777, 0))
+        assert len(record["results"]) == 1  # два одновременных клика — одна катка
+        assert JsonStore(tmp_path / "lobbies.json").load()["777"]["round"] == 2
         announce = sent[0][0][0]
         assert "Апсет" in announce and "Охота на голову" in announce and "Дуэль" in announce
         assert "Ставки сыграли" in announce
@@ -240,7 +247,11 @@ def test_report_result_pays_bets_bounty_duels_and_undo(tmp_path, monkeypatch):
         assert record["round"] == 2
         undo = sent[1][1]["view"]
         button = next(item for item in undo.children)
-        await button.callback(NS(client=bot, guild=guild, response=NS(edit_message=edit_message)))
+        undo_interaction = NS(client=bot, guild=guild,
+                              response=NS(edit_message=edit_message, defer=defer),
+                              edit_original_response=edit_message)
+        await button.callback(undo_interaction)
+        await button.callback(undo_interaction)  # повторная отмена не забирает награду дважды
         assert record["round"] == 1 and record["results"] == []
         assert w.balance(1, 1) == bets.START_COINS and w.balance(1, 99) == bets.START_COINS - 200
         assert w.balance(1, 2) == bets.START_COINS - 150 and len(w.active_duels(1)) == 1
