@@ -2430,4 +2430,71 @@ class Lobby(commands.Cog):
         who=[
             app_commands.Choice(name="Состав", value=PING_WHO_ROSTER),
             app_commands.Choice(name="Состав и запасных", value=PING_WHO_ALL),
-            app_commands.
+            app_commands.Choice(name="Только запасных", value=PING_WHO_SUBS),
+        ]
+    )
+    @app_commands.guild_only()
+    async def ping(
+        self,
+        interaction: discord.Interaction,
+        text: str | None = None,
+        who: app_commands.Choice[str] | None = None,
+    ) -> None:
+        found = self.latest_open_record(interaction.guild)
+        if found is None:
+            await respond(interaction, "Активных сборов нет. Создайте новый через `/custom` или `/scrim`.")
+            return
+        message_id, record = found
+
+        # Звать людей может организатор или тот, кто сам записан на этот сбор.
+        participants = set(record[STATUS_IN]) | set(record[STATUS_SUB]) | set(record[STATUS_OUT])
+        if not (self.is_organizer(interaction, record) or interaction.user.id in participants):
+            await respond(interaction, "Позвать состав может организатор сбора или тот, кто в нём записан.")
+            return
+
+        target = who.value if who else PING_WHO_ROSTER
+        statuses = {
+            PING_WHO_ROSTER: (STATUS_IN,),
+            PING_WHO_ALL: (STATUS_IN, STATUS_SUB),
+            PING_WHO_SUBS: (STATUS_SUB,),
+        }[target]
+
+        members: list[discord.Member] = []
+        for status in statuses:
+            for member in self.members_from_ids(interaction.guild, record[status]):
+                if member not in members:
+                    members.append(member)
+
+        if not members:
+            await respond(interaction, "Звать некого — в этом списке пока никто не записан.")
+            return
+
+        kind = record.get("kind", KIND_SCRIM)
+        title = KIND_TITLES.get(kind, KIND_TITLES[KIND_SCRIM])
+        jump_url = f"https://discord.com/channels/{interaction.guild.id}/{record['channel_id']}/{message_id}"
+
+        lines = [f"🔔 **{title}** · {record['time']}"]
+        if text:
+            lines.append(text)
+        lines.append(" ".join(member.mention for member in members))
+        lines.append(f"[Пост сбора]({jump_url})")
+
+        await interaction.response.send_message(
+            "\n".join(lines),
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=members),
+        )
+
+    @app_commands.command(name="roster", description="Показать состав последнего открытого сбора")
+    @app_commands.guild_only()
+    async def roster(self, interaction: discord.Interaction) -> None:
+        found = self.latest_open_record(interaction.guild)
+        if found is None:
+            await respond(interaction, "Открытых сборов нет. Создайте новый через `/scrim` или `/custom`.")
+            return
+
+        _message_id, record = found
+        await respond(interaction, embed=self.build_embed(interaction.guild, record))
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(Lobby(bot))
