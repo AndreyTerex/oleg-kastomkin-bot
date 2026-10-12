@@ -410,3 +410,48 @@ def test_important_reply_waits_for_vpn_and_still_gets_a_strong_model(monkeypatch
     reply = asyncio.run(client.complete("s", "u"))
     assert reply.model == "gemini:gemini-3.7-flash" and "oss" not in calls
     assert fake.waits == [config.LLM_VPN_WAIT]
+
+
+def test_total_deadline_cancels_stalled_provider(monkeypatch):
+    import asyncio
+    import pytest
+    import config
+    from llm import LLMClient, LLMUnavailable
+
+    monkeypatch.setattr(config, "LLM_REPLY_TIMEOUT", 0.02)
+    client = LLMClient([])
+    cancelled = []
+    async def stalled(*args, **kwargs):
+        try:
+            await asyncio.sleep(1)
+        finally:
+            cancelled.append(True)
+    monkeypatch.setattr(client, "_complete", stalled)
+    async def run():
+        with pytest.raises(LLMUnavailable, match="время ожидания"):
+            await client.complete("s", "u")
+    asyncio.run(run())
+    assert cancelled == [True]
+
+
+def test_slow_provider_leaves_time_for_fallback(monkeypatch):
+    import asyncio
+    import config
+    from llm import LLMClient, Reply
+
+    monkeypatch.setattr(config, "LLM_PROVIDER_TIMEOUT", 0.01)
+    monkeypatch.setattr(config, "LLM_REPLY_TIMEOUT", 1)
+    client = LLMClient([provider("slow", "a"), provider("fast", "b")])
+    async def ask(p, *args):
+        if p.name == "slow":
+            await asyncio.sleep(1)
+        return Reply("готово", p.model, 1)
+    monkeypatch.setattr(client, "_ask_with_retries", ask)
+    async def run():
+        try:
+            reply = await client.complete("s", "u")
+            assert reply.model == "b"
+            assert client._blocked_until["slow:a"] > 0
+        finally:
+            await client.close()
+    asyncio.run(run())

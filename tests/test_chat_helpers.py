@@ -65,9 +65,8 @@ def test_human_gap():
     assert chat.human_gap(timedelta(days=2)) == "2 дн"
 
 
-def test_pick_mood_and_tactic_never_repeat_and_skip_mimic_on_short_text():
+def test_tactics_vary_and_skip_mimic_on_short_text():
     for _ in range(200):
-        assert chat.pick_mood("гг", last="цундере")[0] != "цундере"
         tactic = chat.pick_tactic("гг", last="провокатор")
         assert tactic[0] not in ("провокатор", "подражатель")
 
@@ -302,3 +301,20 @@ def test_fun_line_samples_fresh_phrases():
     assert "«ладушки»" not in line
     # Подсказка не одна и та же каждый раз.
     assert len({chat.fun_line() for _ in range(10)}) > 1
+
+
+def test_mood_has_continuity_and_mistress_requires_cue(monkeypatch):
+    seen = []
+    monkeypatch.setattr(chat.random, "choices", lambda options, weights, k: seen.append(dict(zip(options, weights))) or [options[0]])
+    chat.pick_mood("сегодня работаю", last="кудэрэ")
+    weights = {mood[0]: weight for mood, weight in seen[0].items()}
+    assert weights["кудэрэ"] > weights["гэнки"]
+    assert weights["госпожа"] == 0
+    assert not persona.MOOD_TRIGGERS["госпожа"].search("работа")
+
+
+def test_single_reply_json_preserves_actions_and_rejects_invalid():
+    assert chat.pick_variant('{"reply":"Мид твой, леснику соболезную.","action":null}') == "Мид твой, леснику соболезную."
+    assert chat.pick_variant('{"reply":42}') is None
+    assert chat.pick_variant('{"reply":"   "}') is None
+    assert chat.pick_variant('{"skip":true}', allow_skip=True) == ""

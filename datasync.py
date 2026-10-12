@@ -14,10 +14,12 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+from storage import recover_transactions
+
 # Что переносится. Всё остальное в data/ (vpn.json, llm_usage.json, heartbeat, backups) — нет.
 SYNC_FILES = (
     "stats.json", "memory.json", "oleg.json", "lobbies.json", "champion_history.json", "recap.json", "invites.json",
-    "wallet.json", "quiz.json", "patchnotes.json",
+    "wallet.json", "quiz.json", "patchnotes.json", "lobby_preferences.json",
 )
 META_FILE = "oleg-export.json"
 FORMAT_VERSION = 1
@@ -33,6 +35,7 @@ class ImportError_(ValueError):
 def build_archive(data_dir: str | os.PathLike[str], guild_ids: list[int]) -> tuple[bytes, list[str]]:
     """ZIP с данными и описанием. Возвращает байты архива и список вошедших файлов."""
     data = Path(data_dir)
+    recover_transactions(data)
     buffer = io.BytesIO()
     included = []
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:

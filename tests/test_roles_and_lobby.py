@@ -291,7 +291,8 @@ def test_finish_button_and_series_reset():
 
     record = _record(stage=lobby.STAGE_DONE, teams=[[1], [2]], round=2, results=[{"winner": 0, "game": 5}],
                      deal={"lanes": {}}, captains=[1, 2], last_report_at=1.0)
-    assert lobby.CUSTOM_ID_FINISH in asyncio.run(buttons(record))
+    assert lobby.CUSTOM_ID_MANAGE in asyncio.run(buttons(record))
+    assert lobby.CUSTOM_ID_FINISH not in asyncio.run(buttons(record))
     assert lobby.CUSTOM_ID_FINISH not in asyncio.run(buttons(_record()))  # до команд — нечего завершать
     assert lobby.CUSTOM_ID_FINISH not in asyncio.run(buttons(_record(kind=lobby.KIND_SCRIM, teams=[[1], [2]])))
 

@@ -147,6 +147,8 @@ XRAY_BIN: str = os.getenv("XRAY_BIN", "xray").strip() or "xray"
 VPN_PROXY_URL: str = f"http://127.0.0.1:{VPN_PORT}" if (VPN_SUBSCRIPTION or VPN_URL) else ""
 LLM_PROXY: str = os.getenv("LLM_PROXY", "").strip() or VPN_PROXY_URL
 # Сколько раз за запрос переспрашивать перегруженную модель (HTTP 503) перед переходом к следующей.
+LLM_REPLY_TIMEOUT: int = max(5, _env_int("LLM_REPLY_TIMEOUT", 35))
+LLM_PROVIDER_TIMEOUT: int = max(2, _env_int("LLM_PROVIDER_TIMEOUT", 12))
 LLM_OVERLOAD_RETRIES: int = max(0, _env_int("LLM_OVERLOAD_RETRIES", 3))
 LLM_PROXY_FOR: list[str] = [
     name.strip().lower() for name in os.getenv("LLM_PROXY_FOR", "all").split(",") if name.strip()
