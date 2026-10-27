@@ -61,6 +61,15 @@ class CaptainHistory:
     def recent(self, guild_id: int) -> list[dict]:
         return self.store.data.setdefault(str(guild_id), [])
 
+    def replace(self, guild_id: int, lobby_id: int | str, old: int, new: int) -> bool:
+        """Замена капитана в сборе: в истории капитанил уже новый игрок (сохраняет вызывающий)."""
+        changed = False
+        for entry in self.recent(guild_id):
+            if entry.get("lobby") == lobby_id and old in entry["pair"]:
+                entry["pair"] = [new if user_id == old else user_id for user_id in entry["pair"]]
+                changed = True
+        return changed
+
     async def draw(self, guild_id: int, lobby_id: int | str, player_ids: list[int], count: int = 2) -> list[int]:
         """Выбирает капитанов сбора и запоминает. Повторная жеребьёвка в сборе заменяет прошлую."""
         recent = self.recent(guild_id)

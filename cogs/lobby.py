@@ -1360,11 +1360,16 @@ class SubstituteView(discord.ui.View):
             await respond(interaction, "Бот в кастомку не заходит~")
             return
         stats_cog = interaction.client.get_cog("Stats")
+        history = getattr(cog, "captain_history", None)
         stores = [cog.store] + ([stats_cog.wallets.store] if stats_cog is not None else [])
+        if history is not None:
+            stores.append(history.store)
         refunded = 0
         try:
             with transaction(*stores):
                 side = substitute(record, old, newcomer.id)
+                if history is not None and history.replace(guild.id, self.lobby_message.id, old, newcomer.id):
+                    await history.store.save()
                 if stats_cog is not None:
                     refunded = stats_cog.wallets.refund_wrong_side(
                         guild.id, self.lobby_message.id, bet_round(record), newcomer.id, side,

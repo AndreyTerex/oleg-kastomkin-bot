@@ -30,6 +30,25 @@ def test_substitute_takes_place_lane_champions_and_captaincy():
     assert record["teams"][1] == [3, 6] and 6 not in record["out"] and 4 in record["sub"]
 
 
+def test_substitute_replaces_team_lists_for_in_flight_result():
+    record = game_record()
+    winners, losers = record["teams"]
+    substitute(record, 1, 5)
+    # запись результата, начатая до замены, видит, что составы уже другие
+    assert record["teams"] != [winners, losers] and winners == [1, 2]
+
+
+def test_captain_history_follows_substitute(tmp_path):
+    import captains
+
+    history = captains.CaptainHistory(tmp_path / "captains.json")
+    history.load()
+    history.recent(1)[:] = [{"lobby": 555, "pair": [1, 3]}, {"lobby": 777, "pair": [2, 4]}]
+    assert history.replace(1, 555, 1, 5)
+    assert history.recent(1)[0]["pair"] == [5, 3] and history.recent(1)[1]["pair"] == [2, 4]
+    assert not history.replace(1, 555, 2, 6)  # 2 не капитанил в этом сборе
+
+
 def test_substitute_rejects_bad_cases():
     record = game_record()
     with pytest.raises(RosterError):
@@ -79,6 +98,11 @@ def test_substitute_button_end_to_end(tmp_path, monkeypatch):
 
     cog.save = save
     cog.build_embed = lambda guild, rec: None
+    import captains
+
+    cog.captain_history = captains.CaptainHistory(tmp_path / "captains.json")
+    cog.captain_history.load()
+    cog.captain_history.recent(1).append({"lobby": 555, "pair": [1, 3]})
     stats_cog = StatsCog.__new__(StatsCog)
     stats_cog.wallets = bets.Wallets(tmp_path / "wallet.json")
     stats_cog.wallets.load()
@@ -111,4 +135,5 @@ def test_substitute_button_end_to_end(tmp_path, monkeypatch):
     assert record["teams"] == [[5, 2], [3, 4]] and record["captains"] == [5, 3]
     assert "Замена" in sent[0] and "Garen" in sent[0] and "возвращена" in sent[0]
     assert stats_cog.wallets.balance(1, 5) == bets.START_COINS
+    assert JsonStore(tmp_path / "captains.json").load()["1"][0]["pair"] == [5, 3]
     assert JsonStore(tmp_path / "lobbies.json").load()["555"]["teams"] == [[5, 2], [3, 4]]  # сохранено на диск

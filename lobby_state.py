@@ -66,17 +66,17 @@ def substitute(record: dict, old: int, new: int) -> int:
         raise RosterError("Этого игрока нет в командах.")
     if any(new in team for team in teams):
         raise RosterError("Новый игрок уже в одной из команд — поменять местами можно через «Пересобрать составы».")
-    team = teams[side]
-    team[team.index(old)] = new
+    # Новые списки, а не правка на месте: запись результата держит ссылки на старые составы
+    # и по их несовпадению видит, что команды поменялись, пока она шла.
+    record["teams"] = [[new if user_id == old else user_id for user_id in team] for team in teams]
 
     deal = record.get("deal") or {}
     for key in ("lanes", "champions"):
         part = deal.get(key) or {}
         if str(old) in part:
             part[str(new)] = part.pop(str(old))
-    captains = record.get("captains") or []
-    if old in captains:
-        captains[captains.index(old)] = new
+    if old in (record.get("captains") or []):
+        record["captains"] = [new if user_id == old else user_id for user_id in record["captains"]]
 
     for key in ("in", "sub", "out"):
         if new in record.setdefault(key, []):
