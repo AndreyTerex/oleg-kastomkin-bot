@@ -46,6 +46,8 @@ class CaptainsView(discord.ui.View):
         self.author = author
         self.players = players
         self.captains: list[discord.Member] = []
+        # Ключ жеребьёвки в истории капитанов: переброс заменяет её, а не добавляет новую.
+        self.key = ""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author.id:
@@ -65,7 +67,7 @@ class CaptainsView(discord.ui.View):
 
     @discord.ui.button(label="Перебросить", emoji="🎲", style=discord.ButtonStyle.secondary)
     async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        self.captains = random.sample(self.players, len(self.captains))
+        self.captains = await self.cog.draw_captains(interaction, self.key, self.players, len(self.captains))
         await interaction.response.edit_message(
             embed=self.cog.captains_embed(self.captains, self.players), view=self
         )
@@ -287,10 +289,21 @@ class Scrim(commands.Cog):
             return None
         return voice, players
 
+    async def draw_captains(
+        self, interaction: discord.Interaction, key: str, players: list[discord.Member], count: int,
+    ) -> list[discord.Member]:
+        """Капитаны с честной ротацией (история — у модуля сборов); без него — просто случайно."""
+        lobby = self.bot.get_cog("Lobby")
+        if lobby is None:
+            return random.sample(players, count)
+        by_id = {member.id: member for member in players}
+        ids = await lobby.captain_history.draw(interaction.guild.id, key, list(by_id), count)
+        return [by_id[user_id] for user_id in ids]
+
     def captains_embed(self, captains: list[discord.Member], players: list[discord.Member]) -> discord.Embed:
         embed = discord.Embed(
             title="Жеребьёвка капитанов",
-            description="Капитаны выбраны случайно среди участников голосового канала.",
+            description="Капитаны выбраны случайно среди участников голосового канала — с ротацией: прошлые капитаны отдыхают.",
             color=NEUTRAL,
         )
         for index, captain in enumerate(captains):
@@ -317,7 +330,8 @@ class Scrim(commands.Cog):
         _voice, players = result
 
         view = CaptainsView(self, interaction.user, players)
-        view.captains = random.sample(players, count)
+        view.key = f"voice:{interaction.id}"
+        view.captains = await self.draw_captains(interaction, view.key, players, count)
         await interaction.response.send_message(
             embed=self.captains_embed(view.captains, players), view=view
         )
