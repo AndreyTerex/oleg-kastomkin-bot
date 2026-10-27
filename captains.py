@@ -27,14 +27,21 @@ def weights(candidates: list[int], recent: list[dict]) -> list[float]:
     return [1 / (1 + counts[user_id]) ** 2 for user_id in candidates]
 
 
-def pick(player_ids: list[int], recent: list[dict], rng: random.Random | None = None, count: int = 2) -> list[int]:
-    """count капитанов из player_ids с учётом истории recent (старые записи первыми)."""
+def pick(
+    player_ids: list[int], recent: list[dict], rng: random.Random | None = None, count: int = 2,
+    avoid: list[int] = (),
+) -> list[int]:
+    """count капитанов из player_ids с учётом истории recent (старые записи первыми).
+
+    avoid — пара, которую перебрасывают: она не выпадает, если есть из кого выбрать (важнее отдыха прошлой пары)."""
     rng = rng or random
     candidates = list(player_ids)
-    if recent:
-        rested = [user_id for user_id in candidates if user_id not in recent[-1]["pair"]]
-        if len(rested) >= count:
+    last = recent[-1]["pair"] if recent else []
+    for excluded in (set(avoid) | set(last), set(avoid)):
+        rested = [user_id for user_id in candidates if user_id not in excluded]
+        if excluded and len(rested) >= count:
             candidates = rested
+            break
     chosen = []
     for _ in range(min(count, len(candidates))):
         user_id = rng.choices(candidates, weights=weights(candidates, recent))[0]
@@ -57,8 +64,10 @@ class CaptainHistory:
     async def draw(self, guild_id: int, lobby_id: int | str, player_ids: list[int], count: int = 2) -> list[int]:
         """Выбирает капитанов сбора и запоминает. Повторная жеребьёвка в сборе заменяет прошлую."""
         recent = self.recent(guild_id)
-        pair = pick(player_ids, recent, count=count)
+        previous = [entry for entry in recent if entry.get("lobby") == lobby_id]
         recent[:] = [entry for entry in recent if entry.get("lobby") != lobby_id]
+        avoid = previous[-1]["pair"] if previous else []
+        pair = pick(player_ids, recent, count=count, avoid=avoid)
         recent.append({"lobby": lobby_id, "pair": pair, "at": time.time()})
         del recent[:-HISTORY]
         await self.store.save()

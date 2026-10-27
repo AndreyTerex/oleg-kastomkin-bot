@@ -35,3 +35,13 @@ def test_redraw_in_same_lobby_replaces_entry(tmp_path):
     for lobby in range(30):
         asyncio.run(history.draw(1, lobby, players))
     assert len(history.recent(1)) == captains.HISTORY
+
+
+def test_reroll_avoids_own_pair_even_after_newer_draw(tmp_path):
+    history = captains.CaptainHistory(tmp_path / "captains.json")
+    history.load()
+    history.recent(1)[:] = [{"lobby": 555, "pair": [1, 2]}, {"lobby": 777, "pair": [3, 4]}]
+    for _ in range(20):
+        pair = asyncio.run(history.draw(1, 555, [1, 2, 3, 4]))
+        assert set(pair) != {1, 2} and len(set(pair)) == 2
+        history.recent(1)[:] = [{"lobby": 555, "pair": [1, 2]}, {"lobby": 777, "pair": [3, 4]}]
