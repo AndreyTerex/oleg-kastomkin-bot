@@ -181,6 +181,18 @@ class Wallets:
                 del pools[key]
         return refunded
 
+    def refund_wrong_side(self, guild_id: int, lobby_id: int, round_no: int | str, user_id: int, side: int) -> int:
+        """Игрок попал в команду заменой, а ставка у него на соперников — ставку возвращаем. Сколько вернули."""
+        pool = self.pool(guild_id, lobby_id, round_no)
+        if pool is None or pool.get("settled") is not None:
+            return 0
+        bet = pool["bets"].get(str(user_id))
+        if bet is None or bet["side"] == side:
+            return 0
+        del pool["bets"][str(user_id)]
+        self._user(guild_id, user_id)["coins"] += bet["amount"]
+        return bet["amount"]
+
     def totals(self, pool: dict) -> tuple[int, int]:
         blue = sum(b["amount"] for b in pool["bets"].values() if b["side"] == 0)
         red = sum(b["amount"] for b in pool["bets"].values() if b["side"] == 1)
