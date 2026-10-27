@@ -24,7 +24,7 @@ from champions import POOL, ChampionsUnavailable
 from cogs.scrim import DraftView
 from stats import ELO_START, expected_score
 from storage import JsonStore, transaction
-from lobby_state import RosterError, change_roster, set_waiting
+from lobby_state import RosterError, change_roster, set_waiting, substitute
 from timeparse import parse_when
 from utils import BLUE_SIDE, NEUTRAL, RED_SIDE, format_players, lanes_badge, player_name, respond, shuffled
 
@@ -993,13 +993,27 @@ class ManageView(FinishView):
         if record is None:
             return
         if record.get("stage", STAGE_SIGNUP) != STAGE_SIGNUP:
-            await respond(interaction, "Сначала нажмите «Пересобрать составы» — сыгранные катки сохранятся.")
+            await respond(interaction, "Команды уже поделены: поменять одного — «Замена игрока», переделать всё — «Пересобрать составы» (сыгранные катки сохранятся).")
             return
         view = RosterEditView(self.cog, record, self.lobby_message)
         if not view.has_players:
             await respond(interaction, "В сборе пока никого нет.")
             return
         await interaction.response.edit_message(content="Выберите игроков и действие.", view=view)
+
+    @discord.ui.button(label="Замена игрока", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
+    async def replace(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        record = await self._record(interaction)
+        if record is None:
+            return
+        if record.get("stage") != STAGE_DONE or len(record.get("teams") or []) != 2:
+            await respond(interaction, "Замена — когда команды уже поделены. До запуска правьте запись через «Правка состава».")
+            return
+        view = SubstituteView(self.cog, record, self.lobby_message)
+        await interaction.response.edit_message(
+            content="Кого меняем и кто заходит? Новый игрок займёт его место: та же команда, линия и чемпионы.",
+            view=view,
+        )
 
     @discord.ui.button(label="Режим", emoji="🎲", style=discord.ButtonStyle.secondary, row=1)
     async def mode(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1304,6 +1318,93 @@ class ModeView(discord.ui.View):
             item.disabled = True
         await interaction.response.edit_message(content="\n".join(lines), view=self)
         self.stop()
+
+
+class SubstituteView(discord.ui.View):
+    """Замена игрока в уже поделённых командах — без пересбора серии. Видит только организатор."""
+
+    def __init__(self, cog: "Lobby", record: dict, lobby_message: discord.Message) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.record = record
+        self.lobby_message = lobby_message
+        guild = lobby_message.guild
+        options = []
+        for side, team in enumerate(record["teams"]):
+            for user_id in team:
+                member = guild.get_member(user_id)
+                label = player_name(member) if member else f"ушёл с сервера ({user_id})"
+                options.append(discord.SelectOption(label=label[:100], value=str(user_id), emoji="🔵🔴"[side]))
+        self.leaving = discord.ui.Select(placeholder="Кто уходит", options=options[:25], row=0)
+        self.leaving.callback = self._remember
+        self.coming = discord.ui.UserSelect(placeholder="Кто заходит", row=1)
+        self.coming.callback = self._remember
+        self.add_item(self.leaving)
+        self.add_item(self.coming)
+
+    async def _remember(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Заменить", emoji="🔁", style=discord.ButtonStyle.primary, row=2)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.leaving.values or not self.coming.values:
+            await respond(interaction, "Выберите, кто уходит и кто заходит.")
+            return
+        cog, guild = self.cog, interaction.guild
+        record = cog.get_record(self.lobby_message.id)
+        if record is None or not cog.is_organizer(interaction, record):
+            await respond(interaction, "Сбор больше не отслеживается или у тебя нет прав управления.")
+            return
+        old, newcomer = int(self.leaving.values[0]), self.coming.values[0]
+        if newcomer.bot:
+            await respond(interaction, "Бот в кастомку не заходит~")
+            return
+        stats_cog = interaction.client.get_cog("Stats")
+        history = getattr(cog, "captain_history", None)
+        stores = [cog.store] + ([stats_cog.wallets.store] if stats_cog is not None else [])
+        if history is not None:
+            stores.append(history.store)
+        refunded = 0
+        try:
+            with transaction(*stores):
+                side = substitute(record, old, newcomer.id)
+                if history is not None and history.replace(guild.id, self.lobby_message.id, old, newcomer.id):
+                    await history.store.save()
+                if stats_cog is not None:
+                    refunded = stats_cog.wallets.refund_wrong_side(
+                        guild.id, self.lobby_message.id, bet_round(record), newcomer.id, side,
+                    )
+                    await stats_cog.wallets.save()
+                await cog.save()
+        except RosterError as error:
+            await respond(interaction, str(error))
+            return
+        self.stop()
+        leaving = guild.get_member(old)
+        lines = [
+            f"🔁 Замена у {(BLUE_SIDE, RED_SIDE)[side]}: **{player_name(leaving) if leaving else 'ушедший'}** → "
+            f"{newcomer.mention}"
+        ]
+        deal = record.get("deal") or {}
+        lane = (deal.get("lanes") or {}).get(str(newcomer.id))
+        champions = (deal.get("champions") or {}).get(str(newcomer.id))
+        if lane or champions:
+            parts = [f"линия **{config.LANE_BY_KEY[lane].label}**" if lane in config.LANE_BY_KEY else None,
+                     ("чемпионы: " + ", ".join(champions)) if champions else None]
+            lines.append("Достаётся от предшественника: " + "; ".join(p for p in parts if p) + ".")
+        if refunded:
+            lines.append(f"-# Ставка {player_name(newcomer)} на соперников ({refunded} коинов) возвращена.")
+        await interaction.response.edit_message(content="Готово — замена записана.", view=None)
+        try:
+            await self.lobby_message.edit(embed=cog.build_embed(guild, record), view=LobbyView(record))
+        except discord.HTTPException:
+            log.warning("Не удалось обновить пост сбора %s после замены", self.lobby_message.id)
+        try:
+            await interaction.followup.send(
+                "\n".join(lines), allowed_mentions=discord.AllowedMentions(users=[newcomer]),
+            )
+        except discord.HTTPException:
+            log.warning("Не удалось объявить замену в сборе %s", self.lobby_message.id)
 
 
 class RosterEditView(discord.ui.View):
