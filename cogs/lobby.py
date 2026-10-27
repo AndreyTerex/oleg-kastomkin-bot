@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +16,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import bets
+from captains import CaptainHistory
 import config
 import modes
 import portraits
@@ -585,8 +585,9 @@ class LobbyView(discord.ui.View):
 
         mode = modes.get_mode(record)
         if mode["teams"] == modes.TEAMS_DRAFT:
-            captains = random.sample(players[:target], 2)
-            record["captains"] = [captain.id for captain in captains]
+            record["captains"] = await cog.captain_history.draw(
+                interaction.guild.id, interaction.message.id, [member.id for member in players[:target]],
+            )
             record["teams"] = None
             record["deal"] = None
             record["stage"] = STAGE_CAPTAINS
@@ -1470,6 +1471,7 @@ class Lobby(commands.Cog):
         self.bot = bot
         self.store = JsonStore(Path(config.DATA_DIR) / "lobbies.json")
         self.preferences = JsonStore(Path(config.DATA_DIR) / "lobby_preferences.json")
+        self.captain_history = CaptainHistory()
         # Когда какой чемпион выпадал на сервере: id сервера → {id чемпиона: время}.
         self.champion_history = JsonStore(Path(config.DATA_DIR) / "champion_history.json")
         self._refresh_task: asyncio.Task | None = None
@@ -1481,6 +1483,7 @@ class Lobby(commands.Cog):
     async def cog_load(self) -> None:
         self.champion_history.load()
         self.preferences.load()
+        self.captain_history.load()
         data = self.store.load()
         now = time.time()
         fresh = {

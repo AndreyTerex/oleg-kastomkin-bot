@@ -19,7 +19,7 @@ from storage import recover_transactions
 # Что переносится. Всё остальное в data/ (vpn.json, llm_usage.json, heartbeat, backups) — нет.
 SYNC_FILES = (
     "stats.json", "memory.json", "oleg.json", "lobbies.json", "champion_history.json", "recap.json", "invites.json",
-    "wallet.json", "quiz.json", "patchnotes.json", "lobby_preferences.json",
+    "wallet.json", "quiz.json", "patchnotes.json", "lobby_preferences.json", "captains.json",
 )
 META_FILE = "oleg-export.json"
 FORMAT_VERSION = 1
