@@ -795,6 +795,7 @@ def test_export_local_moves_database_back_to_files(database, monkeypatch, tmp_pa
     local = tmp_path / "local-data"
     local.mkdir()
     (local / "stats.json").write_text('{"old": {}}')
+    (local / "memory.json").write_text('{"stale": {}}')  # в базе такого нет — после переноса пусто
     monkeypatch.setattr(config, "DATABASE_URL", dsn)
     monkeypatch.setattr(config, "SHARED_STATE_KEY", namespace)
     monkeypatch.setattr(config, "DATA_DIR", str(local))
@@ -807,8 +808,32 @@ def test_export_local_moves_database_back_to_files(database, monkeypatch, tmp_pa
     shared_admin.main(["export-local"])
     exported = json.loads((local / "stats.json").read_text())
     assert exported["1"]["players"]["10"]["wins"] == 1
+    assert json.loads((local / "memory.json").read_text()) == {}
     backups = list((local / datasync.IMPORT_BACKUPS).iterdir())
     assert json.loads((backups[0] / "stats.json").read_text()) == {"old": {}}
+    assert json.loads((backups[0] / "memory.json").read_text()) == {"stale": {}}
+
+
+def test_admin_operations_use_vpn_tunnel(monkeypatch):
+    import contextlib
+    seen = []
+
+    @contextlib.contextmanager
+    def tunnel():
+        yield 15432
+
+    def fake_open(port):
+        seen.append(port)
+        raise shared_state.SharedStateError("stop here")
+
+    monkeypatch.setattr(config, "DATABASE_URL", "postgresql://u@db.example.com/x?sslmode=require")
+    monkeypatch.setattr(shared_admin, "database_tunnel", tunnel)
+    monkeypatch.setattr(shared_admin, "open_backend", fake_open)
+    with pytest.raises(shared_state.SharedStateError):
+        shared_admin.main(["export-local"])
+    with pytest.raises(shared_state.SharedStateError):
+        shared_admin.main(["backup", "--apply", "--backup", "/nonexistent/x.zip"])
+    assert seen == [15432, 15432]
 
 
 def test_connection_goes_through_local_tunnel_port(database):
