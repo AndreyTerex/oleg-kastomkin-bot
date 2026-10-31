@@ -167,6 +167,10 @@ VPN_CHECK_GEMINI: bool = bool(GEMINI_API_KEY) and ("all" in LLM_PROXY_FOR or "ge
 # Discord через VPN (VPN_FOR_DISCORD=1). По умолчанию напрямую: через нестабильный VPN-сервер соединение
 # с Discord рвалось, и нажатия кнопок в это время пропадали («Приложение не ответило вовремя»).
 VPN_FOR_DISCORD: bool = os.getenv("VPN_FOR_DISCORD", "0").strip().lower() not in ("0", "false", "no", "off", "нет")
+# Общая база (DATABASE_URL) через VPN бота: из России облачные базы часто недоступны напрямую, а VPN на самом
+# компьютере включают и выключают. По умолчанию включено, когда задан VPN бота. VPN_DB_PORT — локальный порт туннеля.
+VPN_FOR_DATABASE: bool = os.getenv("VPN_FOR_DATABASE", "1").strip().lower() not in ("0", "false", "no", "off", "нет")
+VPN_DB_PORT: int = _env_int("VPN_DB_PORT", VPN_PORT - 1)
 
 # Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Первым — Gemini (самые сильные
 # бесплатные модели), за ним Puter и Z.ai (если заданы ключи), TokenHarbor и OpenRouter. Groq отвечает

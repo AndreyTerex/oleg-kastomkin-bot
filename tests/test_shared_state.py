@@ -785,3 +785,140 @@ def test_address_change_reclaims_own_stale_session_instead_of_stopping(database)
     other.connection = psycopg.connect(dsn, autocommit=True)
     other.owned = True
     assert not other._lock_after_reconnect()
+
+
+def test_export_local_moves_database_back_to_files(database, monkeypatch, tmp_path):
+    owner, _, directory, dsn, namespace = database
+    stats = Stats(directory / "stats.json")
+    stats.load()
+    asyncio.run(stats.record_game(1, [10], [20], event_key="before-export"))
+    local = tmp_path / "local-data"
+    local.mkdir()
+    (local / "stats.json").write_text('{"old": {}}')
+    (local / "memory.json").write_text('{"stale": {}}')  # в базе такого нет — после переноса пусто
+    monkeypatch.setattr(config, "DATABASE_URL", dsn)
+    monkeypatch.setattr(config, "SHARED_STATE_KEY", namespace)
+    monkeypatch.setattr(config, "DATA_DIR", str(local))
+    configure_shared(None)
+    # Бот ещё держит базу — экспорт отказывается, файлы не тронуты.
+    with pytest.raises(shared_state.SharedStateError, match="остановите"):
+        shared_admin.main(["export-local"])
+    assert json.loads((local / "stats.json").read_text()) == {"old": {}}
+    owner.close()
+    shared_admin.main(["export-local"])
+    exported = json.loads((local / "stats.json").read_text())
+    assert exported["1"]["players"]["10"]["wins"] == 1
+    assert json.loads((local / "memory.json").read_text()) == {}
+    backups = list((local / datasync.IMPORT_BACKUPS).iterdir())
+    assert json.loads((backups[0] / "stats.json").read_text()) == {"old": {}}
+    assert json.loads((backups[0] / "memory.json").read_text()) == {"stale": {}}
+
+
+def test_admin_operations_use_vpn_tunnel(monkeypatch):
+    import contextlib
+    seen = []
+
+    @contextlib.contextmanager
+    def tunnel():
+        yield 15432
+
+    def fake_open(port):
+        seen.append(port)
+        raise shared_state.SharedStateError("stop here")
+
+    monkeypatch.setattr(config, "DATABASE_URL", "postgresql://u@db.example.com/x?sslmode=require")
+    monkeypatch.setattr(shared_admin, "database_tunnel", tunnel)
+    monkeypatch.setattr(shared_admin, "open_backend", fake_open)
+    with pytest.raises(shared_state.SharedStateError):
+        shared_admin.main(["export-local"])
+    with pytest.raises(shared_state.SharedStateError):
+        shared_admin.main(["backup", "--apply", "--backup", "/nonexistent/x.zip"])
+    assert seen == [15432, 15432]
+
+
+def _tcp_forwarder(target_host, target_port):
+    """Локальный порт → сервер базы: так же, как туннель Xray (байты насквозь)."""
+    import socket
+    import threading
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    forwarded = []
+
+    def pump(src, dst):
+        try:
+            while data := src.recv(65536):
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for sock in (src, dst):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def accept():
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            forwarded.append(client)
+            upstream = socket.create_connection((target_host, target_port))
+            threading.Thread(target=pump, args=(client, upstream), daemon=True).start()
+            threading.Thread(target=pump, args=(upstream, client), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    return listener, listener.getsockname()[1], forwarded
+
+
+def _tls_test_dsn(dsn):
+    """DSN с host=localhost и CA тестового сервера; без SSL на тестовой базе — пропуск."""
+    root = os.environ.get("TEST_POSTGRES_SSLROOTCERT")
+    if not root:
+        pytest.skip("Set TEST_POSTGRES_SSLROOTCERT to the CA of an SSL-enabled test PostgreSQL")
+    params = psycopg.conninfo.conninfo_to_dict(dsn)
+    params.update(host="localhost", sslrootcert=root)
+    return psycopg.conninfo.make_conninfo(**params), params
+
+
+def test_tunnel_requires_verified_certificate(database):
+    """Туннель через чужой VPN-узел: соединение только с проверенным сертификатом (verify-full),
+    даже если в DSN sslmode=require. Сертификат от неизвестного центра — отказ (как при подмене)."""
+    owner, _, directory, dsn, _ = database
+    good_dsn, params = _tls_test_dsn(dsn)
+    listener, port, forwarded = _tcp_forwarder("127.0.0.1", int(params.get("port", 5432)))
+    try:
+        tunneled = shared_state.SharedState(good_dsn + " sslmode=require", owner.namespace,
+                                            directory / "tunnel", datasync.SYNC_FILES, tunnel_port=port)
+        try:
+            info = tunneled.connection.info
+            assert info.port == port and forwarded
+            assert tunneled.connection.execute(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()").fetchone()[0]
+            tunneled.require_initialized()
+        finally:
+            tunneled.close()
+        # Без своего CA (системные корни не знают тестовый центр) — как подменённый сервер: не подключаемся.
+        bad = dict(params)
+        bad.pop("sslrootcert")
+        bad["sslmode"] = "require"
+        with pytest.raises(shared_state.SharedStateError):
+            shared_state.SharedState(psycopg.conninfo.make_conninfo(**bad), owner.namespace,
+                                     directory / "tunnel2", datasync.SYNC_FILES, tunnel_port=port)
+    finally:
+        listener.close()
+
+
+def test_tunnel_forces_verify_full_and_trusted_roots():
+    state = shared_state.SharedState.__new__(shared_state.SharedState)
+    state._dsn = "postgresql://u:p@db.example.com/x?sslmode=require"
+    state._tunnel_port = 15432
+    params = state._tunnel_params()
+    assert params["sslmode"] == "verify-full" and params["hostaddr"] == "127.0.0.1" and params["port"] == 15432
+    assert params["sslrootcert"] == shared_state.ca_bundle()
+    state._dsn += "&sslrootcert=/my/ca.pem"
+    assert "sslrootcert" not in state._tunnel_params()  # свой корень из DSN не перетираем
+    state._tunnel_port = None
+    assert state._tunnel_params() == {}

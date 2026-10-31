@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -68,9 +70,60 @@ def write_backup(path: Path, entries: dict):
         os.fsync(out.fileno())
 
 
+@contextlib.contextmanager
+def database_tunnel():
+    """Порт туннеля к базе через VPN бота (как у работающего бота), или None — напрямую.
+    Бот при этом остановлен, поэтому Xray поднимаем сами на время операции."""
+    from vpn import VPN_CLIENT, database_target
+    if not (VPN_CLIENT.enabled and database_target()):
+        yield None
+        return
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(VPN_CLIENT.start())
+        port = VPN_CLIENT.database_port()
+        print("Подключение к базе:", "через VPN бота" if port else "напрямую (VPN бота не поднялся)")
+        yield port
+    finally:
+        loop.run_until_complete(VPN_CLIENT.close())
+        loop.close()
+
+
+def open_backend(tunnel_port: int | None) -> SharedState:
+    return SharedState(config.DATABASE_URL, config.SHARED_STATE_KEY, config.DATA_DIR, datasync.SYNC_FILES,
+                       tunnel_port=tunnel_port)
+
+
+def export_local() -> None:
+    """Возврат на локальные файлы: снимок общей базы → data/*.json. Прежние локальные файлы
+    сохраняются в data/backups-import/<время>. Бот должен быть остановлен (берём его замок)."""
+    with database_tunnel() as port:
+        current = read_for_export(open_backend(port))
+    # Все файлы общей базы, даже пустые: иначе остался бы старый локальный файл (сборы, кошельки, память).
+    files = {name: json.dumps(current.get(name, {}), ensure_ascii=False, indent=2).encode("utf-8")
+             for name in datasync.SYNC_FILES}
+    saved = datasync.apply_archive(config.DATA_DIR, files)
+    print("Перенесено в", config.DATA_DIR + ":", ", ".join(sorted(current)) or "—")
+    print("Прежние локальные файлы сохранены в", saved)
+    print("Теперь уберите DATABASE_URL из .env и запустите бота: docker compose up -d")
+
+
+def read_for_export(backend: SharedState) -> dict:
+    try:
+        if not backend.acquire():
+            raise SharedStateError("Бот ещё работает с базой — остановите его (docker compose stop bot) и повторите")
+        backend.require_initialized()
+        current = backend.snapshot()
+    finally:
+        backend.close()
+    if not current:
+        raise SharedStateError("В общей базе нет данных — переносить нечего")
+    return current
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["init", "restore", "backup"])
+    parser.add_argument("operation", choices=["init", "restore", "backup", "export-local"])
     parser.add_argument("--source", type=Path)
     parser.add_argument("--backup", type=Path, help="New ZIP path; never overwritten")
     parser.add_argument("--apply", action="store_true")
@@ -80,19 +133,29 @@ def main(argv=None):
     parser.add_argument("--min-next-id", type=int, default=0)
     parser.add_argument("--require-game-id", type=int, action="append", default=[])
     args = parser.parse_args(argv)
-    if args.operation != "backup":
+    if args.operation not in ("backup", "export-local"):
         if args.source is None:
             parser.error("--source is required")
         entries = load_export(args.source)
         summary = stats_summary(entries)
         check_expectations(summary, args.guild_id, args.min_games, args.min_next_id, args.require_game_id)
         print(json.dumps({"source_digest": digest(entries), "stats": summary}, ensure_ascii=False))
-    if not args.apply:
+    if not args.apply and args.operation != "export-local":
         print("Dry run: no database connection or mutation. Keep the source export and stop all bots before applying.")
+        return
+    if args.operation == "export-local":
+        if not config.DATABASE_URL:
+            parser.error("DATABASE_URL is required for export-local")
+        export_local()
         return
     if not config.DATABASE_URL or args.backup is None:
         parser.error("DATABASE_URL and --backup are required for --apply")
-    backend = SharedState(config.DATABASE_URL, config.SHARED_STATE_KEY, config.DATA_DIR, datasync.SYNC_FILES)
+    with database_tunnel() as port:
+        apply_operation(args, entries if args.operation != "backup" else None, port)
+
+
+def apply_operation(args, entries, tunnel_port):
+    backend = open_backend(tunnel_port)
     try:
         if args.operation == "backup":
             backend.require_initialized()

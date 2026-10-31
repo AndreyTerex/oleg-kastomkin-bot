@@ -464,3 +464,56 @@ def test_server_that_dropped_a_real_request_is_not_trusted_by_a_light_check(tmp_
     monkeypatch.setattr(type(client), "ready", property(lambda self: True))
     client.report_failure(connection=True)
     assert client.suspect == "fp" and "fp" in client.state.data["blacklist"] and "fp" not in client.state.data["good"]
+
+
+def test_database_tunnel_goes_through_the_same_vpn_server(monkeypatch):
+    import config as cfg
+    monkeypatch.setattr(cfg, "DATABASE_URL",
+                        "postgresql://u:secret@ep-test-123.eu-central-1.aws.neon.tech/neondb?sslmode=require")
+    monkeypatch.setattr(cfg, "VPN_FOR_DATABASE", True)
+    target = vpn.database_target()
+    assert target == ("ep-test-123.eu-central-1.aws.neon.tech", 5432)
+    server = links.parse_link(REALITY)
+    config = vpn.main_config(server, fragment=False, port=10809, db=target, db_port=10808)
+    tunnel = config["inbounds"][1]
+    assert tunnel["protocol"] == "dokodemo-door" and tunnel["listen"] == "127.0.0.1" and tunnel["port"] == 10808
+    assert tunnel["settings"] == {"address": target[0], "port": 5432, "network": "tcp"}
+    assert {"type": "field", "inboundTag": ["db-in"], "outboundTag": "proxy"} in config["routing"]["rules"]
+    # Без рабочих серверов туннель остаётся (напрямую), порт тот же.
+    direct = vpn.direct_config(10809, target, 10808)
+    assert direct["inbounds"][1]["port"] == 10808
+    # Пароль в конфиг Xray не попадает.
+    assert "secret" not in json.dumps(config) and "secret" not in json.dumps(direct)
+
+
+def test_database_tunnel_off_without_remote_database(monkeypatch):
+    import config as cfg
+    monkeypatch.setattr(cfg, "VPN_FOR_DATABASE", True)
+    monkeypatch.setattr(cfg, "DATABASE_URL", "")
+    assert vpn.database_target() is None
+    monkeypatch.setattr(cfg, "DATABASE_URL", "postgresql://postgres@127.0.0.1:5432/postgres")
+    assert vpn.database_target() is None
+    monkeypatch.setattr(cfg, "DATABASE_URL", "postgresql://u@db.example.com:6543/x?sslmode=require")
+    assert vpn.database_target() == ("db.example.com", 6543)
+    monkeypatch.setattr(cfg, "VPN_FOR_DATABASE", False)
+    assert vpn.database_target() is None
+    client = vpn.VPN()
+    assert client.database_port() is None  # Xray не запущен — подключение напрямую
+
+
+def test_vpn_starts_without_database_tunnel_if_xray_rejects_it(monkeypatch):
+    import config as cfg
+    monkeypatch.setattr(cfg, "DATABASE_URL", "postgresql://u@db.example.com/x?sslmode=require")
+    monkeypatch.setattr(cfg, "VPN_FOR_DATABASE", True)
+    client = vpn.VPN()
+    started = []
+
+    async def run_main(data):
+        tunnel = any(i.get("protocol") == "dokodemo-door" for i in data["inbounds"])
+        started.append(tunnel)
+        return not tunnel  # «старый» Xray не знает туннеля
+
+    client._run_main = run_main
+    assert asyncio.run(client._run_with_db(lambda db: vpn.direct_config(10809, db)))
+    assert started == [True, False] and client.db_tunnel_rejected
+    assert client.database_port() is None

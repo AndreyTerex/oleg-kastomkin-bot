@@ -25,10 +25,26 @@ from psycopg.types.json import Jsonb
 # а не клиент: у пропавшего клиента (сон ноутбука, обрыв сети, убитый процесс) некому разорвать соединение.
 # Живой бот после простоя просто переподключается при следующем событии.
 IDLE_SESSION_TIMEOUT_MS = 3 * 60 * 1000
+# Подключение: таймаут одной попытки и сколько попыток (с паузой). Вместе укладываются в дедлайн
+# операции (async_db.OPERATION_TIMEOUT = 20 с).
+CONNECT_TIMEOUT = 5
+CONNECT_ATTEMPTS = 3
+CONNECT_RETRY_DELAY = 1.0
 # Сколько ждать, пока сервер закроет нашу же оборванную сессию после смены адреса.
 STALE_TERMINATE_WAIT_MS = 3000
 # Клиент пропал посреди транзакции — сервер откатывает её и закрывает сессию.
 IDLE_IN_TRANSACTION_TIMEOUT_MS = 30 * 1000
+
+
+# Доверенные корневые сертификаты для проверки базы в туннеле (Neon — публичный центр сертификации).
+CA_BUNDLES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem")
+
+
+def ca_bundle() -> str:
+    for path in CA_BUNDLES:
+        if Path(path).is_file():
+            return path
+    return "system"  # libpq ≥ 16: системное хранилище OpenSSL
 
 
 class SharedStateError(RuntimeError):
@@ -44,7 +60,8 @@ def digest(data: dict) -> str:
 
 
 class SharedState:
-    def __init__(self, dsn: str, namespace: str, directory: str | Path, names, on_failure=None):
+    def __init__(self, dsn: str, namespace: str, directory: str | Path, names, on_failure=None,
+                 tunnel_port: int | None = None):
         if not namespace or len(namespace) > 100:
             raise ValueError("SHARED_STATE_KEY must contain 1–100 characters")
         self.namespace = namespace
@@ -57,6 +74,9 @@ class SharedState:
         self._ready = False
         self._revision = None
         self._dsn = dsn
+        # Через туннель VPN бота: TCP идёт на 127.0.0.1:tunnel_port, а имя хоста из DSN остаётся для SNI
+        # и проверки сертификата (libpq: host + hostaddr).
+        self._tunnel_port = tunnel_port
         self.instance_id = uuid.uuid4().hex[:12]
         self._stop = threading.Event()
         self._failure_notified = threading.Event()
@@ -79,9 +99,32 @@ class SharedState:
                                    f"SQLSTATE {error.sqlstate or 'unavailable'}); local fallback is disabled") from None
 
     def _connect(self):
-        self._check_stopped()
+        """Новое соединение. Несколько попыток: VPN бота при смене сервера перезапускает Xray, и туннель
+        к базе на пару секунд закрыт — это не повод останавливать бота."""
+        for attempt in range(CONNECT_ATTEMPTS):
+            self._check_stopped()
+            try:
+                return self._connect_once()
+            except psycopg.OperationalError:
+                if attempt == CONNECT_ATTEMPTS - 1:
+                    raise
+                time.sleep(CONNECT_RETRY_DELAY)
+
+    def _tunnel_params(self) -> dict:
+        """Через туннель VPN бота трафик проходит через сервер из чужой подписки. sslmode=require только
+        шифрует и не проверяет, с кем говорим: подменный узел мог бы выдать себя за базу и узнать пароль.
+        Поэтому в туннеле — только verify-full: сертификат от доверенного центра и имя хоста из DSN."""
+        if not self._tunnel_port:
+            return {}
+        params = {"hostaddr": "127.0.0.1", "port": self._tunnel_port, "sslmode": "verify-full"}
+        if not psycopg.conninfo.conninfo_to_dict(self._dsn).get("sslrootcert"):
+            params["sslrootcert"] = ca_bundle()
+        return params
+
+    def _connect_once(self):
+        tunnel = self._tunnel_params()
         connection = psycopg.connect(
-            self._dsn, autocommit=True, connect_timeout=10,
+            self._dsn, autocommit=True, connect_timeout=CONNECT_TIMEOUT, **tunnel,
             # idle_session_timeout: сессия, чей клиент пропал без закрытия соединения (сон ноутбука, обрыв
             # сети), иначе часами держит advisory-замок, и ни один бот не может запуститься. Живой владелец
             # после простоя просто переподключается и заново берёт замок (_reconnect, SQLSTATE 57P05).
