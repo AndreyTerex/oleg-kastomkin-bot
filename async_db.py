@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import threading
 
-from shared_state import SharedStateError
+from shared_state import SharedStateDeadline
 
 OPERATION_TIMEOUT = 20.0
 CLOSE_TIMEOUT = 2.0
@@ -55,4 +55,4 @@ async def bounded_call(action, *, timeout=OPERATION_TIMEOUT, invalidate=None, di
             invalidate()
         if isinstance(error, asyncio.CancelledError):
             raise
-        raise SharedStateError("Database operation exceeded its deadline; bot stopping, commit outcome requires readback") from None
+        raise SharedStateDeadline("Database operation exceeded its deadline; bot stopping, commit outcome requires readback") from None

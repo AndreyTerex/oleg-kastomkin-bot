@@ -15,7 +15,7 @@ import datasync
 import portraits
 from sync import Sync
 from storage import recover_transactions, configure_shared
-from shared_state import IDLE_SESSION_TIMEOUT_MS
+from shared_state import IDLE_SESSION_TIMEOUT_MS, SharedStateDeadline
 from vpn import VPN_CLIENT
 from utils import WARNING, respond
 
@@ -65,6 +65,10 @@ class ScrimBot(commands.Bot):
                                         datasync.SYNC_FILES),
                     discard=lambda late: late.close(),
                 )
+            except SharedStateDeadline:
+                # Зависший поток не прервать: новые попытки копили бы их. Падаем — Docker перезапустит
+                # процесс с чистого листа.
+                raise
             except SharedStateError as error:
                 backend, message = None, f"База недоступна ({error}). Пробую снова через {SHARED_RETRY_SECONDS} с."
             else:
@@ -74,6 +78,9 @@ class ScrimBot(commands.Bot):
                             log.info("Общая база освободилась после %d с ожидания", waited)
                         return backend
                     holder = await backend.arun("lock_holder")
+                except SharedStateDeadline:
+                    await backend.aclose()
+                    raise
                 except SharedStateError as error:
                     holder = f"не удалось проверить ({error})"
                 message = (

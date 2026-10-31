@@ -734,3 +734,29 @@ def test_unreachable_database_retries_instead_of_crashing(database, monkeypatch,
         await backend.aclose()
     asyncio.run(run())
     assert "База недоступна" in caplog.text
+
+
+def test_hung_connection_attempt_stops_standby_instead_of_piling_threads(monkeypatch):
+    import threading
+    import async_db
+    import bot as bot_module
+    from bot import ScrimBot
+    monkeypatch.setattr(config, "DATABASE_URL", "postgresql://postgres@127.0.0.1:1/postgres")
+    monkeypatch.setattr(bot_module, "SHARED_RETRY_SECONDS", 0.01)
+    release = threading.Event()
+    attempts = []
+    def hanging(*args, **kwargs):
+        attempts.append(1)
+        release.wait(5)
+        raise shared_state.SharedStateError("late")
+    async def short_call(action, **kwargs):
+        return await async_db.bounded_call(action, timeout=0.2, **kwargs)
+    bot = ScrimBot()
+    async def run():
+        with pytest.raises(shared_state.SharedStateDeadline):
+            await bot.acquire_shared(hanging, shared_state.SharedStateError, short_call)
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+    assert len(attempts) == 1

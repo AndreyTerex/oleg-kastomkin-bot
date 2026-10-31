@@ -32,6 +32,10 @@ class SharedStateError(RuntimeError):
     pass
 
 
+class SharedStateDeadline(SharedStateError):
+    """Операция не уложилась в срок: её поток брошен (libpq/DNS не прервать) и может висеть дальше."""
+
+
 def digest(data: dict) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
