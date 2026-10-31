@@ -20,8 +20,20 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 
+# Через столько миллисекунд простоя сервер закрывает сессию и отпускает замок владельца. Закрывает сервер,
+# а не клиент: у пропавшего клиента (сон ноутбука, обрыв сети, убитый процесс) некому разорвать соединение.
+# Живой бот после простоя просто переподключается при следующем событии.
+IDLE_SESSION_TIMEOUT_MS = 3 * 60 * 1000
+# Клиент пропал посреди транзакции — сервер откатывает её и закрывает сессию.
+IDLE_IN_TRANSACTION_TIMEOUT_MS = 30 * 1000
+
+
 class SharedStateError(RuntimeError):
     pass
+
+
+class SharedStateDeadline(SharedStateError):
+    """Операция не уложилась в срок: её поток брошен (libpq/DNS не прервать) и может висеть дальше."""
 
 
 def digest(data: dict) -> str:
@@ -67,7 +79,12 @@ class SharedState:
         self._check_stopped()
         connection = psycopg.connect(
             self._dsn, autocommit=True, connect_timeout=10,
-            options="-c statement_timeout=10000 -c lock_timeout=5000",
+            # idle_session_timeout: сессия, чей клиент пропал без закрытия соединения (сон ноутбука, обрыв
+            # сети), иначе часами держит advisory-замок, и ни один бот не может запуститься. Живой владелец
+            # после простоя просто переподключается и заново берёт замок (_reconnect, SQLSTATE 57P05).
+            options=(f"-c statement_timeout=10000 -c lock_timeout=5000"
+                     f" -c idle_session_timeout={IDLE_SESSION_TIMEOUT_MS}"
+                     f" -c idle_in_transaction_session_timeout={IDLE_IN_TRANSACTION_TIMEOUT_MS}"),
             keepalives_idle=10, keepalives_interval=2, keepalives_count=3, tcp_user_timeout=15000,
             application_name=f"oleg:{self.instance_id}",
         )
@@ -206,6 +223,23 @@ class SharedState:
                 self.owned = conn.execute("SELECT pg_try_advisory_lock(%s)", (self.key,)).fetchone()[0]
                 self._check_stopped()
             return self.owned
+
+    def lock_holder(self) -> str:
+        """Кто держит замок (для лога ожидающего экземпляра): имя приложения и сколько сессия простаивает.
+        Адреса не выводим."""
+        key = self.key & 0xFFFFFFFFFFFFFFFF
+        with self._access() as conn:
+            row = conn.execute("""SELECT a.application_name, a.state,
+                    EXTRACT(EPOCH FROM now() - a.backend_start)::int, EXTRACT(EPOCH FROM now() - a.state_change)::int
+                FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+                WHERE l.locktype = 'advisory' AND l.granted AND l.classid = %s AND l.objid = %s AND l.objsubid = 1""",
+                (key >> 32, key & 0xFFFFFFFF)).fetchone()
+        if row is None:
+            return "никто (замок только что освободился)"
+        name, state, age, idle = row
+        if name is None:
+            return "сессия другого пользователя базы"
+        return f"{name}, подключён {age} с назад, состояние {state}, без активности {idle} с"
 
     def require_initialized(self):
         self.snapshot()

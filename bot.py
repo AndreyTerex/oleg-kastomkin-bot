@@ -15,10 +15,14 @@ import datasync
 import portraits
 from sync import Sync
 from storage import recover_transactions, configure_shared
+from shared_state import IDLE_SESSION_TIMEOUT_MS, SharedStateDeadline
 from vpn import VPN_CLIENT
 from utils import WARNING, respond
 
 log = logging.getLogger("scrimbot")
+
+# Как часто резервный экземпляр проверяет, не освободилась ли общая база.
+SHARED_RETRY_SECONDS = 15
 
 EXTENSIONS = ("cogs.roles", "cogs.scrim", "cogs.stats", "cogs.lobby", "cogs.extras", "cogs.chat", "cogs.vpn_admin", "cogs.ops", "cogs.matchday", "cogs.sync", "cogs.profile", "cogs.quiz", "cogs.patchnotes")
 
@@ -49,6 +53,48 @@ class ScrimBot(commands.Bot):
             log.info("Discord подключается через VPN")
         await super().login(token)
 
+    async def acquire_shared(self, SharedState, SharedStateError, bounded_call):
+        """Право записи в общую базу. Занято другим экземпляром — ждём в резерве (как раньше со standby
+        через канал синхронизации), а не падаем: Docker иначе перезапускает бота по кругу, и стоит
+        владельцу остановиться, резервный бот подхватит работу сам."""
+        waited = 0
+        while True:
+            try:
+                backend = await bounded_call(
+                    lambda: SharedState(config.DATABASE_URL, config.SHARED_STATE_KEY, config.DATA_DIR,
+                                        datasync.SYNC_FILES),
+                    discard=lambda late: late.close(),
+                )
+            except SharedStateDeadline:
+                # Зависший поток не прервать: новые попытки копили бы их. Падаем — Docker перезапустит
+                # процесс с чистого листа.
+                raise
+            except SharedStateError as error:
+                backend, message = None, f"База недоступна ({error}). Пробую снова через {SHARED_RETRY_SECONDS} с."
+            else:
+                try:
+                    if await backend.arun("acquire"):
+                        if waited:
+                            log.info("Общая база освободилась после %d с ожидания", waited)
+                        return backend
+                    holder = await backend.arun("lock_holder")
+                except SharedStateDeadline:
+                    await backend.aclose()
+                    raise
+                except SharedStateError as error:
+                    holder = f"не удалось проверить ({error})"
+                message = (
+                    f"Общей базой владеет другой экземпляр бота: {holder}. Жду в резерве, проверяю раз в "
+                    f"{SHARED_RETRY_SECONDS} с. Если второго бота нет — это оборванное подключение, "
+                    f"база закроет его сама за {IDLE_SESSION_TIMEOUT_MS // 60000} мин."
+                )
+                # Новое подключение на каждую попытку: простаивающее сервер всё равно закроет.
+                await backend.aclose()
+            if waited == 0 or waited % 300 < SHARED_RETRY_SECONDS:
+                log.warning("%s", message)
+            await asyncio.sleep(SHARED_RETRY_SECONDS)
+            waited += SHARED_RETRY_SECONDS
+
     async def setup_hook(self) -> None:
         self.tree.on_error = self.on_tree_error
         self.shared_state = None
@@ -59,14 +105,9 @@ class ScrimBot(commands.Bot):
             def failed():
                 log.critical("Общая база недоступна — закрываю бота без перехода на локальные данные")
                 loop.call_soon_threadsafe(lambda: asyncio.create_task(self.close()))
-            backend = await bounded_call(
-                lambda: SharedState(config.DATABASE_URL, config.SHARED_STATE_KEY, config.DATA_DIR,
-                                    datasync.SYNC_FILES, on_failure=failed),
-                discard=lambda late: late.close(),
-            )
+            backend = await self.acquire_shared(SharedState, SharedStateError, bounded_call)
+            backend.on_failure = failed
             try:
-                if not await backend.arun("acquire"):
-                    raise SharedStateError("Другой экземпляр уже владеет общей базой. Сначала остановите его.")
                 await backend.arun("require_initialized")
                 log.info("Общая база: экземпляр oleg:%s получил право записи", backend.instance_id)
             except BaseException:
