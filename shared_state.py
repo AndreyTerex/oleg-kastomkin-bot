@@ -89,15 +89,13 @@ class SharedState:
             if self.on_failure:
                 self.on_failure()
 
-    async def arun(self, method, *args, lock_held=False):
+    async def arun(self, method, *args):
         from async_db import bounded_call, OPERATION_TIMEOUT
         async def execute():
             self._check_stopped()
             return await bounded_call(lambda: getattr(self, method)(*args), timeout=OPERATION_TIMEOUT,
                                       invalidate=self.invalidate)
         try:
-            if lock_held:
-                return await execute()
             async with self.async_lock:
                 return await execute()
         except asyncio.CancelledError:

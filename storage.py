@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import os
 import tempfile
 from contextlib import contextmanager, asynccontextmanager
@@ -25,6 +26,15 @@ def shared_backend(directory=None):
     return None
 
 
+def _check_preparation(backend):
+    # ContextVars are copied into child tasks. The explicit task identity also
+    # blocks a save from an already-ready task before the no-yield guard runs.
+    preparing = getattr(backend, "_preparing_task", None)
+    if preparing is not None and preparing is not asyncio.current_task():
+        backend.invalidate()
+        raise RuntimeError("Another task entered an unfinished shared transaction")
+
+
 @contextmanager
 def atomic(*stores):
     """Join an existing result transaction or create one for a standalone operation."""
@@ -40,6 +50,8 @@ def atomic(*stores):
 
 @asynccontextmanager
 async def async_atomic(*stores):
+    if _SHARED is not None:
+        _check_preparation(_SHARED)
     active = _TRANSACTION.get()
     if active is not None:
         if any(store not in active for store in stores):
@@ -52,7 +64,13 @@ async def async_atomic(*stores):
 
 @asynccontextmanager
 async def async_transaction(*stores):
-    """Serialize shared mutations and await one immutable database commit off-loop."""
+    """Prepare without yielding, then persist immutable snapshots in FIFO order.
+
+    Entry MUST NOT wait for the database lock: standalone callers mutate memory
+    synchronously before save(), too. Both paths capture/enqueue their snapshots
+    before yielding, so their durable order matches their in-memory order.
+    Inside the body only in-memory work and non-yielding nested saves are allowed.
+    """
     shared = [_SHARED is not None and _SHARED.handles(store.path) for store in stores]
     if not any(shared):
         with transaction(*stores):
@@ -61,20 +79,43 @@ async def async_transaction(*stores):
     if not all(shared) or _TRANSACTION.get() is not None:
         raise RuntimeError("Invalid mixed or nested shared transaction")
     backend = _SHARED
-    async with backend.async_lock:
+    _check_preparation(backend)
+    backend._check_stopped()
+    snapshots = [deepcopy(store.data) for store in stores]
+    token = _TRANSACTION.set(stores)
+    backend._preparing_task = asyncio.current_task()
+    # Fail closed if a future caller introduces network I/O or another yielding
+    # await into the preparation phase. A competing save must never persist a
+    # partially prepared transaction. Cancel this guard before awaiting SQL.
+    yielded = False
+    def unexpected_yield():
+        nonlocal yielded
+        yielded = True
+        backend.invalidate()
+    no_yield = asyncio.get_running_loop().call_soon(unexpected_yield)
+    try:
+        yield
+        if yielded:
+            raise RuntimeError("Shared transaction body yielded; only in-memory work and nested saves are allowed")
         backend._check_stopped()
-        snapshots = [deepcopy(store.data) for store in stores]
-        token = _TRANSACTION.set(stores)
-        try:
-            yield
-            entries = {store.path.name: deepcopy(store.data) for store in stores}
-            await backend.arun("save", entries, lock_held=True)
-        except BaseException:
-            for store, snapshot in zip(stores, snapshots):
-                _restore(store.data, snapshot)
-            raise
-        finally:
-            _TRANSACTION.reset(token)
+        entries = {store.path.name: deepcopy(store.data) for store in stores}
+    except BaseException:
+        for store, snapshot in zip(stores, snapshots):
+            _restore(store.data, snapshot)
+        raise
+    finally:
+        no_yield.cancel()
+        backend._preparing_task = None
+        _TRANSACTION.reset(token)
+    try:
+        await backend.arun("save", entries)
+    except BaseException:
+        # Later snapshots may include these mutations. Stop the entire queue;
+        # never persist them after this commit failed or was cancelled.
+        backend.invalidate()
+        for store, snapshot in zip(stores, snapshots):
+            _restore(store.data, snapshot)
+        raise
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -188,6 +229,8 @@ class JsonStore:
         return self.data
 
     async def save(self) -> None:
+        if _SHARED is not None and _SHARED.handles(self.path):
+            _check_preparation(_SHARED)
         active = _TRANSACTION.get()
         if active is not None:
             if self not in active:
@@ -195,7 +238,11 @@ class JsonStore:
             return
         if _SHARED is not None and _SHARED.handles(self.path):
             # Capture before yielding: a queued save must not read later mutations.
-            await _SHARED.arun("save", {self.path.name: deepcopy(self.data)})
+            try:
+                await _SHARED.arun("save", {self.path.name: deepcopy(self.data)})
+            except BaseException:
+                _SHARED.invalidate()
+                raise
             return
         # Небольшие локальные JSON пишутся без переключения задач: снимок не может
         # измениться во время записи, а транзакцию не обгонит фоновый поток save().

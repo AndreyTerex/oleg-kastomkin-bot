@@ -238,14 +238,16 @@ def test_report_result_pays_bets_bounty_duels_and_undo(tmp_path, monkeypatch):
         await asyncio.gather(lobby.report_result(interaction, 777, 0), lobby.report_result(interaction, 777, 0))
         assert len(record["results"]) == 1  # два одновременных клика — одна катка
         assert JsonStore(tmp_path / "lobbies.json").load()["777"]["round"] == 2
-        announce = sent[0][0][0]
+        # A duplicate callback can respond before the first SQL commit finishes.
+        announce = next(args[0] for args, kwargs in sent if args and "Апсет" in args[0])
         assert "Апсет" in announce and "Охота на голову" in announce and "Дуэль" in announce
         assert "Ставки сыграли" in announce
         assert w.balance(1, 1) == bets.START_COINS + 100
         assert w.balance(1, 2) == bets.START_COINS + 100 + 150
         assert w.balance(1, 99) == bets.START_COINS + 20  # соперников по ставке нет — +10%
         assert record["round"] == 2
-        undo = sent[1][1]["view"]
+        undo = next(kwargs["view"] for args, kwargs in sent
+                    if isinstance(kwargs.get("view"), lobby.UndoResultView))
         button = next(item for item in undo.children)
         undo_interaction = NS(client=bot, guild=guild,
                               response=NS(edit_message=edit_message, defer=defer),

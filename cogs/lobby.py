@@ -420,6 +420,8 @@ class LobbyView(discord.ui.View):
 
         try:
             async with transaction(cog.store):
+                if cog.get_record(interaction.message.id) is not record or record.get("closed"):
+                    raise RosterError("Сбор уже закрыт.")
                 changed, overflow, promoted = cog.apply_move(interaction.guild, record, [interaction.user.id], status)
                 await cog.save()
         except RosterError as error:
@@ -793,20 +795,20 @@ async def report_result(
 
     winners, losers = record["teams"][side], record["teams"][1 - side]
     pool_round = bet_round(record, round_no)
-    # Прогноз и лидер — по Elo до этой катки.
-    chance_blue = win_chance(stats_cog.stats, interaction.guild.id, record["teams"])
-    chance_won = chance_blue if side == 0 else 1 - chance_blue
-    ranking = stats_cog.ranking(interaction.guild.id)
-    leader = ranking[0][0] if len(ranking) >= 3 else None
     await interaction.response.defer()
-    # После сетевого defer другая кнопка могла уже отметить этот раунд.
-    if (record.get("closed") or record.get("round", 1) != round_no
-            or record.get("teams") != ([winners, losers] if side == 0 else [losers, winners])
-            or bet_round(record, round_no) != pool_round):
-        await interaction.followup.send("Этот раунд уже обработан или сбор закрыт.", ephemeral=True)
-        return
     try:
         async with transaction(cog.store, stats_cog.stats.store, stats_cog.wallets.store):
+            # Validate and mutate in the same non-yielding preparation phase.
+            if (cog.get_record(lobby_id) is not record or record.get("closed")
+                    or record.get("round", 1) != round_no
+                    or record.get("teams") != ([winners, losers] if side == 0 else [losers, winners])
+                    or bet_round(record, round_no) != pool_round):
+                raise DuplicateGameError("Этот раунд уже обработан или сбор закрыт.")
+            # Прогноз и лидер — по Elo непосредственно до этой катки.
+            chance_blue = win_chance(stats_cog.stats, interaction.guild.id, record["teams"])
+            chance_won = chance_blue if side == 0 else 1 - chance_blue
+            ranking = stats_cog.ranking(interaction.guild.id)
+            leader = ranking[0][0] if len(ranking) >= 3 else None
             # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
             record["last_report_at"] = time.time()
             record["round"] = round_no + 1
@@ -1125,12 +1127,9 @@ class UndoResultView(discord.ui.View):
             await respond(interaction, "Статистика временно недоступна.")
             return
         await interaction.response.defer()
-        if stats_cog.stats.game(interaction.guild.id, self.game_id) is None:
-            await interaction.edit_original_response(content="Результат уже отменён.", view=None)
-            return
         async with transaction(self.cog.store, stats_cog.stats.store, stats_cog.wallets.store):
-            if stats_cog is not None:
-                await stats_cog.stats.undo_game(interaction.guild.id, self.game_id)
+            undone = await stats_cog.stats.undo_game(interaction.guild.id, self.game_id)
+            if undone:
                 wallets = stats_cog.wallets
                 wallets.unsettle_pool(interaction.guild.id, self.lobby_message.id, self.pool_round)
                 wallets.unresolve_duels(interaction.guild.id, self.game_id)
@@ -1138,17 +1137,20 @@ class UndoResultView(discord.ui.View):
                 if bounty:
                     wallets.take_bounty(interaction.guild.id, winners, bounty)
                 await wallets.save()
-            results = self.record.get("results") or []
-            in_series = any(r.get("game") == self.game_id for r in results)
-            self.record["results"] = [r for r in results if r.get("game") != self.game_id]
-            if in_series:
-                revisions = self.record.setdefault("result_revisions", {})
-                revisions[str(self.round_no)] = revisions.get(str(self.round_no), 0) + 1
-            # Номер катки откатываем, только если катка из текущей серии и после неё новых отметок не было.
-            if in_series and self.record.get("round") == self.round_no + 1:
-                self.record["round"] = self.round_no
-            self.record.pop("last_report_at", None)
-            await self.cog.save()
+                results = self.record.get("results") or []
+                in_series = any(r.get("game") == self.game_id for r in results)
+                self.record["results"] = [r for r in results if r.get("game") != self.game_id]
+                if in_series:
+                    revisions = self.record.setdefault("result_revisions", {})
+                    revisions[str(self.round_no)] = revisions.get(str(self.round_no), 0) + 1
+                # Откатываем номер, только если после этой катки не было новых отметок.
+                if in_series and self.record.get("round") == self.round_no + 1:
+                    self.record["round"] = self.round_no
+                self.record.pop("last_report_at", None)
+                await self.cog.save()
+        if not undone:
+            await interaction.edit_original_response(content="Результат уже отменён.", view=None)
+            return
         try:
             await self.lobby_message.edit(
                 embed=self.cog.build_embed(self.lobby_message.guild, self.record), view=LobbyView(self.record)
@@ -1413,6 +1415,8 @@ class SubstituteView(discord.ui.View):
         refunded = 0
         try:
             async with transaction(*stores):
+                if cog.get_record(self.lobby_message.id) is not record or not cog.is_organizer(interaction, record):
+                    raise RosterError("Сбор больше не отслеживается или у тебя нет прав управления.")
                 side = substitute(record, old, newcomer.id)
                 if history is not None and history.replace(guild.id, self.lobby_message.id, old, newcomer.id):
                     await history.store.save()
