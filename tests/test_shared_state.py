@@ -836,16 +836,13 @@ def test_admin_operations_use_vpn_tunnel(monkeypatch):
     assert seen == [15432, 15432]
 
 
-def test_connection_goes_through_local_tunnel_port(database):
-    """Туннель VPN бота: TCP — на 127.0.0.1:порт, имя хоста из DSN остаётся (для TLS SNI и сертификата)."""
+def _tcp_forwarder(target_host, target_port):
+    """Локальный порт → сервер базы: так же, как туннель Xray (байты насквозь)."""
     import socket
     import threading
-    owner, connect, directory, dsn, _ = database
-    target = psycopg.conninfo.conninfo_to_dict(dsn)
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen()
-    port = listener.getsockname()[1]
     forwarded = []
 
     def pump(src, dst):
@@ -868,18 +865,60 @@ def test_connection_goes_through_local_tunnel_port(database):
             except OSError:
                 return
             forwarded.append(client)
-            upstream = socket.create_connection((target.get("host", "127.0.0.1"), int(target.get("port", 5432))))
+            upstream = socket.create_connection((target_host, target_port))
             threading.Thread(target=pump, args=(client, upstream), daemon=True).start()
             threading.Thread(target=pump, args=(upstream, client), daemon=True).start()
 
     threading.Thread(target=accept, daemon=True).start()
+    return listener, listener.getsockname()[1], forwarded
+
+
+def _tls_test_dsn(dsn):
+    """DSN с host=localhost и CA тестового сервера; без SSL на тестовой базе — пропуск."""
+    root = os.environ.get("TEST_POSTGRES_SSLROOTCERT")
+    if not root:
+        pytest.skip("Set TEST_POSTGRES_SSLROOTCERT to the CA of an SSL-enabled test PostgreSQL")
+    params = psycopg.conninfo.conninfo_to_dict(dsn)
+    params.update(host="localhost", sslrootcert=root)
+    return psycopg.conninfo.make_conninfo(**params), params
+
+
+def test_tunnel_requires_verified_certificate(database):
+    """Туннель через чужой VPN-узел: соединение только с проверенным сертификатом (verify-full),
+    даже если в DSN sslmode=require. Сертификат от неизвестного центра — отказ (как при подмене)."""
+    owner, _, directory, dsn, _ = database
+    good_dsn, params = _tls_test_dsn(dsn)
+    listener, port, forwarded = _tcp_forwarder("127.0.0.1", int(params.get("port", 5432)))
     try:
-        tunneled = shared_state.SharedState(dsn, owner.namespace, directory / "tunnel", datasync.SYNC_FILES,
-                                            tunnel_port=port)
+        tunneled = shared_state.SharedState(good_dsn + " sslmode=require", owner.namespace,
+                                            directory / "tunnel", datasync.SYNC_FILES, tunnel_port=port)
         try:
-            assert tunneled.connection.info.port == port and forwarded
+            info = tunneled.connection.info
+            assert info.port == port and forwarded
+            assert tunneled.connection.execute(
+                "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()").fetchone()[0]
             tunneled.require_initialized()
         finally:
             tunneled.close()
+        # Без своего CA (системные корни не знают тестовый центр) — как подменённый сервер: не подключаемся.
+        bad = dict(params)
+        bad.pop("sslrootcert")
+        bad["sslmode"] = "require"
+        with pytest.raises(shared_state.SharedStateError):
+            shared_state.SharedState(psycopg.conninfo.make_conninfo(**bad), owner.namespace,
+                                     directory / "tunnel2", datasync.SYNC_FILES, tunnel_port=port)
     finally:
         listener.close()
+
+
+def test_tunnel_forces_verify_full_and_trusted_roots():
+    state = shared_state.SharedState.__new__(shared_state.SharedState)
+    state._dsn = "postgresql://u:p@db.example.com/x?sslmode=require"
+    state._tunnel_port = 15432
+    params = state._tunnel_params()
+    assert params["sslmode"] == "verify-full" and params["hostaddr"] == "127.0.0.1" and params["port"] == 15432
+    assert params["sslrootcert"] == shared_state.ca_bundle()
+    state._dsn += "&sslrootcert=/my/ca.pem"
+    assert "sslrootcert" not in state._tunnel_params()  # свой корень из DSN не перетираем
+    state._tunnel_port = None
+    assert state._tunnel_params() == {}

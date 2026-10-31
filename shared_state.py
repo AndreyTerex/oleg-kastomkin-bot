@@ -36,6 +36,17 @@ STALE_TERMINATE_WAIT_MS = 3000
 IDLE_IN_TRANSACTION_TIMEOUT_MS = 30 * 1000
 
 
+# Доверенные корневые сертификаты для проверки базы в туннеле (Neon — публичный центр сертификации).
+CA_BUNDLES = ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem")
+
+
+def ca_bundle() -> str:
+    for path in CA_BUNDLES:
+        if Path(path).is_file():
+            return path
+    return "system"  # libpq ≥ 16: системное хранилище OpenSSL
+
+
 class SharedStateError(RuntimeError):
     pass
 
@@ -99,8 +110,19 @@ class SharedState:
                     raise
                 time.sleep(CONNECT_RETRY_DELAY)
 
+    def _tunnel_params(self) -> dict:
+        """Через туннель VPN бота трафик проходит через сервер из чужой подписки. sslmode=require только
+        шифрует и не проверяет, с кем говорим: подменный узел мог бы выдать себя за базу и узнать пароль.
+        Поэтому в туннеле — только verify-full: сертификат от доверенного центра и имя хоста из DSN."""
+        if not self._tunnel_port:
+            return {}
+        params = {"hostaddr": "127.0.0.1", "port": self._tunnel_port, "sslmode": "verify-full"}
+        if not psycopg.conninfo.conninfo_to_dict(self._dsn).get("sslrootcert"):
+            params["sslrootcert"] = ca_bundle()
+        return params
+
     def _connect_once(self):
-        tunnel = {"hostaddr": "127.0.0.1", "port": self._tunnel_port} if self._tunnel_port else {}
+        tunnel = self._tunnel_params()
         connection = psycopg.connect(
             self._dsn, autocommit=True, connect_timeout=CONNECT_TIMEOUT, **tunnel,
             # idle_session_timeout: сессия, чей клиент пропал без закрытия соединения (сон ноутбука, обрыв
