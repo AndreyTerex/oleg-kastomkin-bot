@@ -76,6 +76,7 @@ BROKEN_PAUSE = 180
 DIRECT_RETRY_HOURS = 0.5
 FRAGMENT_TAG = "fragment"
 PROXY_TAG = "proxy"
+DB_TAG = "db-in"
 
 FRAGMENT_OUTBOUND = {
     "tag": FRAGMENT_TAG,
@@ -232,24 +233,62 @@ def _outbound(server: Server, tag: str, fragment: bool) -> dict:
     return outbound
 
 
-def main_config(server: Server, fragment: bool, port: int) -> dict:
-    """Основной Xray: 127.0.0.1:port → один выбранный сервер (при необходимости через фрагментацию)."""
-    outbounds = [_outbound(server, PROXY_TAG, fragment), {"tag": "direct", "protocol": "freedom"}]
-    if fragment:
-        outbounds.append(copy.deepcopy(FRAGMENT_OUTBOUND))
+def database_target() -> tuple[str, int] | None:
+    """Куда пробрасывать общую базу (хост и порт из DATABASE_URL), или None — туннель не нужен."""
+    if not (config.DATABASE_URL and config.VPN_FOR_DATABASE):
+        return None
+    try:
+        import psycopg
+        parameters = psycopg.conninfo.conninfo_to_dict(config.DATABASE_URL)
+    except Exception:
+        return None
+    host = str(parameters.get("host") or "")
+    if not host or "," in host or host.startswith("/") or host in ("localhost", "127.0.0.1", "::1"):
+        return None
+    try:
+        port = int(parameters.get("port") or 5432)
+    except ValueError:
+        return None
+    return host, port
+
+
+def _db_inbound(target: tuple[str, int], port: int) -> dict:
+    """Локальный порт → сервер базы. TLS идёт насквозь: Xray передаёт байты, сертификат проверяет сам бот."""
+    host, target_port = target
     return {
-        "log": {"loglevel": "warning"},
-        "inbounds": [{"tag": "http-in", "listen": "127.0.0.1", "port": port, "protocol": "http", "settings": {}}],
-        "outbounds": outbounds,
-        "routing": {"rules": [{"type": "field", "inboundTag": ["http-in"], "outboundTag": PROXY_TAG}]},
+        "tag": DB_TAG, "listen": "127.0.0.1", "port": port, "protocol": "dokodemo-door",
+        "settings": {"address": host, "port": target_port, "network": "tcp"},
     }
 
 
-def direct_config(port: int) -> dict:
-    """Запасной режим: рабочих серверов нет — тот же порт, но трафик идёт напрямую (Discord не отваливается)."""
+def main_config(server: Server, fragment: bool, port: int, db: tuple[str, int] | None = None,
+                db_port: int | None = None) -> dict:
+    """Основной Xray: 127.0.0.1:port → один выбранный сервер (при необходимости через фрагментацию).
+    С db — ещё и туннель к общей базе через тот же сервер."""
+    outbounds = [_outbound(server, PROXY_TAG, fragment), {"tag": "direct", "protocol": "freedom"}]
+    if fragment:
+        outbounds.append(copy.deepcopy(FRAGMENT_OUTBOUND))
+    inbounds = [{"tag": "http-in", "listen": "127.0.0.1", "port": port, "protocol": "http", "settings": {}}]
+    rules = [{"type": "field", "inboundTag": ["http-in"], "outboundTag": PROXY_TAG}]
+    if db is not None:
+        inbounds.append(_db_inbound(db, db_port or config.VPN_DB_PORT))
+        rules.append({"type": "field", "inboundTag": [DB_TAG], "outboundTag": PROXY_TAG})
     return {
         "log": {"loglevel": "warning"},
-        "inbounds": [{"tag": "http-in", "listen": "127.0.0.1", "port": port, "protocol": "http", "settings": {}}],
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {"rules": rules},
+    }
+
+
+def direct_config(port: int, db: tuple[str, int] | None = None, db_port: int | None = None) -> dict:
+    """Запасной режим: рабочих серверов нет — тот же порт, но трафик идёт напрямую (Discord не отваливается)."""
+    inbounds = [{"tag": "http-in", "listen": "127.0.0.1", "port": port, "protocol": "http", "settings": {}}]
+    if db is not None:
+        inbounds.append(_db_inbound(db, db_port or config.VPN_DB_PORT))
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": inbounds,
         "outbounds": [{"tag": PROXY_TAG, "protocol": "freedom"}],
     }
 
@@ -346,6 +385,7 @@ class VPN:
         self.broken_until = 0.0
         self.suspect: str | None = None
         self.started = False
+        self.db_tunnel_rejected = False
 
     # --- настройки
 
@@ -527,7 +567,7 @@ class VPN:
         server = self.servers.get(result.fingerprint)
         if server is None:
             return False
-        if not await self._run_main(main_config(server, result.fragment, config.VPN_PORT)):
+        if not await self._run_with_db(lambda db: main_config(server, result.fragment, config.VPN_PORT, db)):
             log.warning("VPN: Xray не принимает ключ «%s» — пропускаю", server.name)
             self.invalid.add(server.fingerprint)
             return False
@@ -545,15 +585,33 @@ class VPN:
             return
         if not quiet:
             log.warning("VPN: рабочих серверов нет — пока хожу напрямую, ищу сервер дальше")
-        await self._run_main(direct_config(config.VPN_PORT))
+        await self._run_with_db(lambda db: direct_config(config.VPN_PORT, db))
         self.current = None
         self.state.data["selected"] = None
         await self.state.save()
+
+    def database_port(self) -> int | None:
+        """Локальный порт туннеля к общей базе, если Xray запущен и туннель нужен; иначе None — напрямую."""
+        if self.ready and not self.db_tunnel_rejected and database_target() is not None:
+            return config.VPN_DB_PORT
+        return None
 
     @property
     def ready(self) -> bool:
         """Локальный прокси запущен (через сервер или напрямую)."""
         return self.process is not None and self.process.returncode is None
+
+    async def _run_with_db(self, build) -> bool:
+        """Основной Xray с туннелем к общей базе. Не принял туннель (другая версия Xray) — поднимаем без него:
+        нейросети и Discord важнее, база тогда пойдёт напрямую."""
+        target = database_target() if not self.db_tunnel_rejected else None
+        if await self._run_main(build(target)):
+            return True
+        if target is None or not await self._run_main(build(None)):
+            return False
+        self.db_tunnel_rejected = True
+        log.warning("VPN: Xray не принял туннель к общей базе — база пойдёт напрямую")
+        return True
 
     async def _run_main(self, data: dict) -> bool:
         if not await xray_accepts(data):

@@ -60,9 +60,10 @@ class ScrimBot(commands.Bot):
         waited = 0
         while True:
             try:
+                tunnel = VPN_CLIENT.database_port()
                 backend = await bounded_call(
                     lambda: SharedState(config.DATABASE_URL, config.SHARED_STATE_KEY, config.DATA_DIR,
-                                        datasync.SYNC_FILES),
+                                        datasync.SYNC_FILES, tunnel_port=tunnel),
                     discard=lambda late: late.close(),
                 )
             except SharedStateDeadline:
@@ -74,6 +75,8 @@ class ScrimBot(commands.Bot):
             else:
                 try:
                     if await backend.arun("acquire"):
+                        log.info("Общая база: подключение %s",
+                                 "через VPN бота" if tunnel else "напрямую (VPN бота не запущен или выключен для базы)")
                         if waited:
                             log.info("Общая база освободилась после %d с ожидания", waited)
                         return backend

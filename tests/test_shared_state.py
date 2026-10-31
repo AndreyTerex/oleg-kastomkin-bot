@@ -785,3 +785,76 @@ def test_address_change_reclaims_own_stale_session_instead_of_stopping(database)
     other.connection = psycopg.connect(dsn, autocommit=True)
     other.owned = True
     assert not other._lock_after_reconnect()
+
+
+def test_export_local_moves_database_back_to_files(database, monkeypatch, tmp_path):
+    owner, _, directory, dsn, namespace = database
+    stats = Stats(directory / "stats.json")
+    stats.load()
+    asyncio.run(stats.record_game(1, [10], [20], event_key="before-export"))
+    local = tmp_path / "local-data"
+    local.mkdir()
+    (local / "stats.json").write_text('{"old": {}}')
+    monkeypatch.setattr(config, "DATABASE_URL", dsn)
+    monkeypatch.setattr(config, "SHARED_STATE_KEY", namespace)
+    monkeypatch.setattr(config, "DATA_DIR", str(local))
+    configure_shared(None)
+    # Бот ещё держит базу — экспорт отказывается, файлы не тронуты.
+    with pytest.raises(shared_state.SharedStateError, match="остановите"):
+        shared_admin.main(["export-local"])
+    assert json.loads((local / "stats.json").read_text()) == {"old": {}}
+    owner.close()
+    shared_admin.main(["export-local"])
+    exported = json.loads((local / "stats.json").read_text())
+    assert exported["1"]["players"]["10"]["wins"] == 1
+    backups = list((local / datasync.IMPORT_BACKUPS).iterdir())
+    assert json.loads((backups[0] / "stats.json").read_text()) == {"old": {}}
+
+
+def test_connection_goes_through_local_tunnel_port(database):
+    """Туннель VPN бота: TCP — на 127.0.0.1:порт, имя хоста из DSN остаётся (для TLS SNI и сертификата)."""
+    import socket
+    import threading
+    owner, connect, directory, dsn, _ = database
+    target = psycopg.conninfo.conninfo_to_dict(dsn)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    forwarded = []
+
+    def pump(src, dst):
+        try:
+            while data := src.recv(65536):
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for sock in (src, dst):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def accept():
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            forwarded.append(client)
+            upstream = socket.create_connection((target.get("host", "127.0.0.1"), int(target.get("port", 5432))))
+            threading.Thread(target=pump, args=(client, upstream), daemon=True).start()
+            threading.Thread(target=pump, args=(upstream, client), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    try:
+        tunneled = shared_state.SharedState(dsn, owner.namespace, directory / "tunnel", datasync.SYNC_FILES,
+                                            tunnel_port=port)
+        try:
+            assert tunneled.connection.info.port == port and forwarded
+            tunneled.require_initialized()
+        finally:
+            tunneled.close()
+    finally:
+        listener.close()
