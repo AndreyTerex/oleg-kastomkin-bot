@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 import uuid
 import asyncio
 from contextlib import contextmanager
@@ -24,6 +25,8 @@ from psycopg.types.json import Jsonb
 # а не клиент: у пропавшего клиента (сон ноутбука, обрыв сети, убитый процесс) некому разорвать соединение.
 # Живой бот после простоя просто переподключается при следующем событии.
 IDLE_SESSION_TIMEOUT_MS = 3 * 60 * 1000
+# Сколько ждать, пока сервер закроет нашу же оборванную сессию после смены адреса.
+STALE_TERMINATE_WAIT_MS = 3000
 # Клиент пропал посреди транзакции — сервер откатывает её и закрывает сессию.
 IDLE_IN_TRANSACTION_TIMEOUT_MS = 30 * 1000
 
@@ -164,7 +167,7 @@ class SharedState:
         self.connection = self._connect()
         if self.owned:
             self._check_stopped()
-            acquired = self.connection.execute("SELECT pg_try_advisory_lock(%s)", (self.key,)).fetchone()[0]
+            acquired = self._lock_after_reconnect()
             self._check_stopped()
             if not acquired:
                 self._abort("Another bot owns the database after reconnect; this instance is stopping")
@@ -182,6 +185,34 @@ class SharedState:
             self._saved = deepcopy(current)
             self._revision = schema["revision"]
             self._ready = True
+        return False
+
+    def _lock_key_parts(self) -> tuple[int, int]:
+        key = self.key & 0xFFFFFFFFFFFFFFFF
+        return key >> 32, key & 0xFFFFFFFF
+
+    def _lock_after_reconnect(self) -> bool:
+        """Снова берёт замок после обрыва связи. Сменился адрес (VPN переключил сервер, включили или
+        выключили VPN) — старое соединение рвётся молча, и его сессия на сервере ещё держит замок.
+        Это наша же сессия (то же application_name с ID этого процесса), а не другой бот: закрываем её
+        и забираем замок, вместо того чтобы останавливать бота."""
+        if self.connection.execute("SELECT pg_try_advisory_lock(%s)", (self.key,)).fetchone()[0]:
+            return True
+        classid, objid = self._lock_key_parts()
+        stale = [row[0] for row in self.connection.execute("""SELECT a.pid
+            FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE l.locktype = 'advisory' AND l.granted AND l.classid = %s AND l.objid = %s AND l.objsubid = 1
+              AND a.application_name = %s AND a.pid <> pg_backend_pid()""",
+            (classid, objid, f"oleg:{self.instance_id}")).fetchall()]
+        if not stale:
+            return False  # замок у другого экземпляра — его не трогаем
+        for pid in stale:
+            self.connection.execute("SELECT pg_terminate_backend(%s, %s)", (pid, STALE_TERMINATE_WAIT_MS))
+        for _ in range(10):
+            self._check_stopped()
+            if self.connection.execute("SELECT pg_try_advisory_lock(%s)", (self.key,)).fetchone()[0]:
+                return True
+            time.sleep(0.2)
         return False
 
     def _read(self, operation):
@@ -227,13 +258,13 @@ class SharedState:
     def lock_holder(self) -> str:
         """Кто держит замок (для лога ожидающего экземпляра): имя приложения и сколько сессия простаивает.
         Адреса не выводим."""
-        key = self.key & 0xFFFFFFFFFFFFFFFF
+        classid, objid = self._lock_key_parts()
         with self._access() as conn:
             row = conn.execute("""SELECT a.application_name, a.state,
                     EXTRACT(EPOCH FROM now() - a.backend_start)::int, EXTRACT(EPOCH FROM now() - a.state_change)::int
                 FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid
                 WHERE l.locktype = 'advisory' AND l.granted AND l.classid = %s AND l.objid = %s AND l.objsubid = 1""",
-                (key >> 32, key & 0xFFFFFFFF)).fetchone()
+                (classid, objid)).fetchone()
         if row is None:
             return "никто (замок только что освободился)"
         name, state, age, idle = row

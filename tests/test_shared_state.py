@@ -760,3 +760,28 @@ def test_hung_connection_attempt_stops_standby_instead_of_piling_threads(monkeyp
     finally:
         release.set()
     assert len(attempts) == 1
+
+
+def test_address_change_reclaims_own_stale_session_instead_of_stopping(database):
+    owner, connect, directory, dsn, namespace = database
+    stats = Stats(directory / "stats.json")
+    stats.load()
+    # Сменился адрес: старое соединение «потерялось» (на сервере живо и держит замок),
+    # а бот видит обрыв и переподключается.
+    zombie = owner.connection
+    owner.connection = psycopg.connect(dsn, autocommit=True)
+    owner.connection.close()
+    owner.check_owner()  # переподключение, своя старая сессия закрыта, замок снова наш
+    assert not owner.failed
+    with psycopg.connect(dsn, autocommit=True) as probe:
+        alive = probe.execute("SELECT count(*) FROM pg_stat_activity WHERE pid = %s",
+                              (zombie.info.backend_pid,)).fetchone()[0]
+    assert alive == 0
+    asyncio.run(stats.record_game(1, [10], [20], event_key="after-vpn-switch"))
+    # Чужой бот (другой ID) так не вытесняется.
+    other = connect(directory / "other-host")
+    assert not other.acquire()
+    other.connection.close()
+    other.connection = psycopg.connect(dsn, autocommit=True)
+    other.owned = True
+    assert not other._lock_after_reconnect()
