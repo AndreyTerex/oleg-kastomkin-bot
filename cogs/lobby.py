@@ -609,9 +609,25 @@ class LobbyView(discord.ui.View):
 
         mode = modes.get_mode(record)
         if mode["teams"] == modes.TEAMS_DRAFT:
-            record["captains"] = await cog.captain_history.draw(
-                interaction.guild.id, interaction.message.id, [member.id for member in players[:target]],
-            )
+            # Claim before history.save() can yield. A later reset/new launch
+            # gets another generation, so this callback cannot revive it.
+            generation = record["launch_no"] = record.get("launch_no", 0) + 1
+            record["stage"] = "launching"
+            def still_launching():
+                return (cog.get_record(interaction.message.id) is record and not record.get("closed")
+                        and record.get("stage") == "launching" and record.get("launch_no") == generation)
+            try:
+                captains = await cog.captain_history.draw(
+                    interaction.guild.id, interaction.message.id, [member.id for member in players[:target]],
+                )
+            except BaseException:
+                if still_launching():
+                    record["stage"] = STAGE_SIGNUP
+                raise
+            if not still_launching():
+                await respond(interaction, "Запуск отменён: состояние сбора изменилось.")
+                return
+            record["captains"] = captains
             record["teams"] = None
             record["deal"] = None
             record["stage"] = STAGE_CAPTAINS
@@ -702,11 +718,37 @@ class LobbyView(discord.ui.View):
 
         draft = cog.draft_view(interaction.message, record, captains, shuffled(pool))
         cog.store_draft(record, draft)
-        await cog.save()
+        generation = record["draft_no"]
+        def draft_is_current():
+            return (cog.get_record(interaction.message.id) is record and not record.get("closed")
+                    and record.get("stage") == STAGE_DRAFT and record.get("draft_no") == generation
+                    and cog.drafts.get(interaction.message.id) is draft)
+        def retire_draft():
+            draft.stop()
+            if cog.drafts.get(interaction.message.id) is draft:
+                cog.drafts.pop(interaction.message.id)
+        try:
+            await cog.save()
+        except BaseException:
+            retire_draft()
+            raise
+        if not draft_is_current():
+            retire_draft()
+            return
         await interaction.response.edit_message(
             embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
         )
+        if not draft_is_current():
+            retire_draft()
+            return
         draft.message = await interaction.followup.send(embed=draft.build_embed(), view=draft, wait=True)
+        if not draft_is_current():
+            retire_draft()
+            try:
+                await draft.message.edit(view=None)
+            except discord.HTTPException:
+                log.warning("Не удалось убрать кнопки отменённого драфта")
+            return
         record["draft"]["message_id"] = draft.message.id
         await cog.save()
 
