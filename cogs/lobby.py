@@ -1,6 +1,7 @@
-"""Сборы: скрим против соперника и внутренняя кастомка 5×5.
+"""Сборы: скримы, кастомки, ARAM: Хаос и пати Ranked Flex.
 
-Лобби ведёт сбор по стадиям: запись → капитаны → драфт → развод по каналам.
+Обычная кастомка проходит стадии: запись → капитаны → драфт → развод по каналам.
+Новые форматы ARAM/Flex ведут только запись и завершение сбора.
 Состояние пишется на диск, поэтому переживает перезапуск контейнера.
 """
 from __future__ import annotations
@@ -22,7 +23,7 @@ import modes
 import portraits
 from champions import POOL, ChampionsUnavailable
 from cogs.scrim import DraftView
-from stats import ELO_START, expected_score
+from stats import ELO_START, expected_score, DuplicateGameError
 from storage import JsonStore, transaction
 from lobby_state import RosterError, change_roster, set_waiting, substitute
 from timeparse import parse_when
@@ -42,10 +43,24 @@ STATUS_TITLES = {
 
 KIND_SCRIM = "scrim"
 KIND_CUSTOM = "custom"
+KIND_ARAM_CUSTOM = "aram_mayhem_custom"
+KIND_ARAM_PARTY = "aram_mayhem_party"
+KIND_FLEX = "ranked_flex"
+
+# Эти форматы только собирают игроков. Лобби и очередь запускаются в клиенте LoL.
+# Размеры фиксированы; старые /custom и /scrim сохраняют свои настройки slots.
+GATHERING_TARGETS = {KIND_ARAM_CUSTOM: 10, KIND_ARAM_PARTY: 5, KIND_FLEX: 5}
+ARAM_FORMAT_CHOICES = [
+    app_commands.Choice(name="Пати — 5 игроков", value=KIND_ARAM_PARTY),
+    app_commands.Choice(name="Кастомка 5×5 — 10 игроков", value=KIND_ARAM_CUSTOM),
+]
 
 KIND_TITLES = {
     KIND_SCRIM: "⚔️ Скрим",
     KIND_CUSTOM: "🎮 Кастомка 5×5",
+    KIND_ARAM_CUSTOM: "🌪️ ARAM: Хаос · кастомка 5×5",
+    KIND_ARAM_PARTY: "🌪️ ARAM: Хаос · пати на 5",
+    KIND_FLEX: "🏆 Ranked Flex · пати на 5",
 }
 
 # Стадии сбора: по ним включаются кнопки.
@@ -325,8 +340,8 @@ class LobbyView(discord.ui.View):
                 self.remove_item(child)
                 continue
 
-            # Скрим — это одна команда против соперника: делить её на две и раздавать чемпионов незачем.
-            if kind == KIND_SCRIM and custom_id in CUSTOM_GAME_ONLY:
+            # Драфт, раздача и результаты относятся только к прежней внутренней кастомке.
+            if kind != KIND_CUSTOM and custom_id in CUSTOM_GAME_ONLY:
                 self.remove_item(child)
                 continue
 
@@ -397,18 +412,19 @@ class LobbyView(discord.ui.View):
         record = cog.get_record(interaction.message.id)
 
         if record is None:
-            await respond(interaction, "Этот сбор больше не отслеживается — создайте новый через `/scrim` или `/custom`.")
+            await respond(interaction, "Этот сбор больше не отслеживается — создайте новый через `/scrim`, `/custom`, `/aram` или `/flex`.")
             return
         if record.get("closed"):
             await respond(interaction, "Сбор отменён.")
             return
 
         try:
-            changed, overflow, promoted = cog.apply_move(interaction.guild, record, [interaction.user.id], status)
+            with transaction(cog.store):
+                changed, overflow, promoted = cog.apply_move(interaction.guild, record, [interaction.user.id], status)
+                await cog.save()
         except RosterError as error:
             await respond(interaction, str(error))
             return
-        await cog.save()
         await interaction.response.edit_message(
             embed=cog.build_embed(interaction.guild, record), view=LobbyView(record)
         )
@@ -549,6 +565,9 @@ class LobbyView(discord.ui.View):
         if record is None:
             await respond(interaction, "Этот сбор больше не отслеживается.")
             return
+        if record.get("kind", KIND_SCRIM) != KIND_CUSTOM:
+            await respond(interaction, "Этот формат только собирает игроков — режим выбираете в клиенте LoL.")
+            return
         if not cog.is_organizer(interaction, record):
             await respond(interaction, "Режим выбирает автор сбора или организатор ивентов.")
             return
@@ -564,6 +583,9 @@ class LobbyView(discord.ui.View):
         record = cog.get_record(interaction.message.id)
         if record is None:
             await respond(interaction, "Этот сбор больше не отслеживается.")
+            return
+        if record.get("kind", KIND_SCRIM) != KIND_CUSTOM:
+            await respond(interaction, "Этот формат только собирает игроков — игру запускаете в клиенте LoL.")
             return
         if not cog.is_organizer(interaction, record):
             await respond(interaction, "Запускать игру может только автор сбора или организатор ивентов.")
@@ -783,20 +805,26 @@ async def report_result(
             or bet_round(record, round_no) != pool_round):
         await interaction.followup.send("Этот раунд уже обработан или сбор закрыт.", ephemeral=True)
         return
-    with transaction(cog.store, stats_cog.stats.store, stats_cog.wallets.store):
-        # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
-        record["last_report_at"] = time.time()
-        record["round"] = round_no + 1
-        game_id = await stats_cog.stats.record_game(
-            interaction.guild.id, list(winners), list(losers), lobby_id=lobby_id, round_no=round_no,
-            channel_id=interaction.channel_id,
-        )
-        record.setdefault("results", []).append({"round": round_no, "winner": side, "game": game_id})
-        await cog.save()
-        bet_line = await cog.settle_bets(interaction.guild, lobby_id, pool_round, side)
-        bounty = config.BOUNTY_COINS if leader is not None and leader in losers else 0
-        extra_lines = cog.settle_extras(interaction.guild, game_id, list(winners), list(losers), leader, bounty)
-        await stats_cog.wallets.save()
+    try:
+        with transaction(cog.store, stats_cog.stats.store, stats_cog.wallets.store):
+            # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
+            record["last_report_at"] = time.time()
+            record["round"] = round_no + 1
+            game_id = await stats_cog.stats.record_game(
+                interaction.guild.id, list(winners), list(losers), lobby_id=lobby_id, round_no=round_no,
+                channel_id=interaction.channel_id,
+                event_key=f"match:{interaction.guild.id}:{lobby_id}:{record.get('series_no', 0)}:{round_no}:"
+                          f"{record.get('result_revisions', {}).get(str(round_no), 0)}",
+            )
+            record.setdefault("results", []).append({"round": round_no, "winner": side, "game": game_id})
+            await cog.save()
+            bet_line = await cog.settle_bets(interaction.guild, lobby_id, pool_round, side)
+            bounty = config.BOUNTY_COINS if leader is not None and leader in losers else 0
+            extra_lines = cog.settle_extras(interaction.guild, game_id, list(winners), list(losers), leader, bounty)
+            await stats_cog.wallets.save()
+    except DuplicateGameError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
     side_name = (BLUE_SIDE, RED_SIDE)[side]
     if interaction.message is not None and interaction.message.id == lobby_id:
         lobby_message = interaction.message
@@ -945,10 +973,11 @@ class FinishView(discord.ui.View):
         record["finished"] = True
         await self.cog.save()
         await self.cog.refund_bets(interaction.guild.id, self.lobby_message.id)
-        await interaction.response.edit_message(content="Кастомка завершена.", view=None)
+        gathering = record.get("kind") in GATHERING_TARGETS
+        await interaction.response.edit_message(content="Сбор завершён." if gathering else "Кастомка завершена.", view=None)
         await self.lobby_message.edit(embed=self.cog.build_embed(interaction.guild, record), view=LobbyView(record))
         try:
-            await interaction.followup.send(f"🏁 Кастомка завершена досрочно. {score}")
+            await interaction.followup.send("🏁 Сбор завершён." if gathering else f"🏁 Кастомка завершена досрочно. {score}")
         except discord.HTTPException:
             log.warning("Не удалось объявить завершение кастомки")
         self.stop()
@@ -957,6 +986,9 @@ class FinishView(discord.ui.View):
     async def rebuild(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         record = await self._record(interaction)
         if record is None:
+            return
+        if record.get("kind") in GATHERING_TARGETS:
+            await respond(interaction, "В этом сборе состав меняется через «Правка состава».")
             return
         draft = self.cog.drafts.pop(self.lobby_message.id, None)
         if draft is not None:
@@ -979,6 +1011,14 @@ class FinishView(discord.ui.View):
 
 class ManageView(FinishView):
     """Редкие действия доступны организатору в отдельном меню."""
+
+    def __init__(self, cog: "Lobby", lobby_message: discord.Message) -> None:
+        super().__init__(cog, lobby_message)
+        record = cog.get_record(lobby_message.id)
+        if record is not None and record.get("kind") in GATHERING_TARGETS:
+            self.close_lobby.label = "Завершить сбор"
+            for item in (self.rebuild, self.replace, self.mode, self.captains):
+                self.remove_item(item)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         record = self.cog.get_record(self.lobby_message.id)
@@ -1020,8 +1060,8 @@ class ManageView(FinishView):
         record = await self._record(interaction)
         if record is None:
             return
-        if record.get("kind") == KIND_SCRIM:
-            await respond(interaction, "У скрима одна команда — режим кастомки не нужен.")
+        if record.get("kind", KIND_SCRIM) != KIND_CUSTOM:
+            await respond(interaction, "Этот формат только собирает игроков — режим выбираете в клиенте LoL.")
             return
         view = ModeView(self.cog, record, self.lobby_message)
         await interaction.response.edit_message(content=view.describe(), view=view)
@@ -1101,6 +1141,9 @@ class UndoResultView(discord.ui.View):
             results = self.record.get("results") or []
             in_series = any(r.get("game") == self.game_id for r in results)
             self.record["results"] = [r for r in results if r.get("game") != self.game_id]
+            if in_series:
+                revisions = self.record.setdefault("result_revisions", {})
+                revisions[str(self.round_no)] = revisions.get(str(self.round_no), 0) + 1
             # Номер катки откатываем, только если катка из текущей серии и после неё новых отметок не было.
             if in_series and self.record.get("round") == self.round_no + 1:
                 self.record["round"] = self.round_no
@@ -1292,6 +1335,9 @@ class ModeView(discord.ui.View):
 
     @discord.ui.button(label="Сохранить", emoji="💾", style=discord.ButtonStyle.success, row=4)
     async def save(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.record.get("kind", KIND_SCRIM) != KIND_CUSTOM:
+            await respond(interaction, "Для этого формата настройки раздачи не используются.")
+            return
         if self.record.get("closed") or self.record.get("stage", STAGE_SIGNUP) != STAGE_SIGNUP:
             await respond(interaction, "Режим меняется до запуска. Для новой игры сначала пересоберите составы.")
             return
@@ -1889,7 +1935,7 @@ class Lobby(commands.Cog):
 
     async def open_bets(self, guild_id: int, lobby_id: int, record: dict) -> None:
         stats_cog = self.bot.get_cog("Stats")
-        if stats_cog is None or record.get("kind") == KIND_SCRIM:
+        if stats_cog is None or record.get("kind", KIND_SCRIM) != KIND_CUSTOM:
             return
         stats_cog.wallets.open_pool(guild_id, lobby_id, bet_round(record))
         await stats_cog.wallets.save()
@@ -2264,7 +2310,7 @@ class Lobby(commands.Cog):
         mode = modes.get_mode(record)
         series = record.get("series", DEFAULT_SERIES)
         title = KIND_TITLES.get(kind, KIND_TITLES[KIND_SCRIM])
-        if kind != KIND_SCRIM:
+        if kind == KIND_CUSTOM:
             title += f" · Bo{series}"
         if closed:
             title += " · завершён" if record.get("finished") else " · отменён"
@@ -2277,11 +2323,15 @@ class Lobby(commands.Cog):
         else:
             lines = [f"### 🕒 {record['time']}"]
         details = []
-        if kind != KIND_SCRIM:
+        if kind == KIND_CUSTOM:
             mode_text = modes.mode_title(mode)
             if modes.find_preset(mode) is None:
                 mode_text += f" — {modes.mode_summary(mode)}"
             details.append(f"Режим {mode_text}")
+        if kind == KIND_ARAM_CUSTOM:
+            details.append("Сбор игроков; доступность ARAM: Хаос в своей игре проверьте в клиенте LoL")
+        elif kind in (KIND_ARAM_PARTY, KIND_FLEX):
+            details.append("Собираем пятёрку; очередь запускаете в клиенте LoL")
         if record.get("opponent"):
             details.append(f"⚔️ Соперник {record['opponent']}")
         if details:
@@ -2340,6 +2390,8 @@ class Lobby(commands.Cog):
 
         if closed:
             footer = "Кастомка завершена — результаты в /stats" if record.get("finished") else "Сбор отменён"
+            if record.get("finished") and kind in GATHERING_TARGETS:
+                footer = "Сбор завершён"
         elif len(teams) == 2:
             footer = "Составы готовы — можно раскидать по каналам"
             footer += f" · катка {record.get('round', 1)}: после игры отметьте победителя"
@@ -2350,7 +2402,9 @@ class Lobby(commands.Cog):
         elif len(captains) == 2:
             footer = "Капитаны выбраны — можно начинать драфт"
         elif going >= target:
-            if kind == KIND_SCRIM:
+            if kind in GATHERING_TARGETS:
+                footer = "Состав собран — собирайтесь в клиенте LoL · после игры: «Управление» → «Завершить сбор»"
+            elif kind == KIND_SCRIM:
                 footer = "Состав собран — ждём соперника"
             elif mode["teams"] == modes.TEAMS_DRAFT:
                 footer = "Состав собран — можно ролить капитанов"
@@ -2376,6 +2430,7 @@ class Lobby(commands.Cog):
         ping: str,
         series: int = DEFAULT_SERIES,
     ) -> None:
+        target = GATHERING_TARGETS.get(kind, target)
         warning: str | None = None
         # Массовый пинг доступен только тем, кто и сам может упоминать @everyone,
         # иначе через бота это мог бы сделать любой участник сервера.
@@ -2424,6 +2479,10 @@ class Lobby(commands.Cog):
             STATUS_SUB: [],
             STATUS_OUT: [],
         }
+        if kind in GATHERING_TARGETS:
+            # Не наследуем пресет «Хаос» или серию обычной кастомки.
+            record.pop("mode")
+            record.pop("series")
 
         parts = [PING_TEXT[ping]] if ping in PING_TEXT else []
         if mention is not None:
@@ -2511,6 +2570,53 @@ class Lobby(commands.Cog):
             series=series.value if series else DEFAULT_SERIES,
         )
 
+    @app_commands.command(name="aram", description="Сбор на ARAM: Хаос — пати на 5 или кастомка на 10")
+    @app_commands.describe(
+        when="Когда играем, например «сегодня 21:00»",
+        format="Пати на 5 (по умолчанию) или кастомка 5×5 на 10",
+        note="Дополнение к сбору",
+        ping="Кого позвать (по умолчанию @everyone)",
+        mention="Дополнительно упомянуть конкретную роль",
+    )
+    @app_commands.choices(format=ARAM_FORMAT_CHOICES, ping=PING_CHOICES)
+    @app_commands.guild_only()
+    async def aram(
+        self,
+        interaction: discord.Interaction,
+        when: str,
+        format: app_commands.Choice[str] | None = None,
+        note: str | None = None,
+        ping: app_commands.Choice[str] | None = None,
+        mention: discord.Role | None = None,
+    ) -> None:
+        kind = format.value if format else KIND_ARAM_PARTY
+        await self._open_lobby(
+            interaction, kind=kind, target=GATHERING_TARGETS[kind], when=when,
+            opponent=None, note=note, mention=mention, ping=ping.value if ping else PING_EVERYONE,
+        )
+
+    @app_commands.command(name="flex", description="Собрать пятёрку для Ranked Flex")
+    @app_commands.describe(
+        when="Когда играем, например «сегодня 21:00»",
+        note="Дополнение к сбору",
+        ping="Кого позвать (по умолчанию @everyone)",
+        mention="Дополнительно упомянуть конкретную роль",
+    )
+    @app_commands.choices(ping=PING_CHOICES)
+    @app_commands.guild_only()
+    async def flex(
+        self,
+        interaction: discord.Interaction,
+        when: str,
+        note: str | None = None,
+        ping: app_commands.Choice[str] | None = None,
+        mention: discord.Role | None = None,
+    ) -> None:
+        await self._open_lobby(
+            interaction, kind=KIND_FLEX, target=GATHERING_TARGETS[KIND_FLEX], when=when,
+            opponent=None, note=note, mention=mention, ping=ping.value if ping else PING_EVERYONE,
+        )
+
     def latest_open_record(self, guild: discord.Guild) -> tuple[str, dict] | None:
         """Последний непогашенный сбор сервера — к нему привязаны /roster и /ping."""
         now = time.time()
@@ -2546,7 +2652,7 @@ class Lobby(commands.Cog):
     ) -> None:
         found = self.latest_open_record(interaction.guild)
         if found is None:
-            await respond(interaction, "Активных сборов нет. Создайте новый через `/custom` или `/scrim`.")
+            await respond(interaction, "Активных сборов нет. Создайте новый через `/custom`, `/scrim`, `/aram` или `/flex`.")
             return
         message_id, record = found
 
@@ -2593,7 +2699,7 @@ class Lobby(commands.Cog):
     async def roster(self, interaction: discord.Interaction) -> None:
         found = self.latest_open_record(interaction.guild)
         if found is None:
-            await respond(interaction, "Открытых сборов нет. Создайте новый через `/scrim` или `/custom`.")
+            await respond(interaction, "Открытых сборов нет. Создайте новый через `/scrim`, `/custom`, `/aram` или `/flex`.")
             return
 
         _message_id, record = found

@@ -179,6 +179,9 @@ LLM_ORDER: list[str] = [
 
 # Каталог для сохранения состояния (в Docker смонтирован как volume).
 DATA_DIR: str = os.getenv("DATA_DIR", "data")
+# Общие данные: direct PostgreSQL URL (Neon), только вне репозитория.
+DATABASE_URL: str = os.getenv("DATABASE_URL", "").strip()
+SHARED_STATE_KEY: str = os.getenv("SHARED_STATE_KEY", "oleg").strip()
 
 # Канал для тревог (ошибки, VPN лежит, все нейросети на лимите). Пусто — тревоги не шлются, /oleg-status работает.
 ALERT_CHANNEL_ID: int = _env_int("ALERT_CHANNEL_ID")

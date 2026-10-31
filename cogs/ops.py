@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import re
@@ -31,6 +32,7 @@ from discord.ext import commands, tasks
 
 import config
 import datasync
+from storage import shared_backend
 from utils import NEUTRAL, WARNING
 from vpn import VPN_CLIENT
 
@@ -117,11 +119,18 @@ def make_backup(data_dir: str | os.PathLike[str], day: str, keep: int) -> Path |
     if target.exists():
         return None
     files = sorted(Path(data_dir).glob("*.json"))
+    backend = shared_backend(data_dir)
+    snapshot = backend.snapshot() if backend is not None else None
     tmp = target.with_name(f".{day}.tmp")
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
     for path in files:
+        if snapshot is not None and path.name in datasync.SYNC_FILES:
+            continue
         shutil.copy2(path, tmp / path.name)
+    if snapshot is not None:
+        for name, value in snapshot.items():
+            (tmp / name).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(target)
     prune_backups(data_dir, keep)
     return target
@@ -298,6 +307,11 @@ class Ops(commands.Cog):
         embed = discord.Embed(title="Состояние Олега", color=NEUTRAL)
         embed.add_field(name="Работает", value=f"{uptime_text(time.time() - STARTED_AT)} (с <t:{int(STARTED_AT)}:f>)")
         embed.add_field(name="Discord", value=f"{latency:.0f} мс" if latency is not None else "—")
+        backend = shared_backend(config.DATA_DIR)
+        if backend is not None:
+            embed.add_field(name="Данные", value="Общая PostgreSQL-база · " +
+                            ("связь потеряна, запись остановлена" if backend.failed else "этот экземпляр владеет записью"),
+                            inline=False)
 
         client = self.chat_client()
         if client is None or not client.enabled:
@@ -360,10 +374,14 @@ class Ops(commands.Cog):
             datasync.build_archive, config.DATA_DIR, [guild.id for guild in self.bot.guilds],
         )
         name = f"oleg-data-{datetime.now(config.TIMEZONE).strftime('%Y-%m-%d_%H-%M')}.zip"
+        instructions = (
+            "Это резервная копия общей базы. Для восстановления остановите бота и используйте shared_admin restore. "
+            if shared_backend(config.DATA_DIR) is not None else
+            "Чтобы перенести их в другого бота, там выполните `/oleg-import` и приложите этот файл. "
+        )
         await interaction.followup.send(
             f"Данные Олега: {', '.join(files) or 'пусто'}.\n"
-            "Чтобы перенести их в другого бота, там выполните `/oleg-import` и приложите этот файл. "
-            "Кэша VPN и ключей в архиве нет.",
+            + instructions + "Кэша VPN и ключей в архиве нет.",
             file=discord.File(io.BytesIO(payload), filename=name),
             ephemeral=True,
         )
@@ -376,6 +394,12 @@ class Ops(commands.Cog):
     async def import_data(self, interaction: discord.Interaction, archive: discord.Attachment) -> None:
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("Команда только для администраторов сервера.", ephemeral=True)
+            return
+        if shared_backend(config.DATA_DIR) is not None:
+            await interaction.response.send_message(
+                "Общая база включена. Для восстановления остановите бота и используйте shared_admin restore "
+                "с проверкой снимка и резервной копией.", ephemeral=True,
+            )
             return
         if archive.size > datasync.MAX_ARCHIVE_BYTES:
             await interaction.response.send_message("Архив слишком большой.", ephemeral=True)

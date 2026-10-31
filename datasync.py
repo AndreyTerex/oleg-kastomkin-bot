@@ -14,7 +14,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from storage import recover_transactions
+from storage import recover_transactions, shared_backend
 
 # Что переносится. Всё остальное в data/ (vpn.json, llm_usage.json, heartbeat, backups) — нет.
 SYNC_FILES = (
@@ -35,6 +35,10 @@ class ImportError_(ValueError):
 def build_archive(data_dir: str | os.PathLike[str], guild_ids: list[int]) -> tuple[bytes, list[str]]:
     """ZIP с данными и описанием. Возвращает байты архива и список вошедших файлов."""
     data = Path(data_dir)
+    backend = shared_backend(data)
+    if backend is not None:
+        entries = backend.snapshot()
+        return archive_entries(entries, guild_ids)
     recover_transactions(data)
     buffer = io.BytesIO()
     included = []
@@ -51,6 +55,18 @@ def build_archive(data_dir: str | os.PathLike[str], guild_ids: list[int]) -> tup
             "files": included,
         }, ensure_ascii=False, indent=2))
     return buffer.getvalue(), included
+
+
+def archive_entries(entries: dict[str, dict], guild_ids: list[int]) -> tuple[bytes, list[str]]:
+    """Canonical backup of a single database snapshot, compatible with /oleg-export."""
+    buffer = io.BytesIO()
+    names = [name for name in SYNC_FILES if name in entries]
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name in names:
+            archive.writestr(name, json.dumps(entries[name], ensure_ascii=False, indent=2))
+        archive.writestr(META_FILE, json.dumps({"format": FORMAT_VERSION, "exported_at": int(time.time()),
+                                             "guilds": [str(g) for g in guild_ids], "files": names}))
+    return buffer.getvalue(), names
 
 
 def read_archive(payload: bytes) -> tuple[dict[str, bytes], dict]:
@@ -96,6 +112,8 @@ def apply_archive(data_dir: str | os.PathLike[str], files: dict[str, bytes]) -> 
     Файлы, которых нет в архиве, не трогаются. Пишется синхронно и атомарно (через временный файл).
     """
     data = Path(data_dir)
+    if shared_backend(data) is not None:
+        raise ImportError_("Общая база включена: остановите бота и используйте shared_admin restore с резервной копией.")
     backup = data / IMPORT_BACKUPS / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     backup.mkdir(parents=True, exist_ok=True)
     for name in SYNC_FILES:

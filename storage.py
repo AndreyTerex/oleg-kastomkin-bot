@@ -11,6 +11,31 @@ from pathlib import Path
 
 _TRANSACTION: ContextVar[tuple | None] = ContextVar("json_transaction", default=None)
 JOURNAL = ".pending-transaction.json"
+_SHARED = None
+
+
+def configure_shared(backend) -> None:
+    global _SHARED
+    _SHARED = backend
+
+
+def shared_backend(directory=None):
+    if _SHARED is not None and (directory is None or Path(directory).resolve() == _SHARED.directory):
+        return _SHARED
+    return None
+
+
+@contextmanager
+def atomic(*stores):
+    """Join an existing result transaction or create one for a standalone operation."""
+    active = _TRANSACTION.get()
+    if active is not None:
+        if any(store not in active for store in stores):
+            raise RuntimeError("Store is not part of the active transaction")
+        yield
+    else:
+        with transaction(*stores):
+            yield
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -75,13 +100,20 @@ def transaction(*stores: "JsonStore"):
     if len(parents) != 1:
         raise ValueError("Файлы транзакции должны лежать в одной папке")
     directory = parents.pop()
-    recover_transactions(directory)
+    shared = [_SHARED is not None and _SHARED.handles(store.path) for store in stores]
+    if any(shared) and not all(shared):
+        raise RuntimeError("Cannot mix local and shared stores in one transaction")
+    if not all(shared):
+        recover_transactions(directory)
     snapshots = [deepcopy(store.data) for store in stores]
     token = _TRANSACTION.set(stores)
     prepared = False
     try:
         yield
         entries = {store.path.name: store.data for store in stores}
+        if all(shared):
+            _SHARED.save(entries)
+            return
         _write_json(directory / JOURNAL, entries)
         prepared = True
         recover_transactions(directory)
@@ -100,6 +132,9 @@ class JsonStore:
         self.data: dict = {}
 
     def load(self) -> dict:
+        if _SHARED is not None and _SHARED.handles(self.path):
+            self.data = _SHARED.load(self.path.name)
+            return self.data
         recover_transactions(self.path.parent)
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -119,8 +154,12 @@ class JsonStore:
             return
         # Небольшие локальные JSON пишутся без переключения задач: снимок не может
         # измениться во время записи, а транзакцию не обгонит фоновый поток save().
-        recover_transactions(self.path.parent)
+        if _SHARED is None or not _SHARED.handles(self.path):
+            recover_transactions(self.path.parent)
         self._write()
 
     def _write(self) -> None:
+        if _SHARED is not None and _SHARED.handles(self.path):
+            _SHARED.save({self.path.name: self.data})
+            return
         _write_json(self.path, self.data)

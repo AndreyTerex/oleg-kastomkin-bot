@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from storage import JsonStore
+from storage import JsonStore, atomic, shared_backend
 
 # Сколько последних каток хранить подробно (для отмены и истории). Счётчики игроков не обрезаются.
 HISTORY_LIMIT = 500
@@ -23,6 +23,11 @@ ELO_K = 24.0
 # Столько каток игрок считается новичком (больший коэффициент).
 ELO_NEW_GAMES = 10
 ELO_VERSION = 1
+
+
+class DuplicateGameError(ValueError):
+    """A stable match key has already been accepted (even if its result was later undone)."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -95,6 +100,8 @@ class Stats:
         guild.setdefault("players", {})
         guild.setdefault("games", [])
         guild.setdefault("next_id", 1)
+        if guild.get("elo_version", 0) > ELO_VERSION:
+            raise ValueError("Stats were written by newer Elo code; refusing to downgrade them")
         if guild.get("elo_version") != ELO_VERSION:
             self._replay_elo(guild)
         return guild
@@ -137,65 +144,75 @@ class Stats:
     async def record_game(
         self, guild_id: int, winners: list[int], losers: list[int], *, lobby_id: int | None = None, round_no: int = 1,
         channel_id: int | None = None,
+        event_key: str | None = None,
     ) -> int:
         """Записывает катку и возвращает её номер — по нему катку можно отменить."""
-        guild = self._guild(guild_id)
-        game_id = guild["next_id"]
-        guild["next_id"] += 1
-        ratings = {u: (self.player(guild_id, u).elo, self.player(guild_id, u).games) for u in winners + losers}
-        changes = elo_changes(ratings, winners, losers)
-        for user_id, delta in changes.items():
-            entry = guild["players"].setdefault(str(user_id), {"wins": 0, "losses": 0})
-            entry["elo"] = round(entry.get("elo", ELO_START) + delta, 1)
-        for user_id, key in [(u, "wins") for u in winners] + [(u, "losses") for u in losers]:
-            entry = guild["players"].setdefault(str(user_id), {"wins": 0, "losses": 0})
-            entry[key] = entry.get(key, 0) + 1
-        guild["games"].append({
-            "id": game_id, "at": time.time(), "winners": winners, "losers": losers,
-            "lobby": lobby_id, "round": round_no, "elo": {str(u): d for u, d in changes.items()},
-        })
-        del guild["games"][:-HISTORY_LIMIT]
-        if channel_id:
-            guild["last_channel"] = channel_id
-        await self.store.save()
-        return game_id
+        with atomic(self.store):
+            guild = self._guild(guild_id)
+            if event_key is not None and event_key in guild.get("result_keys", {}):
+                raise DuplicateGameError("Этот результат уже сохранён; повторная запись не выполнена.")
+            game_id = guild["next_id"]
+            guild["next_id"] += 1
+            ratings = {u: (self.player(guild_id, u).elo, self.player(guild_id, u).games) for u in winners + losers}
+            changes = elo_changes(ratings, winners, losers)
+            for user_id, delta in changes.items():
+                entry = guild["players"].setdefault(str(user_id), {"wins": 0, "losses": 0})
+                entry["elo"] = round(entry.get("elo", ELO_START) + delta, 1)
+            for user_id, key in [(u, "wins") for u in winners] + [(u, "losses") for u in losers]:
+                entry = guild["players"].setdefault(str(user_id), {"wins": 0, "losses": 0})
+                entry[key] = entry.get(key, 0) + 1
+            guild["games"].append({
+                "id": game_id, "at": time.time(), "winners": winners, "losers": losers,
+                "lobby": lobby_id, "round": round_no, "elo": {str(u): d for u, d in changes.items()},
+            })
+            if event_key is not None:
+                guild.setdefault("result_keys", {})[event_key] = game_id
+                guild["games"][-1]["event_key"] = event_key
+            if shared_backend(self.store.path.parent) is None:
+                del guild["games"][:-HISTORY_LIMIT]
+            if channel_id:
+                guild["last_channel"] = channel_id
+            await self.store.save()
+            return game_id
 
     async def undo_game(self, guild_id: int, game_id: int) -> bool:
-        guild = self._guild(guild_id)
-        game = next((g for g in guild["games"] if g["id"] == game_id), None)
-        if game is None:
-            return False
-        for user_id, key in [(u, "wins") for u in game["winners"]] + [(u, "losses") for u in game["losers"]]:
-            entry = guild["players"].get(str(user_id))
-            if entry and entry.get(key, 0) > 0:
-                entry[key] -= 1
-        for user_id, delta in (game.get("elo") or {}).items():
-            entry = guild["players"].get(str(user_id))
-            if entry:
-                entry["elo"] = round(entry.get("elo", ELO_START) - delta, 1)
-        for user_id in game.get("mvp") or []:
-            entry = guild["players"].get(str(user_id))
-            if entry and entry.get("mvp", 0) > 0:
-                entry["mvp"] -= 1
-        guild["games"].remove(game)
-        await self.store.save()
-        return True
+        with atomic(self.store):
+            guild = self._guild(guild_id)
+            game = next((g for g in guild["games"] if g["id"] == game_id), None)
+            if game is None:
+                return False
+            for user_id, key in [(u, "wins") for u in game["winners"]] + [(u, "losses") for u in game["losers"]]:
+                entry = guild["players"].get(str(user_id))
+                if entry and entry.get(key, 0) > 0:
+                    entry[key] -= 1
+            for user_id, delta in (game.get("elo") or {}).items():
+                entry = guild["players"].get(str(user_id))
+                if entry:
+                    entry["elo"] = round(entry.get("elo", ELO_START) - delta, 1)
+            for user_id in game.get("mvp") or []:
+                entry = guild["players"].get(str(user_id))
+                if entry and entry.get("mvp", 0) > 0:
+                    entry["mvp"] -= 1
+            guild["games"].remove(game)
+            await self.store.save()
+            return True
 
     def game(self, guild_id: int, game_id: int) -> dict | None:
         return next((g for g in self._guild(guild_id)["games"] if g["id"] == game_id), None)
 
     async def set_mvp(self, guild_id: int, game_id: int, user_ids: list[int]) -> bool:
         """MVP катки по итогам голосования. False — катку уже отменили."""
-        game = self.game(guild_id, game_id)
-        if game is None or game.get("mvp"):
-            return False
-        guild = self._guild(guild_id)
-        game["mvp"] = list(user_ids)
-        for user_id in user_ids:
-            entry = guild["players"].setdefault(str(user_id), {"wins": 0, "losses": 0})
-            entry["mvp"] = entry.get("mvp", 0) + 1
-        await self.store.save()
-        return True
+        with atomic(self.store):
+            game = self.game(guild_id, game_id)
+            if game is None or game.get("mvp"):
+                return False
+            guild = self._guild(guild_id)
+            game["mvp"] = list(user_ids)
+            for user_id in user_ids:
+                entry = guild["players"].setdefault(str(user_id), {"wins": 0, "losses": 0})
+                entry["mvp"] = entry.get("mvp", 0) + 1
+            await self.store.save()
+            return True
 
     def games_since(self, guild_id: int, since: float) -> list[dict]:
         return [g for g in self._guild(guild_id)["games"] if g.get("at", 0) >= since]

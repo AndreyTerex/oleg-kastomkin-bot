@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 import sys
 
 import discord
@@ -10,9 +11,10 @@ from discord.ext import commands
 
 import champions
 import config
+import datasync
 import portraits
 from sync import Sync
-from storage import recover_transactions
+from storage import recover_transactions, configure_shared
 from vpn import VPN_CLIENT
 from utils import WARNING, respond
 
@@ -49,8 +51,29 @@ class ScrimBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.tree.on_error = self.on_tree_error
+        self.shared_state = None
+        if config.DATABASE_URL:
+            from shared_state import SharedState, SharedStateError
+            loop = asyncio.get_running_loop()
+            def failed():
+                log.critical("Общая база недоступна — закрываю бота без перехода на локальные данные")
+                loop.call_soon_threadsafe(lambda: asyncio.create_task(self.close()))
+            backend = SharedState(config.DATABASE_URL, config.SHARED_STATE_KEY, config.DATA_DIR,
+                                  datasync.SYNC_FILES, on_failure=failed)
+            try:
+                if not backend.acquire():
+                    raise SharedStateError("Другой экземпляр уже владеет общей базой. Сначала остановите его.")
+                backend.require_initialized()
+            except BaseException:
+                backend.close()
+                raise
+            self.shared_state = backend
+            configure_shared(backend)
+            from shared_discord import install_discord_guard
+            install_discord_guard(self, backend)
         # До загрузки модулей: если бот уже работает на другом компьютере — ждём; свежие данные — из канала.
-        recover_transactions(config.DATA_DIR)
+        if self.shared_state is None:
+            recover_transactions(config.DATA_DIR)
         self.sync = Sync(self)
         await self.sync.prepare()
 
@@ -83,7 +106,13 @@ class ScrimBot(commands.Bot):
         await champions.POOL.close()
         await portraits.close()
         await VPN_CLIENT.close()
-        await super().close()
+        try:
+            await super().close()
+        finally:
+            backend = getattr(self, "shared_state", None)
+            if backend is not None:
+                backend.close()
+                # Keep the failed backend installed: late tasks must never fall back to local files.
 
     async def on_message(self, message: discord.Message) -> None:
         # Текстовых команд у бота нет — только слэш-команды. Без этого «@Олег привет»

@@ -99,7 +99,7 @@ def lock_is_foreign(lock: tuple[str, float] | None, me: str, now: float, stale: 
 class Sync:
     def __init__(self, bot: discord.Client) -> None:
         self.bot = bot
-        self.channel_id = config.SYNC_CHANNEL_ID
+        self.channel_id = 0 if config.DATABASE_URL else config.SYNC_CHANNEL_ID
         self.me = instance_id(config.DATA_DIR) if self.channel_id else ""
         self.lock_message: discord.Message | None = None
         self.pushed_digest = ""

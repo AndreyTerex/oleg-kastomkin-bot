@@ -34,6 +34,7 @@ from discord.ext import commands
 
 import config
 import persona
+from cogs.lobby import KIND_SCRIM, KIND_TITLES
 from lobby_state import RosterError
 import llm_actions
 import lobby_requests
@@ -90,7 +91,7 @@ BURST_WINDOW = 2 * 60
 
 # О сборе Олег узнаёт, только когда о нём говорят, — иначе суёт «19:00» в каждую реплику.
 LOBBY_TOPIC = re.compile(
-    r"кастом|сбор|катк|запис|кто (играет|идёт|идет|будет|в игру)|\b\d{1,2}[:.]\d{2}\b|состав|драфт|капитан|режим"
+    r"кастом|сбор|катк|запис|кто (играет|идёт|идет|будет|в игру)|\b\d{1,2}[:.]\d{2}\b|состав|драфт|капитан|режим|aram|арам|flex|флекс"
     r"|бан|забан|пик|раздач|чемп|чамп|контр|против них|соперник|команд|сторон|синие|синих|красные|красных",
     re.IGNORECASE,
 )
@@ -1001,7 +1002,7 @@ class Chat(commands.Cog):
             return None
         found = lobby_cog.latest_open_record(guild)
         if found is None:
-            return "Открытых сборов на кастомку сейчас нет."
+            return "Открытых сборов сейчас нет."
         _message_id, record = found
 
         def names(key: str) -> str:
@@ -1010,8 +1011,9 @@ class Chat(commands.Cog):
 
         going = len(record.get("in", []))
         target = record.get("target", config.TEAM_SIZE)
+        title = KIND_TITLES.get(record.get("kind", KIND_SCRIM), KIND_TITLES[KIND_SCRIM])
         summary = (
-            f"Ближайший сбор: {record.get('time')}, записались {going} из {target}. "
+            f"Ближайший сбор: {title}, {record.get('time')}, записались {going} из {target}. "
             f"Играют: {names('in')}. Запасные: {names('sub')}. Не смогут: {names('out')}."
         )
         deal = deal_summary(guild, record)
