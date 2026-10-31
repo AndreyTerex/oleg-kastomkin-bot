@@ -513,3 +513,177 @@ def test_persistent_button_parser_is_guarded_before_view_dispatch(database, monk
         await asyncio.gather(*tuple(bot._shared_event_tasks))
         assert dispatch_view.call_count == 1
     asyncio.run(run())
+
+
+def test_quiz_style_save_keeps_discord_heartbeat_running(database, monkeypatch):
+    import threading
+    import async_db
+    owner, _, directory, _, _ = database
+    store = JsonStore(directory / "quiz.json")
+    store.load()
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    original = owner._commit
+    def stalled(entries, operation):
+        entered.set()
+        try:
+            release.wait(2)  # simulate a socket read ignoring server statement_timeout
+            original(entries, operation)
+        finally:
+            finished.set()
+    monkeypatch.setattr(owner, "_commit", stalled)
+    monkeypatch.setattr(async_db, "OPERATION_TIMEOUT", 0.08)
+    async def run():
+        store.data["1"] = {"last_at": 1}
+        save = asyncio.create_task(store.save())
+        ticks = 0
+        try:
+            while not save.done():
+                await asyncio.sleep(0.005)
+                ticks += 1
+            with pytest.raises(shared_state.SharedStateError, match="deadline"):
+                await save
+            assert entered.is_set() and ticks >= 5
+            assert owner.failed and owner._stop.is_set()
+        finally:
+            release.set()
+        assert await asyncio.to_thread(finished.wait, 1)
+    asyncio.run(run())
+    # The timed-out worker may not resume and commit from old memory.
+    reader = database[1]()
+    assert "quiz.json" not in reader.snapshot()
+
+
+def test_async_partial_transaction_timeout_rolls_back_all_state(database, monkeypatch):
+    import threading
+    import async_db
+    owner, connect, directory, _, _ = database
+    stats = Stats(directory / "stats.json")
+    stats.load()
+    before = deepcopy(stats.store.data)
+    release, finished = threading.Event(), threading.Event()
+    original_write, original_commit = owner._write_entries, owner._commit
+    def slow_write(entries):
+        original_write(entries)
+        release.wait(2)
+    def observed_commit(entries, operation):
+        try:
+            original_commit(entries, operation)
+        finally:
+            finished.set()
+    monkeypatch.setattr(owner, "_write_entries", slow_write)
+    monkeypatch.setattr(owner, "_commit", observed_commit)
+    monkeypatch.setattr(async_db, "OPERATION_TIMEOUT", 0.05)
+    async def run():
+        try:
+            with pytest.raises(shared_state.SharedStateError, match="deadline"):
+                await stats.record_game(1, [10], [20], event_key="must-not-commit")
+            assert stats.store.data == before
+        finally:
+            release.set()
+        assert await asyncio.to_thread(finished.wait, 1)
+    asyncio.run(run())
+    assert connect().snapshot()["stats.json"] == before
+
+
+def test_async_match_transactions_serialize_concurrent_results(database):
+    owner, _, directory, _, _ = database
+    stats = Stats(directory / "stats.json")
+    stats.load()
+    async def run():
+        return await asyncio.gather(*(stats.record_game(1, [10], [20], event_key=f"concurrent:{i}")
+                                      for i in range(12)))
+    assert sorted(asyncio.run(run())) == list(range(1, 13))
+    saved = owner.snapshot()["stats.json"]["1"]
+    assert len(saved["games"]) == 12 and saved["players"]["10"]["wins"] == 12
+
+
+def test_runtime_load_uses_preloaded_snapshot_without_network(database, monkeypatch):
+    owner, _, directory, _, _ = database
+    owner.runtime = True
+    owner._saved["quiz.json"] = {"1": {"score": 2}}
+    def forbidden(*args):
+        raise AssertionError("Runtime load used synchronous database I/O")
+    monkeypatch.setattr(owner, "load", forbidden)
+    store = JsonStore(directory / "quiz.json")
+    assert store.load() == {"1": {"score": 2}}
+    store.data["1"]["score"] = 3
+    assert owner._saved["quiz.json"]["1"]["score"] == 2
+
+
+def test_successful_startup_loads_all_cogs_without_live_discord(database, monkeypatch):
+    import threading
+    from unittest.mock import AsyncMock
+    from bot import ScrimBot, EXTENSIONS
+    owner, _, directory, dsn, namespace = database
+    owner.close()
+    configure_shared(None)
+    monkeypatch.setattr(config, "DATABASE_URL", dsn)
+    monkeypatch.setattr(config, "SHARED_STATE_KEY", namespace)
+    monkeypatch.setattr(config, "DATA_DIR", directory)
+    monkeypatch.setattr(config, "GUILD_ID", 0)
+    monkeypatch.setattr(config, "WATCHDOG_DISCONNECT_MINUTES", 0)
+    main_thread = threading.get_ident()
+    for name in ("_connect", "acquire", "_read_state", "_commit"):
+        original = getattr(shared_state.SharedState, name)
+        def off_loop(self, *args, _original=original, **kwargs):
+            assert threading.get_ident() != main_thread, "Synchronous DB work reached Discord's loop"
+            return _original(self, *args, **kwargs)
+        monkeypatch.setattr(shared_state.SharedState, name, off_loop)
+    bot = ScrimBot()
+    bot.tree.sync = AsyncMock(return_value=[])
+    async def run():
+        async with bot:
+            await bot.setup_hook()
+            assert set(bot.extensions) == set(EXTENSIONS)
+            assert bot.shared_state.runtime and not bot.shared_state.failed
+            assert not bot.sync.enabled
+            assert bot.tree.sync.await_count == 1
+    asyncio.run(run())
+
+
+def test_cancelled_queued_save_fences_later_mutations(database):
+    owner, _, directory, _, _ = database
+    store = JsonStore(directory / "quiz.json")
+    async def run():
+        async with owner.async_lock:
+            store.data["cancelled"] = True
+            save = asyncio.create_task(store.save())
+            await asyncio.sleep(0)
+            save.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await save
+        assert owner.failed
+        with pytest.raises(shared_state.SharedStateError):
+            await store.save()
+    asyncio.run(run())
+
+
+def test_async_close_is_bounded_behind_stuck_worker(database, monkeypatch):
+    import threading
+    import time
+    import async_db
+    owner, _, _, _, _ = database
+    held, release = threading.Event(), threading.Event()
+    def occupy():
+        with owner._mutex:
+            held.set()
+            release.wait(2)
+    thread = threading.Thread(target=occupy, daemon=True)
+    thread.start()
+    assert held.wait(1)
+    monkeypatch.setattr(async_db, "CLOSE_TIMEOUT", 0.03)
+    async def run():
+        started = time.monotonic()
+        try:
+            await owner.aclose()
+            assert time.monotonic() - started < 0.3
+            assert owner._stop.is_set()
+        finally:
+            release.set()
+    asyncio.run(run())
+    thread.join(1)
+
+
+def test_database_session_has_correlatable_nonsecret_owner_label(database):
+    owner, _, _, _, _ = database
+    assert owner.connection.execute("SHOW application_name").fetchone()[0] == f"oleg:{owner.instance_id}"

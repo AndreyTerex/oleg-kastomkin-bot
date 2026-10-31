@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from storage import JsonStore, atomic, shared_backend
+from storage import JsonStore, async_atomic as atomic, shared_backend
 
 # Сколько последних каток хранить подробно (для отмены и истории). Счётчики игроков не обрезаются.
 HISTORY_LIMIT = 500
@@ -147,7 +147,7 @@ class Stats:
         event_key: str | None = None,
     ) -> int:
         """Записывает катку и возвращает её номер — по нему катку можно отменить."""
-        with atomic(self.store):
+        async with atomic(self.store):
             guild = self._guild(guild_id)
             if event_key is not None and event_key in guild.get("result_keys", {}):
                 raise DuplicateGameError("Этот результат уже сохранён; повторная запись не выполнена.")
@@ -176,7 +176,7 @@ class Stats:
             return game_id
 
     async def undo_game(self, guild_id: int, game_id: int) -> bool:
-        with atomic(self.store):
+        async with atomic(self.store):
             guild = self._guild(guild_id)
             game = next((g for g in guild["games"] if g["id"] == game_id), None)
             if game is None:
@@ -202,7 +202,7 @@ class Stats:
 
     async def set_mvp(self, guild_id: int, game_id: int, user_ids: list[int]) -> bool:
         """MVP катки по итогам голосования. False — катку уже отменили."""
-        with atomic(self.store):
+        async with atomic(self.store):
             game = self.game(guild_id, game_id)
             if game is None or game.get("mvp"):
                 return False

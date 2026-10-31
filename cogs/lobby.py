@@ -24,7 +24,7 @@ import portraits
 from champions import POOL, ChampionsUnavailable
 from cogs.scrim import DraftView
 from stats import ELO_START, expected_score, DuplicateGameError
-from storage import JsonStore, transaction
+from storage import JsonStore, async_transaction as transaction
 from lobby_state import RosterError, change_roster, set_waiting, substitute
 from timeparse import parse_when
 from utils import BLUE_SIDE, NEUTRAL, RED_SIDE, format_players, lanes_badge, player_name, respond, shuffled
@@ -419,7 +419,7 @@ class LobbyView(discord.ui.View):
             return
 
         try:
-            with transaction(cog.store):
+            async with transaction(cog.store):
                 changed, overflow, promoted = cog.apply_move(interaction.guild, record, [interaction.user.id], status)
                 await cog.save()
         except RosterError as error:
@@ -806,7 +806,7 @@ async def report_result(
         await interaction.followup.send("Этот раунд уже обработан или сбор закрыт.", ephemeral=True)
         return
     try:
-        with transaction(cog.store, stats_cog.stats.store, stats_cog.wallets.store):
+        async with transaction(cog.store, stats_cog.stats.store, stats_cog.wallets.store):
             # Отметка раньше записи: второй быстрый клик уже увидит, что катка записана.
             record["last_report_at"] = time.time()
             record["round"] = round_no + 1
@@ -1128,7 +1128,7 @@ class UndoResultView(discord.ui.View):
         if stats_cog.stats.game(interaction.guild.id, self.game_id) is None:
             await interaction.edit_original_response(content="Результат уже отменён.", view=None)
             return
-        with transaction(self.cog.store, stats_cog.stats.store, stats_cog.wallets.store):
+        async with transaction(self.cog.store, stats_cog.stats.store, stats_cog.wallets.store):
             if stats_cog is not None:
                 await stats_cog.stats.undo_game(interaction.guild.id, self.game_id)
                 wallets = stats_cog.wallets
@@ -1412,7 +1412,7 @@ class SubstituteView(discord.ui.View):
             stores.append(history.store)
         refunded = 0
         try:
-            with transaction(*stores):
+            async with transaction(*stores):
                 side = substitute(record, old, newcomer.id)
                 if history is not None and history.replace(guild.id, self.lobby_message.id, old, newcomer.id):
                     await history.store.save()

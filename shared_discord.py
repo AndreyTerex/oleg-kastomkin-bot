@@ -23,7 +23,7 @@ class OwnedWebhookAdapter(AsyncWebhookAdapter):
 
     async def request(self, route, session, **kwargs):
         if route.method != "GET":
-            await asyncio.to_thread(self.backend.check_owner)
+            await self.backend.arun("check_owner")
         return await super().request(route, session, **kwargs)
 
 
@@ -33,7 +33,7 @@ def install_discord_guard(bot, backend):
 
     async def owned_request(route, **kwargs):
         if route.method != "GET":
-            await asyncio.to_thread(backend.check_owner)
+            await backend.arun("check_owner")
         return await original_request(route, **kwargs)
 
     bot.http.request = owned_request
@@ -49,13 +49,13 @@ def install_discord_guard(bot, backend):
                     if event == "MESSAGE_UPDATE":
                         revision = data.get("edited_timestamp")
                         if revision is None:
-                            await asyncio.to_thread(backend.check_owner)
+                            await backend.arun("check_owner")
                             original(data)  # embed-only update; no new user edit
                             return
                         key = f"{event}:{data['id']}:{revision}"
                     else:
                         key = f"{event}:{data['id']}"
-                    if await asyncio.to_thread(backend.claim_event, key):
+                    if await backend.arun("claim_event", key):
                         original(data)
                 except SharedStateError:
                     # The backend schedules shutdown on ownership/state loss. Do not

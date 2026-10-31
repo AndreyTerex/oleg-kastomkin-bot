@@ -11,6 +11,7 @@ import hashlib
 import json
 import threading
 import uuid
+import asyncio
 from contextlib import contextmanager
 from pathlib import Path
 from copy import deepcopy
@@ -41,6 +42,11 @@ class SharedState:
         self._ready = False
         self._revision = None
         self._dsn = dsn
+        self.instance_id = uuid.uuid4().hex[:12]
+        self._stop = threading.Event()
+        self._failure_notified = threading.Event()
+        self.async_lock = asyncio.Lock()
+        self.runtime = False
         self._mutex = threading.RLock()
         self._saved = {}
         self.key = int.from_bytes(hashlib.sha256(namespace.encode()).digest()[:8], "big", signed=True)
@@ -53,21 +59,64 @@ class SharedState:
                 if parameters.get("sslmode") not in ("require", "verify-ca", "verify-full"):
                     raise SharedStateError("Remote PostgreSQL requires TLS: sslmode=require or verify-full")
             self.connection = self._connect()
-        except psycopg.Error:
-            raise SharedStateError("Shared database connection failed; local fallback is disabled") from None
+        except psycopg.Error as error:
+            raise SharedStateError(f"Shared database connection failed ({type(error).__name__}, "
+                                   f"SQLSTATE {error.sqlstate or 'unavailable'}); local fallback is disabled") from None
 
     def _connect(self):
-        return psycopg.connect(
+        self._check_stopped()
+        connection = psycopg.connect(
             self._dsn, autocommit=True, connect_timeout=10,
             options="-c statement_timeout=10000 -c lock_timeout=5000",
-            keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+            keepalives_idle=10, keepalives_interval=2, keepalives_count=3, tcp_user_timeout=15000,
+            application_name=f"oleg:{self.instance_id}",
         )
+        if self._stop.is_set():
+            connection.close()
+            self._check_stopped()
+        return connection
+
+    def _check_stopped(self):
+        if self._stop.is_set():
+            raise SharedStateError("Database worker invalidated; restart and reload required")
+
+    def invalidate(self, notify=True):
+        """Lock-free: the event loop must not wait behind a stuck libpq/RLock call."""
+        self._stop.set()
+        self.failed = True
+        if notify and not self._failure_notified.is_set():
+            self._failure_notified.set()
+            if self.on_failure:
+                self.on_failure()
+
+    async def arun(self, method, *args, lock_held=False):
+        from async_db import bounded_call, OPERATION_TIMEOUT
+        async def execute():
+            self._check_stopped()
+            return await bounded_call(lambda: getattr(self, method)(*args), timeout=OPERATION_TIMEOUT,
+                                      invalidate=self.invalidate)
+        try:
+            if lock_held:
+                return await execute()
+            async with self.async_lock:
+                return await execute()
+        except asyncio.CancelledError:
+            # A caller may already have changed its dictionary before waiting for
+            # the serialization lock. Do not let later saves persist cancelled work.
+            self.invalidate()
+            raise
+
+    async def aclose(self):
+        from async_db import bounded_call, CLOSE_TIMEOUT
+        self.invalidate(notify=False)
+        try:
+            await bounded_call(self.close, timeout=CLOSE_TIMEOUT)
+        except SharedStateError:
+            pass  # process exit closes its sockets; never wait indefinitely for a worker
 
     def _abort(self, message):
-        self.failed = True
+        self.invalidate()
         self.connection.close()
-        if self.on_failure:
-            self.on_failure()
         raise SharedStateError(message) from None
 
     def _disconnected(self, error):
@@ -78,8 +127,10 @@ class SharedState:
                  error.sqlstate in ("57P01", "57P02", "57P03", "57P05")))
 
     def _read_state(self):
+        self._check_stopped()
         rows = dict(self.connection.execute(
             "SELECT name, data FROM oleg_state WHERE namespace=%s", (self.namespace,)).fetchall())
+        self._check_stopped()
         schema = rows.get("_schema", {})
         if schema.get("version") != 2 or type(schema.get("revision")) is not int:
             self._abort("Shared namespace requires schema 2; initialize from a verified export")
@@ -93,10 +144,13 @@ class SharedState:
         executing the mutation again. The same revision and old snapshot prove that
         it was not committed and that one retry is safe.
         """
+        self._check_stopped()
         self.connection.close()
         self.connection = self._connect()
         if self.owned:
+            self._check_stopped()
             acquired = self.connection.execute("SELECT pg_try_advisory_lock(%s)", (self.key,)).fetchone()[0]
+            self._check_stopped()
             if not acquired:
                 self._abort("Another bot owns the database after reconnect; this instance is stopping")
             current, schema = self._read_state()
@@ -132,8 +186,13 @@ class SharedState:
                 raise SharedStateError("Shared database session is unavailable; restart and reload required")
             try:
                 yield self.connection
-            except psycopg.Error:
-                self._abort("Shared database operation failed; outcome may require readback")
+            except psycopg.Error as error:
+                self._abort(f"Shared database operation failed ({type(error).__name__}, "
+                            f"SQLSTATE {error.sqlstate or 'unavailable'}); outcome may require readback")
+            except SharedStateError:
+                if self._stop.is_set():
+                    self.connection.close()
+                raise
 
     def ensure_schema(self):
         """Explicit administrative initialization, not an automatic production migration."""
@@ -147,6 +206,7 @@ class SharedState:
         with self._access() as conn:
             if not self.owned:
                 self.owned = conn.execute("SELECT pg_try_advisory_lock(%s)", (self.key,)).fetchone()[0]
+                self._check_stopped()
             return self.owned
 
     def require_initialized(self):
@@ -234,8 +294,10 @@ class SharedState:
                     return
 
     def _commit(self, entries, operation, event_key=None):
+        self._check_stopped()
         with self.connection.transaction():
             self._write_entries(entries)
+            self._check_stopped()
             row = self.connection.execute("""UPDATE oleg_state SET data = data ||
                 jsonb_build_object('version', 2, 'revision', %s, 'operation', %s::text) ||
                 CASE WHEN %s::text IS NULL THEN '{}'::jsonb ELSE
@@ -246,9 +308,11 @@ class SharedState:
                                      self.namespace, self._revision)).fetchone()
             if row is None:
                 raise SharedStateError("Shared revision changed; stale transaction rejected")
+            self._check_stopped()
 
     def _write_entries(self, entries):
         for name, data in entries.items():
+            self._check_stopped()
             self.connection.execute("""INSERT INTO oleg_state (namespace, name, data) VALUES (%s, %s, %s)
                 ON CONFLICT (namespace, name) DO UPDATE SET data=EXCLUDED.data""",
                          (self.namespace, name, Jsonb(data)))

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from pathlib import Path
@@ -36,6 +36,45 @@ def atomic(*stores):
     else:
         with transaction(*stores):
             yield
+
+
+@asynccontextmanager
+async def async_atomic(*stores):
+    active = _TRANSACTION.get()
+    if active is not None:
+        if any(store not in active for store in stores):
+            raise RuntimeError("Store is not part of the active transaction")
+        yield
+    else:
+        async with async_transaction(*stores):
+            yield
+
+
+@asynccontextmanager
+async def async_transaction(*stores):
+    """Serialize shared mutations and await one immutable database commit off-loop."""
+    shared = [_SHARED is not None and _SHARED.handles(store.path) for store in stores]
+    if not any(shared):
+        with transaction(*stores):
+            yield
+        return
+    if not all(shared) or _TRANSACTION.get() is not None:
+        raise RuntimeError("Invalid mixed or nested shared transaction")
+    backend = _SHARED
+    async with backend.async_lock:
+        backend._check_stopped()
+        snapshots = [deepcopy(store.data) for store in stores]
+        token = _TRANSACTION.set(stores)
+        try:
+            yield
+            entries = {store.path.name: deepcopy(store.data) for store in stores}
+            await backend.arun("save", entries, lock_held=True)
+        except BaseException:
+            for store, snapshot in zip(stores, snapshots):
+                _restore(store.data, snapshot)
+            raise
+        finally:
+            _TRANSACTION.reset(token)
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -133,7 +172,9 @@ class JsonStore:
 
     def load(self) -> dict:
         if _SHARED is not None and _SHARED.handles(self.path):
-            self.data = _SHARED.load(self.path.name)
+            # Runtime startup already fetched one complete snapshot off the event loop.
+            self.data = (deepcopy(_SHARED._saved.get(self.path.name, {})) if _SHARED.runtime else
+                         _SHARED.load(self.path.name))
             return self.data
         recover_transactions(self.path.parent)
         try:
@@ -151,6 +192,10 @@ class JsonStore:
         if active is not None:
             if self not in active:
                 raise RuntimeError("Хранилище не включено в транзакцию")
+            return
+        if _SHARED is not None and _SHARED.handles(self.path):
+            # Capture before yielding: a queued save must not read later mutations.
+            await _SHARED.arun("save", {self.path.name: deepcopy(self.data)})
             return
         # Небольшие локальные JSON пишутся без переключения задач: снимок не может
         # измениться во время записи, а транзакцию не обгонит фоновый поток save().

@@ -54,19 +54,25 @@ class ScrimBot(commands.Bot):
         self.shared_state = None
         if config.DATABASE_URL:
             from shared_state import SharedState, SharedStateError
+            from async_db import bounded_call
             loop = asyncio.get_running_loop()
             def failed():
                 log.critical("Общая база недоступна — закрываю бота без перехода на локальные данные")
                 loop.call_soon_threadsafe(lambda: asyncio.create_task(self.close()))
-            backend = SharedState(config.DATABASE_URL, config.SHARED_STATE_KEY, config.DATA_DIR,
-                                  datasync.SYNC_FILES, on_failure=failed)
+            backend = await bounded_call(
+                lambda: SharedState(config.DATABASE_URL, config.SHARED_STATE_KEY, config.DATA_DIR,
+                                    datasync.SYNC_FILES, on_failure=failed),
+                discard=lambda late: late.close(),
+            )
             try:
-                if not backend.acquire():
+                if not await backend.arun("acquire"):
                     raise SharedStateError("Другой экземпляр уже владеет общей базой. Сначала остановите его.")
-                backend.require_initialized()
+                await backend.arun("require_initialized")
+                log.info("Общая база: экземпляр oleg:%s получил право записи", backend.instance_id)
             except BaseException:
-                backend.close()
+                await backend.aclose()
                 raise
+            backend.runtime = True
             self.shared_state = backend
             configure_shared(backend)
             from shared_discord import install_discord_guard
@@ -111,7 +117,7 @@ class ScrimBot(commands.Bot):
         finally:
             backend = getattr(self, "shared_state", None)
             if backend is not None:
-                backend.close()
+                await backend.aclose()
                 # Keep the failed backend installed: late tasks must never fall back to local files.
 
     async def on_message(self, message: discord.Message) -> None:

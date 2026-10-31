@@ -113,14 +113,19 @@ def backups_dir(data_dir: str | os.PathLike[str]) -> Path:
     return Path(data_dir) / "backups"
 
 
-def make_backup(data_dir: str | os.PathLike[str], day: str, keep: int) -> Path | None:
+_SNAPSHOT_UNSET = object()
+
+
+def make_backup(data_dir: str | os.PathLike[str], day: str, keep: int,
+                shared_snapshot=_SNAPSHOT_UNSET) -> Path | None:
     """Копирует data/*.json в data/backups/<day>; удаляет старые копии сверх keep. None — если копия уже есть."""
     target = backups_dir(data_dir) / day
     if target.exists():
         return None
     files = sorted(Path(data_dir).glob("*.json"))
     backend = shared_backend(data_dir)
-    snapshot = backend.snapshot() if backend is not None else None
+    snapshot = ((backend.snapshot() if backend is not None else None)
+                if shared_snapshot is _SNAPSHOT_UNSET else shared_snapshot)
     tmp = target.with_name(f".{day}.tmp")
     shutil.rmtree(tmp, ignore_errors=True)
     tmp.mkdir(parents=True)
@@ -292,8 +297,12 @@ class Ops(commands.Cog):
 
     async def backup_if_due(self) -> None:
         day = datetime.now(config.TIMEZONE).strftime("%Y-%m-%d")
+        if (backups_dir(config.DATA_DIR) / day).exists():
+            return
         try:
-            made = await asyncio.to_thread(make_backup, config.DATA_DIR, day, config.BACKUP_KEEP)
+            backend = shared_backend(config.DATA_DIR)
+            snapshot = await backend.arun("snapshot") if backend is not None else None
+            made = await asyncio.to_thread(make_backup, config.DATA_DIR, day, config.BACKUP_KEEP, snapshot)
         except OSError:
             log.exception("Не удалось сделать резервную копию data/")
             return
@@ -370,9 +379,13 @@ class Ops(commands.Cog):
             await interaction.response.send_message("Команда только для администраторов сервера.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        payload, files = await asyncio.to_thread(
-            datasync.build_archive, config.DATA_DIR, [guild.id for guild in self.bot.guilds],
-        )
+        guild_ids = [guild.id for guild in self.bot.guilds]
+        backend = shared_backend(config.DATA_DIR)
+        if backend is not None:
+            snapshot = await backend.arun("snapshot")
+            payload, files = await asyncio.to_thread(datasync.archive_entries, snapshot, guild_ids)
+        else:
+            payload, files = await asyncio.to_thread(datasync.build_archive, config.DATA_DIR, guild_ids)
         name = f"oleg-data-{datetime.now(config.TIMEZONE).strftime('%Y-%m-%d_%H-%M')}.zip"
         instructions = (
             "Это резервная копия общей базы. Для восстановления остановите бота и используйте shared_admin restore. "
