@@ -246,22 +246,45 @@ def test_migration_rejects_newer_elo_before_writing():
         shared_admin.stats_summary(entries)
 
 
-def test_busy_database_stops_startup_before_extensions_or_discord_sync(database, monkeypatch):
+def test_busy_database_waits_in_standby_before_extensions_or_discord_sync(database, monkeypatch, caplog):
     from unittest.mock import AsyncMock
+    import bot as bot_module
     from bot import ScrimBot
-    _, _, directory, dsn, namespace = database
+    owner, _, directory, dsn, namespace = database
     monkeypatch.setattr(config, "DATABASE_URL", dsn)
     monkeypatch.setattr(config, "SHARED_STATE_KEY", namespace)
     monkeypatch.setattr(config, "DATA_DIR", directory)
+    monkeypatch.setattr(bot_module, "SHARED_RETRY_SECONDS", 0.05)
     bot = ScrimBot()
     bot.load_extension = AsyncMock()
     bot.tree.sync = AsyncMock()
     async def run():
-        with pytest.raises(shared_state.SharedStateError, match="Другой экземпляр"):
-            await bot.setup_hook()
+        startup = asyncio.create_task(bot.setup_hook())
+        await asyncio.sleep(0.5)
+        # Владелец жив — резервный экземпляр ждёт и ничего не грузит, а не падает.
+        assert not startup.done()
         bot.load_extension.assert_not_awaited()
         bot.tree.sync.assert_not_awaited()
+        owner.close()
+        await asyncio.wait_for(startup, 10)
+        bot.load_extension.assert_awaited()
+        await bot.shared_state.aclose()
     asyncio.run(run())
+    assert "владеет другой экземпляр" in caplog.text and "oleg:" in caplog.text
+
+
+def test_abandoned_session_releases_lock_after_idle_timeout(database, monkeypatch):
+    _, connect, directory, _, _ = database
+    monkeypatch.setattr(shared_state, "IDLE_SESSION_TIMEOUT_MS", 500)
+    database[0].close()  # освобождаем замок владельца фикстуры
+    zombie = connect(directory)
+    assert zombie.acquire()
+    # Клиент «пропал» (сон ноутбука, обрыв сети): соединение висит, запросов нет.
+    assert not connect(directory / "other-host").acquire()
+    import time
+    time.sleep(1.5)
+    # Резервный бот пробует каждый раз новым подключением (bot.acquire_shared) — и забирает замок.
+    assert connect(directory / "other-host").acquire()
 
 
 def disconnect_session(owner, dsn):
@@ -687,3 +710,27 @@ def test_async_close_is_bounded_behind_stuck_worker(database, monkeypatch):
 def test_database_session_has_correlatable_nonsecret_owner_label(database):
     owner, _, _, _, _ = database
     assert owner.connection.execute("SHOW application_name").fetchone()[0] == f"oleg:{owner.instance_id}"
+
+
+def test_unreachable_database_retries_instead_of_crashing(database, monkeypatch, caplog):
+    import bot as bot_module
+    from bot import ScrimBot
+    from async_db import bounded_call
+    owner, _, directory, dsn, namespace = database
+    owner.close()
+    monkeypatch.setattr(config, "DATABASE_URL", "postgresql://postgres@127.0.0.1:1/postgres")
+    monkeypatch.setattr(config, "SHARED_STATE_KEY", namespace)
+    monkeypatch.setattr(config, "DATA_DIR", directory)
+    monkeypatch.setattr(bot_module, "SHARED_RETRY_SECONDS", 0.05)
+    bot = ScrimBot()
+    async def run():
+        waiting = asyncio.create_task(
+            bot.acquire_shared(shared_state.SharedState, shared_state.SharedStateError, bounded_call))
+        await asyncio.sleep(0.5)
+        assert not waiting.done()
+        config.DATABASE_URL = dsn  # сеть вернулась
+        backend = await asyncio.wait_for(waiting, 10)
+        assert backend.owned
+        await backend.aclose()
+    asyncio.run(run())
+    assert "База недоступна" in caplog.text
