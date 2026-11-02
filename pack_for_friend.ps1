@@ -10,9 +10,11 @@ $zip = Join-Path $root 'oleg-bot-for-friend.zip'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Path $target | Out-Null
 
+# Every root-level module (*.py) is copied automatically so new modules never go missing from the pack.
+# tests/ is a subdirectory and is not picked up.
+Get-ChildItem $root -Filter '*.py' -File | Copy-Item -Destination $target
+
 $files = @(
-    'bot.py', 'config.py', 'utils.py', 'storage.py', 'champions.py', 'modes.py', 'llm.py', 'memory.py',
-    'persona.py', 'role_requests.py', 'lobby_requests.py', 'llm_actions.py', 'vpn.py', 'vpn_links.py', 'stats.py', 'timeparse.py', 'portraits.py',
     'requirements.txt', 'Dockerfile', 'docker-compose.yml',
     '.dockerignore', '.gitignore', '.env', '.env.example', 'README.md', 'HANDOVER.md', 'update.bat'
 )
