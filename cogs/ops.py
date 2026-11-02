@@ -181,6 +181,7 @@ class Ops(commands.Cog):
         self.bot = bot
         self.errors = ErrorBuffer()
         self.vpn_outage = Outage(VPN_DOWN_ALERT_AFTER)
+        self.offline_reported = False
         self.llm_outage = Outage(LLM_DOWN_ALERT_AFTER)
         self.last_error_alert = 0.0
         self.beat = time.monotonic()
@@ -262,6 +263,12 @@ class Ops(commands.Cog):
             status = VPN_CLIENT.status()
             messages.append(f"✅ VPN снова работает: {status['server']} ({status['country'] or '—'}).")
 
+        offline = getattr(self.bot, "offline_since", None)
+        if offline and not self.offline_reported:
+            self.offline_reported = True
+            messages.append(f"🛑 **Общая база недоступна** с <t:{int(offline)}:f> — Олег работает на локальной "
+                            "копии данных. Когда база вернётся, он перенесёт сделанное и перезапустится на ней.")
+
         client = self.chat_client()
         if client is not None and client.enabled:
             change = self.llm_outage.update(client.all_blocked(), now)
@@ -317,10 +324,18 @@ class Ops(commands.Cog):
         embed.add_field(name="Работает", value=f"{uptime_text(time.time() - STARTED_AT)} (с <t:{int(STARTED_AT)}:f>)")
         embed.add_field(name="Discord", value=f"{latency:.0f} мс" if latency is not None else "—")
         backend = shared_backend(config.DATA_DIR)
+        offline = getattr(self.bot, "offline_since", None)
         if backend is not None:
             embed.add_field(name="Данные", value="Общая PostgreSQL-база · " +
-                            ("связь потеряна, запись остановлена" if backend.failed else "этот экземпляр владеет записью"),
+                            ("связь потеряна, запись остановлена" if backend.failed else "этот экземпляр владеет записью")
+                            + (" · через VPN бота" if getattr(backend, "via_tunnel", False) else " · напрямую"),
                             inline=False)
+        elif offline:
+            embed.add_field(name="Данные", value=(
+                f"⚠️ Общая база недоступна с <t:{int(offline)}:f> — работаю на локальной копии. "
+                f"Проверяю базу раз в {config.DATABASE_RETRY_MINUTES} мин; вернётся — перенесу сделанное и перезапущусь."
+            ), inline=False)
+            embed.color = WARNING
 
         client = self.chat_client()
         if client is None or not client.enabled:
@@ -412,6 +427,12 @@ class Ops(commands.Cog):
             await interaction.response.send_message(
                 "Общая база включена. Для восстановления остановите бота и используйте shared_admin restore "
                 "с проверкой снимка и резервной копией.", ephemeral=True,
+            )
+            return
+        if getattr(self.bot, "offline_since", None):
+            await interaction.response.send_message(
+                "Общая база сейчас недоступна, бот работает на локальной копии. Импорт заменил бы её, "
+                "а потом и базу — дождитесь, пока база вернётся.", ephemeral=True,
             )
             return
         if archive.size > datasync.MAX_ARCHIVE_BYTES:

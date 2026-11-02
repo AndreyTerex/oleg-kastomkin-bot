@@ -1,14 +1,20 @@
-"""Optional PostgreSQL JSON state; one session owns the bot, no offline fallback.
+"""Optional PostgreSQL JSON state; one session owns the bot.
 
 Use a direct/session connection, never a transaction pooler. The same connection
 holds the advisory lock and performs every write; a lost session cannot reconnect
 and overwrite a newer owner's state. Reconnection rechecks ownership, revision
 and the complete durable snapshot before retrying. Local-only caches stay local.
+
+Запасной режим: подключение идёт через туннель VPN бота, не вышло — напрямую. Каждая подтверждённая
+запись зеркалится в data/*.json (local_mirror.py): если база недоступна при запуске, бот работает
+на этой копии, а когда база вернётся, переносит в неё сделанное без неё (только если базу за это
+время никто не менял).
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 import time
 import uuid
@@ -20,6 +26,9 @@ from copy import deepcopy
 import psycopg
 from psycopg.types.json import Jsonb
 
+import local_mirror
+
+log = logging.getLogger("scrimbot.db")
 
 # Через столько миллисекунд простоя сервер закрывает сессию и отпускает замок владельца. Закрывает сервер,
 # а не клиент: у пропавшего клиента (сон ноутбука, обрыв сети, убитый процесс) некому разорвать соединение.
@@ -75,8 +84,12 @@ class SharedState:
         self._revision = None
         self._dsn = dsn
         # Через туннель VPN бота: TCP идёт на 127.0.0.1:tunnel_port, а имя хоста из DSN остаётся для SNI
-        # и проверки сертификата (libpq: host + hostaddr).
+        # и проверки сертификата (libpq: host + hostaddr). Туннель не отвечает — подключаемся напрямую.
         self._tunnel_port = tunnel_port
+        self.via_tunnel = False
+        # Зеркало в data/*.json: включает бот после сверки при запуске (reconcile_offline).
+        self.mirror = False
+        self._mirror_digests: dict[str, str] = {}
         self.instance_id = uuid.uuid4().hex[:12]
         self._stop = threading.Event()
         self._failure_notified = threading.Event()
@@ -100,15 +113,29 @@ class SharedState:
 
     def _connect(self):
         """Новое соединение. Несколько попыток: VPN бота при смене сервера перезапускает Xray, и туннель
-        к базе на пару секунд закрыт — это не повод останавливать бота."""
-        for attempt in range(CONNECT_ATTEMPTS):
+        к базе на пару секунд закрыт — это не повод останавливать бота. Туннель не отвечает (VPN не
+        подключился) — следующая попытка идёт напрямую, обычным интернетом."""
+        routes = self._routes()
+        for attempt, route in enumerate(routes):
             self._check_stopped()
             try:
-                return self._connect_once()
+                connection = self._connect_once(route)
             except psycopg.OperationalError:
-                if attempt == CONNECT_ATTEMPTS - 1:
+                if attempt == len(routes) - 1:
                     raise
                 time.sleep(CONNECT_RETRY_DELAY)
+                continue
+            if self._tunnel_port and not route and (self.via_tunnel or attempt):
+                log.warning("Общая база: туннель VPN бота не отвечает — подключился напрямую")
+            self.via_tunnel = bool(route)
+            return connection
+
+    def _routes(self) -> list[dict]:
+        """Параметры каждой попытки: туннель, напрямую, снова туннель. Без туннеля — все напрямую."""
+        tunnel = self._tunnel_params()
+        if not tunnel:
+            return [{}] * CONNECT_ATTEMPTS
+        return ([tunnel, {}] * CONNECT_ATTEMPTS)[:CONNECT_ATTEMPTS]
 
     def _tunnel_params(self) -> dict:
         """Через туннель VPN бота трафик проходит через сервер из чужой подписки. sslmode=require только
@@ -121,8 +148,8 @@ class SharedState:
             params["sslrootcert"] = ca_bundle()
         return params
 
-    def _connect_once(self):
-        tunnel = self._tunnel_params()
+    def _connect_once(self, tunnel: dict | None = None):
+        tunnel = tunnel or {}
         connection = psycopg.connect(
             self._dsn, autocommit=True, connect_timeout=CONNECT_TIMEOUT, **tunnel,
             # idle_session_timeout: сессия, чей клиент пропал без закрытия соединения (сон ноутбука, обрыв
@@ -389,6 +416,7 @@ class SharedState:
                     if not self._disconnected(error):
                         raise
                     if self._reconnect((operation, expected)):
+                        self._mirror(entries)
                         return  # exact intended state already committed, no second mutation
                     if attempt:
                         self._abort("Database disconnected twice; operation was not committed, retry after restart")
@@ -397,6 +425,7 @@ class SharedState:
                 else:
                     self._saved = expected
                     self._revision += 1
+                    self._mirror(entries)
                     return
 
     def _commit(self, entries, operation, event_key=None):
@@ -423,6 +452,34 @@ class SharedState:
                 ON CONFLICT (namespace, name) DO UPDATE SET data=EXCLUDED.data""",
                          (self.namespace, name, Jsonb(data)))
 
+    # --- запасная копия в data/*.json -------------------------------------------------
+
+    def _mirror(self, entries: dict):
+        """Записанное в базу — ещё и в локальные файлы. Ошибка диска не мешает работе с базой."""
+        if not self.mirror or not entries:
+            return
+        try:
+            self._mirror_digests = local_mirror.write(
+                self.directory, self.namespace, self.names,
+                {name: self._saved.get(name, {}) for name in entries}, self._mirror_digests)
+        except (OSError, ValueError, TypeError) as error:
+            log.warning("Не удалось обновить локальную копию базы (%s)", type(error).__name__)
+
+    def reconcile_offline(self) -> str | None:
+        """При запуске: перенести в базу то, что бот сделал без неё, затем записать полную локальную копию
+        и включить зеркалирование. Возвращает сообщение для лога (или None — делать было нечего)."""
+        with self._mutex:
+            current = self.snapshot()
+            message = local_mirror.reconcile(self.directory, self.namespace, self.names, current, self.save)
+            try:
+                self._mirror_digests = local_mirror.write(
+                    self.directory, self.namespace, self.names,
+                    {name: self._saved.get(name, {}) for name in self.names}, {})
+            except (OSError, ValueError, TypeError) as error:
+                log.warning("Не удалось записать локальную копию базы (%s)", type(error).__name__)
+            self.mirror = True
+            return message
+
     def initialize(self, entries: dict):
         if not self.owned:
             raise SharedStateError("Stop the active bot before initialization")
@@ -444,3 +501,24 @@ class SharedState:
             self.connection.close()
             self.owned = False
             self._closed = True
+
+
+def database_ready(dsn: str, namespace: str, directory, names, tunnel_port: int | None = None) -> bool:
+    """Можно ли вернуться на общую базу: она отвечает и либо свободна и готова, либо её держит другой
+    экземпляр бота (тогда работать должен он). Соединение сразу закрывается — замок не удерживается."""
+    try:
+        backend = SharedState(dsn, namespace, directory, names, tunnel_port=tunnel_port)
+    except SharedStateError:
+        return False
+    try:
+        if not backend.acquire():
+            return True
+        backend.require_initialized()
+        return True
+    except (SharedStateError, psycopg.Error):
+        return False
+    finally:
+        try:
+            backend.close()
+        except psycopg.Error:
+            pass

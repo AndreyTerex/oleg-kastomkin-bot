@@ -736,7 +736,7 @@ def test_unreachable_database_retries_instead_of_crashing(database, monkeypatch,
     assert "База недоступна" in caplog.text
 
 
-def test_hung_connection_attempt_stops_standby_instead_of_piling_threads(monkeypatch):
+def test_hung_connection_attempt_goes_offline_instead_of_piling_threads(monkeypatch):
     import threading
     import async_db
     import bot as bot_module
@@ -753,8 +753,8 @@ def test_hung_connection_attempt_stops_standby_instead_of_piling_threads(monkeyp
         return await async_db.bounded_call(action, timeout=0.2, **kwargs)
     bot = ScrimBot()
     async def run():
-        with pytest.raises(shared_state.SharedStateDeadline):
-            await bot.acquire_shared(hanging, shared_state.SharedStateError, short_call)
+        # Зависшее подключение не роняет бота (Docker перезапускал бы его по кругу) — он работает без базы.
+        assert await bot.acquire_shared(hanging, shared_state.SharedStateError, short_call) is None
     try:
         asyncio.run(run())
     finally:
