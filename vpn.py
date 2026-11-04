@@ -76,6 +76,11 @@ BROKEN_PAUSE = 180
 # полная проверка удваивает паузу (полчаса, час, два…, но не реже VPN_FULL_CHECK_HOURS): бот не долбит
 # сотни мёртвых серверов без конца, а спокойно работает напрямую.
 DIRECT_RETRY_HOURS = 0.5
+# VPN этого компьютера: локальный прокси VPN-клиента (v2rayN, Hiddify, Clash, NekoRay…), из Docker — по этому имени.
+PC_PROXY_HOST = "host.docker.internal"
+PC_PROXY_PORTS = ((10808, "socks"), (10809, "http"), (2080, "socks"), (12334, "http"), (7890, "http"),
+                  (7891, "socks"), (1080, "socks"))
+PC_PREFIX = "pc-"
 FRAGMENT_TAG = "fragment"
 PROXY_TAG = "proxy"
 DB_TAG = "db-in"
@@ -165,6 +170,47 @@ def choose(
             return best
         return kept
     return best
+
+
+# --- VPN этого компьютера ------------------------------------------------------------
+
+
+def pc_proxy_candidates() -> list[tuple[str, str, int]]:
+    """Где искать прокси VPN-клиента компьютера: (socks|http, адрес, порт)."""
+    value = config.PC_PROXY
+    if value.lower() == "auto":
+        return [(scheme, PC_PROXY_HOST, port) for port, scheme in PC_PROXY_PORTS]
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(value if "://" in value else f"socks5://{value}")
+        port = parts.port
+    except ValueError:
+        return []
+    scheme = "http" if parts.scheme in ("http", "https") else "socks"
+    return [(scheme, parts.hostname, port)] if parts.hostname and port else []
+
+
+def pc_server(scheme: str, host: str, port: int) -> Server:
+    """Прокси VPN-клиента компьютера как ещё один «сервер»: дальше его проверяют и выбирают как любой другой."""
+    outbound = {"protocol": scheme, "settings": {"servers": [{"address": host, "port": port}]}}
+    return Server(f"💻 VPN этого компьютера ({scheme} :{port})", scheme, f"{PC_PREFIX}{scheme}-{host}-{port}",
+                  outbound, host, port)
+
+
+async def _port_open(host: str, port: int, timeout: float = 1.5) -> bool:
+    try:
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+    except (OSError, TimeoutError):
+        return False
+    writer.close()
+    return True
+
+
+async def find_pc_proxies() -> list[Server]:
+    """Открытые порты прокси VPN-клиента компьютера (проверка, что он реально выводит в интернет, — потом)."""
+    candidates = pc_proxy_candidates()
+    opened = await asyncio.gather(*(_port_open(host, port) for _scheme, host, port in candidates))
+    return [pc_server(*candidate) for candidate, ok in zip(candidates, opened) if ok]
 
 
 # --- состояние в data/vpn.json ------------------------------------------------------
@@ -390,11 +436,17 @@ class VPN:
         self.db_tunnel_rejected = False
         # Сколько полных проверок подряд не нашли ни одного рабочего сервера (для паузы в режиме «напрямую»).
         self.direct_failures = 0
+        # Найденные прокси VPN-клиента компьютера (отпечатки) — чтобы писать в лог только перемены.
+        self.pc_found: tuple[str, ...] | None = None
 
     # --- настройки
 
     @property
     def enabled(self) -> bool:
+        return bool(config.VPN_SUBSCRIPTION or config.VPN_URL or config.PC_PROXY_ENABLED)
+
+    @property
+    def subscription(self) -> bool:
         return bool(config.VPN_SUBSCRIPTION or config.VPN_URL)
 
     @property
@@ -407,10 +459,13 @@ class VPN:
         if not self.enabled or self.started:
             return
         if shutil.which(config.XRAY_BIN) is None:
-            log.warning(
-                "VPN указан в .env, но Xray не найден — он есть только в Docker-образе бота. "
-                "Нейросети из LLM_PROXY_FOR будут недоступны из России."
-            )
+            if self.subscription:
+                log.warning(
+                    "VPN указан в .env, но Xray не найден — он есть только в Docker-образе бота. "
+                    "Нейросети из LLM_PROXY_FOR будут недоступны из России."
+                )
+            else:
+                log.info("Xray не найден (запуск не в Docker) — VPN компьютера не ищу, хожу обычным интернетом")
             return
         self.state.load()
         self.started = True
@@ -455,7 +510,12 @@ class VPN:
     # --- подписка
 
     async def refresh_servers(self, force: bool = False) -> None:
-        if not force and time.time() - self.fetched_at < SUBSCRIPTION_REFRESH and self.servers:
+        # VPN этого компьютера ищем каждый раз (его включают и выключают), подписку качаем раз в 6 часов.
+        await self.refresh_pc_proxies()
+        if not self.subscription:
+            return
+        subscribed = {fp: server for fp, server in self.servers.items() if not fp.startswith(PC_PREFIX)}
+        if not force and time.time() - self.fetched_at < SUBSCRIPTION_REFRESH and subscribed:
             return
         texts = []
         if config.VPN_URL:
@@ -479,17 +539,41 @@ class VPN:
             servers += found
             for reason, count in reasons.items():
                 skipped[reason] = skipped.get(reason, 0) + count
-        if not servers and self.servers:
+        if not servers and subscribed:
             log.warning("VPN: подписка пустая или не скачалась — остаюсь на прежнем списке серверов")
             return
         kept, dropped = usable(servers, config.VPN_FILTER)
         for reason, count in dropped.items():
             skipped[reason] = skipped.get(reason, 0) + count
-        self.servers = {server.fingerprint: server for server in kept}
+        pc = {fp: server for fp, server in self.servers.items() if fp.startswith(PC_PREFIX)}
+        self.servers = {server.fingerprint: server for server in kept} | pc
         self.fetched_at = time.time()
         details = ", ".join(f"{reason}: {count}" for reason, count in skipped.items())
         log.info("VPN: в подписке серверов %d, к проверке %d%s", len(servers), len(kept),
                  f" (пропущено — {details})" if details else "")
+
+    async def refresh_pc_proxies(self) -> bool:
+        """Найти прокси VPN-клиента компьютера. True — набор найденных изменился."""
+        if not config.PC_PROXY_ENABLED:
+            return False
+        found = await find_pc_proxies()
+        fingerprints = tuple(server.fingerprint for server in found)
+        self.servers = {fp: server for fp, server in self.servers.items() if not fp.startswith(PC_PREFIX)}
+        self.servers.update({server.fingerprint: server for server in found})
+        if fingerprints == self.pc_found:
+            return False
+        self.pc_found = fingerprints
+        if found:
+            log.info("VPN: найден VPN этого компьютера — %s; проверяю, выводит ли он за границу",
+                     ", ".join(server.name for server in found))
+        else:
+            log.info("VPN: VPN-клиента на этом компьютере не видно (порты %s) — %s",
+                     ", ".join(str(port) for _scheme, _host, port in pc_proxy_candidates()),
+                     "хожу по подписке" if self.subscription else "хожу обычным интернетом компьютера")
+        for server in found:
+            # Только что включённый VPN компьютера не ждёт, пока истечёт чёрный список после прошлой неудачи.
+            self.state.data.get("blacklist", {}).pop(server.fingerprint, None)
+        return True
 
     # --- проверка серверов
 
@@ -823,7 +907,10 @@ class VPN:
                 if not (self.current and await self.activate(self.current)):
                     await self.activate_direct()
             if not full and self.current is None and self.ready:
-                return self.status()  # напрямую: все серверы перебираем только по расписанию (_full_check_due)
+                # Напрямую: все серверы перебираем только по расписанию (_full_check_due). Но если на компьютере
+                # включили VPN — проверяем его сразу (это пара прокси, а не сотни серверов).
+                if not (await self.refresh_pc_proxies() and self.pc_found):
+                    return self.status()
             # Сначала — один запрос через текущий сервер: жив — полную проверку (если пора) делаем спокойно,
             # мёртв — быстро ищем замену среди выборки, а не ждём проверки всех сотен серверов.
             suspect = self.current is not None and self.current.fingerprint == self.suspect

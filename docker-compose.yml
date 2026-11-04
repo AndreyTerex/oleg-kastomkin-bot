@@ -10,6 +10,10 @@ services:
     volumes:
       # Сборы, статистика и память Олега переживают обновления образа.
       - ./data:/app/data
+    extra_hosts:
+      # Через это имя бот находит VPN-клиент самого компьютера (v2rayN, Hiddify, Clash…), см. PC_PROXY.
+      # В Docker Desktop (Windows/macOS) оно есть и так, строка нужна для Linux.
+      - "host.docker.internal:host-gateway"
     labels:
       # Watchtower обновляет только помеченные контейнеры.
       com.centurylinklabs.watchtower.enable: "true"

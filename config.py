@@ -109,6 +109,13 @@ GEMINI_SCARCE: list[str] = [
 # Бот сам запускает Xray как локальный прокси и ходит через него к нейросетям (LLM_PROXY_FOR) и к Discord.
 VPN_SUBSCRIPTION: str = os.getenv("VPN_SUBSCRIPTION", "").strip()
 VPN_URL: str = os.getenv("VPN_URL", "").strip()
+# VPN этого компьютера (v2rayN, Hiddify, Clash, NekoRay…): auto — если VPN_SUBSCRIPTION и VPN_URL пусты, бот сам ищет
+# локальный прокси VPN-клиента компьютера (host.docker.internal, порты 10808, 10809, 2080, 12334, 7890, 7891, 1080)
+# и ходит через него к базе и нейросетям; off — не искать; или явно: socks5://адрес:порт / http://адрес:порт.
+PC_PROXY: str = os.getenv("PC_PROXY", "auto").strip() or "auto"
+PC_PROXY_ENABLED: bool = PC_PROXY.lower() not in ("off", "0", "no", "false", "нет") and (
+    PC_PROXY.lower() != "auto" or not (VPN_SUBSCRIPTION or VPN_URL)
+)
 # Необязательно: брать только серверы, в названии которых есть это (регулярное выражение), например «DE|NL|Finland».
 VPN_FILTER: str = os.getenv("VPN_FILTER", "").strip()
 VPN_PORT: int = _env_int("VPN_PORT", 10809)
@@ -144,7 +151,7 @@ XRAY_BIN: str = os.getenv("XRAY_BIN", "xray").strip() or "xray"
 # Google не пускает к Gemini из России («User location is not supported»). Если есть HTTP-прокси за рубежом,
 # укажите его: http://логин:пароль@адрес:порт. С VPN_SUBSCRIPTION / VPN_URL прокси подставляется сам.
 # Через прокси ходят провайдеры из LLM_PROXY_FOR (по умолчанию all — все нейросети).
-VPN_PROXY_URL: str = f"http://127.0.0.1:{VPN_PORT}" if (VPN_SUBSCRIPTION or VPN_URL) else ""
+VPN_PROXY_URL: str = f"http://127.0.0.1:{VPN_PORT}" if (VPN_SUBSCRIPTION or VPN_URL or PC_PROXY_ENABLED) else ""
 LLM_PROXY: str = os.getenv("LLM_PROXY", "").strip() or VPN_PROXY_URL
 # Сколько раз за запрос переспрашивать перегруженную модель (HTTP 503) перед переходом к следующей.
 LLM_REPLY_TIMEOUT: int = max(5, _env_int("LLM_REPLY_TIMEOUT", 35))
