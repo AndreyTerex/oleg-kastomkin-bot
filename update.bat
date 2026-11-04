@@ -43,8 +43,23 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem Auto-update: Watchtower must be running next to the bot, otherwise new versions never arrive.
+docker compose ps --status running --services | findstr /x "watchtower" >nul
+if errorlevel 1 (
+    echo Watchtower ^(auto-update^) did not start - trying once more...
+    docker compose up -d watchtower
+    docker compose ps --status running --services | findstr /x "watchtower" >nul
+    if errorlevel 1 (
+        echo WARNING: Watchtower is not running, the bot will NOT update itself.
+        echo See: docker compose logs watchtower
+    )
+)
+
 echo.
-echo Done. From now on the bot updates itself (Watchtower checks GitHub every 5 minutes).
+docker compose ps
+echo.
+echo Done. Both lol-scrim-bot and oleg-watchtower above should be "running" / "Up".
+echo From now on the bot updates itself (Watchtower checks GitHub every 5 minutes).
 echo Bot logs (close the window to exit, the bot keeps running):
 echo.
 docker compose logs -f --tail 20 bot
