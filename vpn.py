@@ -72,7 +72,9 @@ FAILURE_DEBOUNCE = 60
 # Прокси не довёз запрос — столько секунд считаем VPN сломанным (нейросети идут напрямую),
 # пока проверка не подтвердит рабочий сервер.
 BROKEN_PAUSE = 180
-# Без рабочего сервера (режим «напрямую») все серверы перепроверяются так часто.
+# Без рабочего сервера (режим «напрямую») все серверы перепроверяются так часто. Каждая следующая неудачная
+# полная проверка удваивает паузу (полчаса, час, два…, но не реже VPN_FULL_CHECK_HOURS): бот не долбит
+# сотни мёртвых серверов без конца, а спокойно работает напрямую.
 DIRECT_RETRY_HOURS = 0.5
 FRAGMENT_TAG = "fragment"
 PROXY_TAG = "proxy"
@@ -386,6 +388,8 @@ class VPN:
         self.suspect: str | None = None
         self.started = False
         self.db_tunnel_rejected = False
+        # Сколько полных проверок подряд не нашли ни одного рабочего сервера (для паузы в режиме «напрямую»).
+        self.direct_failures = 0
 
     # --- настройки
 
@@ -419,14 +423,28 @@ class VPN:
                 saved.get("country"), bool(saved.get("fragment")),
             )
             if await self.activate(result):
-                log.info(
-                    "VPN: поднят сохранённый сервер «%s» (%s, %s мс), проверяю остальные в фоне",
-                    result.name, result.country or "??", result.latency_ms or "?",
-                )
+                # Один запрос через него: мёртвый сервер не должен на минуты отрезать базу, Discord и нейросети.
+                if await self._saved_alive():
+                    log.info(
+                        "VPN: поднят сохранённый сервер «%s» (%s, %s мс), проверяю остальные в фоне",
+                        result.name, result.country or "??", result.latency_ms or "?",
+                    )
+                else:
+                    log.warning("VPN: сохранённый сервер «%s» не отвечает — пока хожу напрямую, ищу другой в фоне",
+                                result.name)
+                    self.current = None
+                    await self.activate_direct(quiet=True, force=True)
         if self.current is None:
             # Порт нужен сразу (через него ходят Discord и нейросети), сервер подберётся в фоне.
             await self.activate_direct(quiet=True)
         self.task = asyncio.create_task(self._loop(first_delay=90 if self.current else 0))
+
+    async def _saved_alive(self) -> bool:
+        try:
+            return await self._current_alive()
+        except Exception:  # проверка не должна мешать запуску бота
+            log.debug("VPN: проверка сохранённого сервера не удалась", exc_info=True)
+            return False
 
     async def close(self) -> None:
         if self.task is not None:
@@ -579,9 +597,10 @@ class VPN:
         await self.state.save()
         return True
 
-    async def activate_direct(self, quiet: bool = False) -> None:
-        """Рабочих серверов нет: порт остаётся, но трафик идёт напрямую, пока не найдётся сервер."""
-        if self.current is None and self.ready:
+    async def activate_direct(self, quiet: bool = False, force: bool = False) -> None:
+        """Рабочих серверов нет: порт остаётся, но трафик идёт напрямую, пока не найдётся сервер.
+        force — Xray уже запущен на сервере, который не отвечает: переключить его на прямой выход."""
+        if self.current is None and self.ready and not force:
             return
         if not quiet:
             log.warning("VPN: рабочих серверов нет — пока хожу напрямую, ищу сервер дальше")
@@ -713,8 +732,14 @@ class VPN:
 
     def _full_check_due(self) -> bool:
         last = (self.state.data.get("last_check") or {}).get("at") or 0
-        hours = config.VPN_FULL_CHECK_HOURS if self.current else min(config.VPN_FULL_CHECK_HOURS, DIRECT_RETRY_HOURS)
-        return time.time() - last >= hours * 3600
+        return time.time() - last >= self.full_check_hours() * 3600
+
+    def full_check_hours(self) -> float:
+        """Пауза между полными проверками. Без рабочего сервера — чаще, но с каждой неудачей всё реже."""
+        if self.current:
+            return config.VPN_FULL_CHECK_HOURS
+        backoff = DIRECT_RETRY_HOURS * 2 ** max(0, self.direct_failures - 1)
+        return min(config.VPN_FULL_CHECK_HOURS, backoff)
 
     async def _current_alive(self) -> bool:
         """Лёгкая проверка: один запрос через уже запущенный Xray, без перебора всех серверов."""
@@ -839,10 +864,13 @@ class VPN:
                     self.current = results[current]  # выход неудачный, но связь есть — лучше, чем ничего
                 else:
                     await self.activate_direct(quiet=True)
+                if not quick and self.current is None:
+                    self.direct_failures += 1
                 log.warning(
                     "VPN: проверено %d, рабочих 0%s — %s",
                     len(results), f" (выход в исключённых странах: {wrong_country})" if wrong_country else "",
-                    f"остаюсь на «{self.current.name}»" if self.current else "пока хожу напрямую",
+                    f"остаюсь на «{self.current.name}»" if self.current else
+                    f"работаю напрямую, следующая попытка через {self.full_check_hours() * 60:.0f} мин",
                 )
             elif choice.fingerprint != current or self.process is None:
                 previous = self.current.name if self.current else None
@@ -860,6 +888,8 @@ class VPN:
                     "VPN: проверено %d, рабочих %d, остаюсь на «%s» (%s, %.0f мс)",
                     len(results), working, choice.name, choice.country, choice.latency_ms or 0,
                 )
+            if self.current is not None:
+                self.direct_failures = 0
             self.last_summary = {"at": now, "checked": len(results), "working": working}
             if not quick:
                 # Время полной проверки — от него считается следующая по расписанию; быструю не учитываем.

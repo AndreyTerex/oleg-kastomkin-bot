@@ -1,25 +1,36 @@
-"""Optional PostgreSQL JSON state; one session owns the bot, no offline fallback.
+"""Optional PostgreSQL JSON state; one session owns the bot.
 
 Use a direct/session connection, never a transaction pooler. The same connection
 holds the advisory lock and performs every write; a lost session cannot reconnect
 and overwrite a newer owner's state. Reconnection rechecks ownership, revision
 and the complete durable snapshot before retrying. Local-only caches stay local.
+
+Запасной режим: подключение идёт через туннель VPN бота, не вышло — напрямую. Каждая подтверждённая
+запись зеркалится в data/*.json (local_mirror.py): если база недоступна при запуске, бот работает
+на этой копии, а когда база вернётся, переносит в неё сделанное без неё (только если базу за это
+время никто не менял).
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
+import socket
 import threading
 import time
 import uuid
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from copy import deepcopy
 
 import psycopg
 from psycopg.types.json import Jsonb
 
+import local_mirror
+
+log = logging.getLogger("scrimbot.db")
 
 # Через столько миллисекунд простоя сервер закрывает сессию и отпускает замок владельца. Закрывает сервер,
 # а не клиент: у пропавшего клиента (сон ноутбука, обрыв сети, убитый процесс) некому разорвать соединение.
@@ -34,6 +45,62 @@ CONNECT_RETRY_DELAY = 1.0
 STALE_TERMINATE_WAIT_MS = 3000
 # Клиент пропал посреди транзакции — сервер откатывает её и закрывает сессию.
 IDLE_IN_TRANSACTION_TIMEOUT_MS = 30 * 1000
+
+
+# Квитанции событий Discord (защита от повторной доставки) храним столько секунд, а не вечно: иначе служебная
+# строка базы растёт с каждым сообщением в чате, каждая запись переписывает её целиком, а чтение при запуске
+# становится тяжёлым и упирается в лимит времени. Повторная доставка приходит в пределах минут.
+RECEIPT_TTL = 3600
+INSTANCE_FILE = ".shared-instance.json"
+INSTANCE_LOCK = ".shared-instance.lock"
+
+
+_INSTANCE_LOCKS: dict[str, int] = {}
+
+
+def _hold_instance_lock(path: Path) -> bool:
+    """Замок файла на всё время жизни процесса: второй живой процесс бота с той же папкой на этой машине
+    его не получит. Процесс умер или перезапустился через exec — замок снят (дескриптор закрывается)."""
+    key = str(path.resolve())
+    if key in _INSTANCE_LOCKS:
+        return True
+    try:
+        import fcntl
+    except ImportError:
+        return False
+    fd = os.open(key, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    _INSTANCE_LOCKS[key] = fd
+    return True
+
+
+def local_instance_id(directory) -> str | None:
+    """Постоянный ID бота на этой машине (контейнере). С ним при запуске бот узнаёт свою же сессию прошлого
+    запуска (процесс упал или перезапустился, а сессия через VPN ещё висит и держит замок) и сразу закрывает
+    её, а не ждёт 3 минуты. Привязан к имени машины: скопированная папка data/ чужой ID не даст.
+
+    Сессию с этим ID бот закрывает, только если она точно мертва: ID выдаётся лишь процессу, который держит
+    файловый замок INSTANCE_LOCK. Если на этой машине с той же папкой уже работает другой процесс бота,
+    замок у него — тогда None (без постоянного ID чужую живую сессию не тронем)."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    if not _hold_instance_lock(directory / INSTANCE_LOCK):
+        return None
+    path = directory / INSTANCE_FILE
+    host = socket.gethostname()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("host") == host and isinstance(data.get("id"), str) and len(data["id"]) == 12:
+            return data["id"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    value = uuid.uuid4().hex[:12]
+    path.write_text(json.dumps({"host": host, "id": value}), encoding="utf-8")
+    return value
 
 
 # Доверенные корневые сертификаты для проверки базы в туннеле (Neon — публичный центр сертификации).
@@ -55,13 +122,17 @@ class SharedStateDeadline(SharedStateError):
     """Операция не уложилась в срок: её поток брошен (libpq/DNS не прервать) и может висеть дальше."""
 
 
+class _AlreadyClaimed(Exception):
+    """Событие Discord уже принято (повторная доставка)."""
+
+
 def digest(data: dict) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
 class SharedState:
     def __init__(self, dsn: str, namespace: str, directory: str | Path, names, on_failure=None,
-                 tunnel_port: int | None = None):
+                 tunnel_port: int | None = None, instance_id: str | None = None):
         if not namespace or len(namespace) > 100:
             raise ValueError("SHARED_STATE_KEY must contain 1–100 characters")
         self.namespace = namespace
@@ -75,9 +146,15 @@ class SharedState:
         self._revision = None
         self._dsn = dsn
         # Через туннель VPN бота: TCP идёт на 127.0.0.1:tunnel_port, а имя хоста из DSN остаётся для SNI
-        # и проверки сертификата (libpq: host + hostaddr).
+        # и проверки сертификата (libpq: host + hostaddr). Туннель не отвечает — подключаемся напрямую.
         self._tunnel_port = tunnel_port
-        self.instance_id = uuid.uuid4().hex[:12]
+        self.via_tunnel = False
+        # Зеркало в data/*.json: включает бот после сверки при запуске (reconcile_offline).
+        self.mirror = False
+        self._mirror_digests: dict[str, str] = {}
+        # Постоянный ID (local_instance_id) — замок, который держит прошлый запуск этого же бота, забираем сразу.
+        self.instance_id = instance_id or uuid.uuid4().hex[:12]
+        self._reclaim_own = instance_id is not None
         self._stop = threading.Event()
         self._failure_notified = threading.Event()
         self.async_lock = asyncio.Lock()
@@ -100,15 +177,39 @@ class SharedState:
 
     def _connect(self):
         """Новое соединение. Несколько попыток: VPN бота при смене сервера перезапускает Xray, и туннель
-        к базе на пару секунд закрыт — это не повод останавливать бота."""
-        for attempt in range(CONNECT_ATTEMPTS):
+        к базе на пару секунд закрыт — это не повод останавливать бота. Туннель не отвечает (VPN не
+        подключился) — следующая попытка идёт напрямую, обычным интернетом."""
+        routes = self._routes()
+        for attempt, route in enumerate(routes):
             self._check_stopped()
             try:
-                return self._connect_once()
+                connection = self._connect_once(route)
             except psycopg.OperationalError:
-                if attempt == CONNECT_ATTEMPTS - 1:
+                if attempt == len(routes) - 1:
                     raise
                 time.sleep(CONNECT_RETRY_DELAY)
+                continue
+            direct = "hostaddr" not in route
+            if self._tunnel_port and direct and (self.via_tunnel or attempt):
+                log.warning("Общая база: туннель VPN бота не отвечает — подключился напрямую")
+            self.via_tunnel = not direct
+            return connection
+
+    def _routes(self) -> list[dict]:
+        """Параметры каждой попытки: туннель, напрямую, снова туннель. Без туннеля — все напрямую."""
+        tunnel = self._tunnel_params()
+        if not tunnel:
+            return [{}] * CONNECT_ATTEMPTS
+        return ([tunnel, self._fallback_params()] * CONNECT_ATTEMPTS)[:CONNECT_ATTEMPTS]
+
+    def _fallback_params(self) -> dict:
+        """Напрямую вместо туннеля — с той же проверкой сертификата (verify-full), что и в туннеле.
+        Иначе подменный узел мог бы нарочно сломать туннель, чтобы бот перешёл на sslmode=require из DSN
+        (шифрование без проверки, с кем говорим), и выдать себя за базу."""
+        params = {"sslmode": "verify-full"}
+        if not psycopg.conninfo.conninfo_to_dict(self._dsn).get("sslrootcert"):
+            params["sslrootcert"] = ca_bundle()
+        return params
 
     def _tunnel_params(self) -> dict:
         """Через туннель VPN бота трафик проходит через сервер из чужой подписки. sslmode=require только
@@ -121,8 +222,8 @@ class SharedState:
             params["sslrootcert"] = ca_bundle()
         return params
 
-    def _connect_once(self):
-        tunnel = self._tunnel_params()
+    def _connect_once(self, tunnel: dict | None = None):
+        tunnel = tunnel or {}
         connection = psycopg.connect(
             self._dsn, autocommit=True, connect_timeout=CONNECT_TIMEOUT, **tunnel,
             # idle_session_timeout: сессия, чей клиент пропал без закрытия соединения (сон ноутбука, обрыв
@@ -189,8 +290,10 @@ class SharedState:
 
     def _read_state(self):
         self._check_stopped()
+        # Квитанции событий не нужны для чтения — не тащим их по сети.
         rows = dict(self.connection.execute(
-            "SELECT name, data FROM oleg_state WHERE namespace=%s", (self.namespace,)).fetchall())
+            "SELECT name, CASE WHEN name = '_schema' THEN data - 'receipts' ELSE data END"
+            " FROM oleg_state WHERE namespace=%s", (self.namespace,)).fetchall())
         self._check_stopped()
         schema = rows.get("_schema", {})
         if schema.get("version") != 2 or type(schema.get("revision")) is not int:
@@ -210,7 +313,7 @@ class SharedState:
         self.connection = self._connect()
         if self.owned:
             self._check_stopped()
-            acquired = self._lock_after_reconnect()
+            acquired = self._take_lock(reclaim=True)
             self._check_stopped()
             if not acquired:
                 self._abort("Another bot owns the database after reconnect; this instance is stopping")
@@ -235,12 +338,17 @@ class SharedState:
         return key >> 32, key & 0xFFFFFFFF
 
     def _lock_after_reconnect(self) -> bool:
-        """Снова берёт замок после обрыва связи. Сменился адрес (VPN переключил сервер, включили или
-        выключили VPN) — старое соединение рвётся молча, и его сессия на сервере ещё держит замок.
-        Это наша же сессия (то же application_name с ID этого процесса), а не другой бот: закрываем её
-        и забираем замок, вместо того чтобы останавливать бота."""
+        return self._take_lock(reclaim=True)
+
+    def _take_lock(self, reclaim: bool) -> bool:
+        """Берёт замок. reclaim — замок может держать наша же оборванная сессия: сменился адрес (VPN
+        переключил сервер, включили или выключили VPN) или прошлый запуск этого бота упал, а его сессия
+        через VPN-сервер ещё жива. Это мы (то же application_name), а не другой бот: закрываем её и
+        забираем замок, вместо того чтобы останавливаться или ждать."""
         if self.connection.execute("SELECT pg_try_advisory_lock(%s)", (self.key,)).fetchone()[0]:
             return True
+        if not reclaim:
+            return False
         classid, objid = self._lock_key_parts()
         stale = [row[0] for row in self.connection.execute("""SELECT a.pid
             FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
@@ -249,6 +357,7 @@ class SharedState:
             (classid, objid, f"oleg:{self.instance_id}")).fetchall()]
         if not stale:
             return False  # замок у другого экземпляра — его не трогаем
+        log.warning("Общая база: закрываю своё оборванное подключение, которое ещё держит замок")
         for pid in stale:
             self.connection.execute("SELECT pg_terminate_backend(%s, %s)", (pid, STALE_TERMINATE_WAIT_MS))
         for _ in range(10):
@@ -294,7 +403,7 @@ class SharedState:
     def acquire(self) -> bool:
         with self._access() as conn:
             if not self.owned:
-                self.owned = conn.execute("SELECT pg_try_advisory_lock(%s)", (self.key,)).fetchone()[0]
+                self.owned = self._take_lock(reclaim=self._reclaim_own)
                 self._check_stopped()
             return self.owned
 
@@ -348,22 +457,17 @@ class SharedState:
                 self._abort("Shared revision changed; this instance must reload before doing work")
 
     def claim_event(self, event_key: str) -> bool:
-        """Durable admission before Discord callbacks; duplicate gateway delivery is skipped."""
+        """Durable admission before Discord callbacks; duplicate gateway delivery is skipped.
+        Одним запросом: проверка владения (ревизия), квитанции и запись — у Discord на ответ всего 3 с,
+        а каждый лишний запрос через VPN стоит сотни миллисекунд."""
         with self._mutex:
-            self.check_owner()
-            row = self._read(lambda: self.connection.execute(
-                "SELECT (data->'receipts') ? %s FROM oleg_state WHERE namespace=%s AND name='_schema'",
-                (event_key, self.namespace)).fetchone())
-            if row and row[0]:
-                return False
-            self._save({}, event_key=event_key)
-            return True
+            return self._save({}, event_key=event_key)
 
     def save(self, entries: dict):
         with self._mutex:
             self._save(entries)
 
-    def _save(self, entries: dict, event_key=None):
+    def _save(self, entries: dict, event_key=None) -> bool:
         if not self.owned:
             raise SharedStateError("This process does not own the shared-state lock")
         if self.failed or self._closed:
@@ -374,9 +478,12 @@ class SharedState:
             self.require_initialized()
         entries = deepcopy({name: data for name, data in entries.items() if data != self._saved.get(name)})
         if not entries and event_key is None:
-            return
-        expected = deepcopy(self._saved)
-        expected.update(entries)
+            return True
+        # Только квитанция события (данные не меняются) — без копии всего состояния на каждое сообщение.
+        expected = self._saved
+        if entries:
+            expected = deepcopy(self._saved)
+            expected.update(entries)
         operation = uuid.uuid4().hex
         with self._access():
             for attempt in range(2):
@@ -389,32 +496,64 @@ class SharedState:
                     if not self._disconnected(error):
                         raise
                     if self._reconnect((operation, expected)):
-                        return  # exact intended state already committed, no second mutation
+                        self._mirror(entries)
+                        return True  # exact intended state already committed, no second mutation
                     if attempt:
                         self._abort("Database disconnected twice; operation was not committed, retry after restart")
+                except _AlreadyClaimed:
+                    return False
                 except SharedStateError:
                     self._abort("Shared revision changed; stale transaction rejected, restart and reload required")
                 else:
                     self._saved = expected
                     self._revision += 1
-                    return
+                    self._mirror(entries)
+                    return True
 
     def _commit(self, entries, operation, event_key=None):
+        """Одна транзакция. Запросы уходят пачкой (pipeline): через VPN каждый обмен с базой — сотни
+        миллисекунд, а у Discord на ответ кнопке всего 3 секунды. Только квитанция события, без данных, —
+        одним запросом без транзакции (он и так атомарен)."""
         self._check_stopped()
-        with self.connection.transaction():
-            self._write_entries(entries)
-            self._check_stopped()
-            row = self.connection.execute("""UPDATE oleg_state SET data = data ||
-                jsonb_build_object('version', 2, 'revision', %s, 'operation', %s::text) ||
-                CASE WHEN %s::text IS NULL THEN '{}'::jsonb ELSE
-                  jsonb_build_object('receipts', COALESCE(data->'receipts', '{}'::jsonb) ||
-                    jsonb_build_object(%s::text, %s::text)) END
-                WHERE namespace=%s AND name='_schema' AND (data->>'revision')::bigint=%s
-                RETURNING name""", (self._revision + 1, operation, event_key, event_key, operation,
-                                     self.namespace, self._revision)).fetchone()
-            if row is None:
-                raise SharedStateError("Shared revision changed; stale transaction rejected")
-            self._check_stopped()
+        if not entries:
+            row = self._bump_revision(operation, event_key)
+        else:
+            with self._batch(), self.connection.transaction():
+                self._write_entries(entries)
+                self._check_stopped()
+                row = self._bump_revision(operation, event_key)
+        if row is None:
+            if event_key is not None and self._receipt_exists(event_key):
+                raise _AlreadyClaimed()
+            raise SharedStateError("Shared revision changed; stale transaction rejected")
+        self._check_stopped()
+
+    def _batch(self):
+        return self.connection.pipeline() if psycopg.Pipeline.is_supported() else nullcontext()
+
+    def _bump_revision(self, operation, event_key):
+        """Новая ревизия, если база не менялась с нашей (это и проверка владения). С event_key — ещё и
+        квитанция события (если её нет; старше RECEIPT_TTL — выбрасываются)."""
+        return self.connection.execute("""UPDATE oleg_state SET data = data ||
+            jsonb_build_object('version', 2, 'revision', %(revision)s, 'operation', %(operation)s::text) ||
+            CASE WHEN %(key)s::text IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('receipts',
+              (SELECT COALESCE(jsonb_object_agg(e.key, e.value), '{}'::jsonb)
+                 FROM jsonb_each(COALESCE(data->'receipts', '{}'::jsonb)) AS e
+                WHERE jsonb_typeof(e.value) = 'number'
+                  AND (e.value)::numeric > EXTRACT(EPOCH FROM now()) - %(ttl)s)
+              || jsonb_build_object(%(key)s::text, floor(EXTRACT(EPOCH FROM now()))::bigint)) END
+            WHERE namespace=%(namespace)s AND name='_schema' AND (data->>'revision')::bigint=%(current)s
+              AND (%(key)s::text IS NULL OR NOT COALESCE(data->'receipts', '{}'::jsonb) ? %(key)s::text)
+            RETURNING name""", {"revision": self._revision + 1, "operation": operation, "key": event_key,
+                                "ttl": RECEIPT_TTL, "namespace": self.namespace,
+                                "current": self._revision}).fetchone()
+
+    def _receipt_exists(self, event_key) -> bool:
+        """Запись не прошла: событие уже обработано (дубль) — или ревизия сменилась (тогда False)."""
+        row = self.connection.execute(
+            "SELECT data->>'revision', COALESCE(data->'receipts', '{}'::jsonb) ? %s"
+            " FROM oleg_state WHERE namespace=%s AND name='_schema'", (event_key, self.namespace)).fetchone()
+        return row is not None and row[0] == str(self._revision) and bool(row[1])
 
     def _write_entries(self, entries):
         for name, data in entries.items():
@@ -422,6 +561,34 @@ class SharedState:
             self.connection.execute("""INSERT INTO oleg_state (namespace, name, data) VALUES (%s, %s, %s)
                 ON CONFLICT (namespace, name) DO UPDATE SET data=EXCLUDED.data""",
                          (self.namespace, name, Jsonb(data)))
+
+    # --- запасная копия в data/*.json -------------------------------------------------
+
+    def _mirror(self, entries: dict):
+        """Записанное в базу — ещё и в локальные файлы. Ошибка диска не мешает работе с базой."""
+        if not self.mirror or not entries:
+            return
+        try:
+            self._mirror_digests = local_mirror.write(
+                self.directory, self.namespace, self.names,
+                {name: self._saved.get(name, {}) for name in entries}, self._mirror_digests)
+        except (OSError, ValueError, TypeError) as error:
+            log.warning("Не удалось обновить локальную копию базы (%s)", type(error).__name__)
+
+    def reconcile_offline(self) -> str | None:
+        """При запуске: перенести в базу то, что бот сделал без неё, затем записать полную локальную копию
+        и включить зеркалирование. Возвращает сообщение для лога (или None — делать было нечего)."""
+        with self._mutex:
+            current = self.snapshot()
+            message = local_mirror.reconcile(self.directory, self.namespace, self.names, current, self.save)
+            try:
+                self._mirror_digests = local_mirror.write(
+                    self.directory, self.namespace, self.names,
+                    {name: self._saved.get(name, {}) for name in self.names}, {})
+            except (OSError, ValueError, TypeError) as error:
+                log.warning("Не удалось записать локальную копию базы (%s)", type(error).__name__)
+            self.mirror = True
+            return message
 
     def initialize(self, entries: dict):
         if not self.owned:
@@ -444,3 +611,25 @@ class SharedState:
             self.connection.close()
             self.owned = False
             self._closed = True
+
+
+def database_ready(dsn: str, namespace: str, directory, names, tunnel_port: int | None = None,
+                   instance_id: str | None = None) -> bool:
+    """Можно ли вернуться на общую базу: она отвечает и либо свободна и готова, либо её держит другой
+    экземпляр бота (тогда работать должен он). Соединение сразу закрывается — замок не удерживается."""
+    try:
+        backend = SharedState(dsn, namespace, directory, names, tunnel_port=tunnel_port, instance_id=instance_id)
+    except SharedStateError:
+        return False
+    try:
+        if not backend.acquire():
+            return True
+        backend.require_initialized()
+        return True
+    except (SharedStateError, psycopg.Error):
+        return False
+    finally:
+        try:
+            backend.close()
+        except psycopg.Error:
+            pass

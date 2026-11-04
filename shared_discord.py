@@ -16,13 +16,23 @@ from shared_state import SharedStateError
 log = logging.getLogger("scrimbot.shared")
 
 
+def needs_owner_check(route) -> bool:
+    """Проверять ли владение базой перед запросом. Первый ответ на нажатие/команду — нет: событие только что
+    принято через claim_event (то есть владение уже проверено), ответить можно лишь один раз, а у Discord
+    на это всего 3 секунды — лишний запрос к базе через VPN и даёт «Unknown interaction»."""
+    if route.method == "GET":
+        return False
+    path = getattr(route, "path", "") or ""
+    return not (path.startswith("/interactions/") and path.endswith("/callback"))
+
+
 class OwnedWebhookAdapter(AsyncWebhookAdapter):
     def __init__(self, backend):
         super().__init__()
         self.backend = backend
 
     async def request(self, route, session, **kwargs):
-        if route.method != "GET":
+        if needs_owner_check(route):
             await self.backend.arun("check_owner")
         return await super().request(route, session, **kwargs)
 

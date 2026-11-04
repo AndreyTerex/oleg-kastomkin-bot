@@ -1,6 +1,7 @@
 """Общие помощники: ответы на взаимодействия, работа с составом и линиями."""
 from __future__ import annotations
 
+import logging
 import random
 from typing import Iterable, Sequence
 
@@ -34,10 +35,28 @@ async def respond(
     if view is not None:
         payload["view"] = view
 
-    if interaction.response.is_done():
-        await interaction.followup.send(**payload)
-    else:
-        await interaction.response.send_message(**payload)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(**payload)
+        else:
+            await interaction.response.send_message(**payload)
+    except discord.HTTPException as error:
+        if not interaction_expired(error):
+            raise
+        # Discord не дождался ответа (у него 3 секунды) или ответ уже ушёл — повторять нечего.
+        logging.getLogger("scrimbot").warning("Ответ на взаимодействие не доставлен: %s", error.text or error)
+
+
+# Discord: «Unknown interaction» — ответ не успел за 3 секунды; «already acknowledged» — ответ уже был.
+EXPIRED_INTERACTION_CODES = (10062, 40060)
+
+
+def interaction_expired(error: BaseException) -> bool:
+    """Ошибка значит лишь, что ответить на нажатие/команду уже нельзя (не сбой бота)."""
+    original = getattr(error, "original", None)
+    if original is not None and original is not error:
+        return interaction_expired(original)
+    return isinstance(error, discord.HTTPException) and getattr(error, "code", None) in EXPIRED_INTERACTION_CODES
 
 
 def member_lanes(member: discord.Member) -> list[config.Lane]:

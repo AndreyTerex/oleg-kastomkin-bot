@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import config
 from storage import JsonStore, async_atomic as atomic, shared_backend
 
 # Сколько последних каток хранить подробно (для отмены и истории). Счётчики игроков не обрезаются.
@@ -168,7 +169,9 @@ class Stats:
             if event_key is not None:
                 guild.setdefault("result_keys", {})[event_key] = game_id
                 guild["games"][-1]["event_key"] = event_key
-            if shared_backend(self.store.path.parent) is None:
+            # Без общей базы история обрезается. Но если база задана и бот лишь временно работает без неё,
+            # не обрезаем: эта история уйдёт обратно в базу, где она полная.
+            if shared_backend(self.store.path.parent) is None and not config.DATABASE_URL:
                 del guild["games"][:-HISTORY_LIMIT]
             if channel_id:
                 guild["last_channel"] = channel_id

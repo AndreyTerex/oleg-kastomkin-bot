@@ -186,6 +186,10 @@ DATA_DIR: str = os.getenv("DATA_DIR", "data")
 # Общие данные: direct PostgreSQL URL (Neon), только вне репозитория.
 DATABASE_URL: str = os.getenv("DATABASE_URL", "").strip()
 SHARED_STATE_KEY: str = os.getenv("SHARED_STATE_KEY", "oleg").strip()
+# Базы не видно при запуске (VPN не подключился, нет связи с облаком) — столько секунд ждём, потом работаем
+# на локальной копии в data/ (local_mirror.py). Без базы проверяем её раз в DATABASE_RETRY_MINUTES минут.
+DATABASE_WAIT_SECONDS: int = max(0, _env_int("DATABASE_WAIT_SECONDS", 60))
+DATABASE_RETRY_MINUTES: int = max(1, _env_int("DATABASE_RETRY_MINUTES", 5))
 
 # Канал для тревог (ошибки, VPN лежит, все нейросети на лимите). Пусто — тревоги не шлются, /oleg-status работает.
 ALERT_CHANNEL_ID: int = _env_int("ALERT_CHANNEL_ID")
