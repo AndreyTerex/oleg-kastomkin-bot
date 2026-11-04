@@ -296,6 +296,8 @@ def test_bot_starts_on_local_files_when_database_is_unreachable(tmp_path, monkey
     monkeypatch.setattr(config, "GUILD_ID", 0)
     monkeypatch.setattr(config, "WATCHDOG_DISCONNECT_MINUTES", 0)
     monkeypatch.setattr(bot_module, "SHARED_RETRY_SECONDS", 0.01)
+    # Этот компьютер — последний владелец базы (есть её копия).
+    local_mirror.write(tmp_path, config.SHARED_STATE_KEY, NAMES, {}, {})
     bot = ScrimBot()
     bot.tree.sync = AsyncMock(return_value=[])
 
@@ -411,3 +413,56 @@ def test_expired_interaction_is_not_an_error():
     other = discord.NotFound(NS(status=404, reason="Not Found"), {"code": 10008, "message": "Unknown Message"})
     assert interaction_expired(expired) and interaction_expired(acked) and not interaction_expired(other)
     assert interaction_expired(discord.app_commands.CommandInvokeError(NS(name="x", qualified_name="x"), expired))
+
+
+def test_only_last_owner_runs_without_database(tmp_path):
+    allowed, reason = local_mirror.may_run_offline(tmp_path, "ns")
+    assert not allowed and "ни разу" in reason  # копии базы нет — может работать другой экземпляр
+    _mirror(tmp_path, {})
+    assert local_mirror.may_run_offline(tmp_path, "ns")[0]
+    # Этот бот стал резервным: базой владеет другой. Даже после перезапуска без базы он не запустится.
+    local_mirror.note_other_owner(tmp_path, "ns")
+    allowed, reason = local_mirror.may_run_offline(tmp_path, "ns")
+    assert not allowed and "другой экземпляр" in reason
+    # Снова стал владельцем — отметка сброшена.
+    _mirror(tmp_path, {})
+    assert local_mirror.may_run_offline(tmp_path, "ns")[0]
+
+
+def test_standby_keeps_waiting_when_database_disappears(tmp_path, monkeypatch, caplog):
+    import bot as bot_module
+    from bot import ScrimBot
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "DATABASE_URL", "postgresql://postgres@127.0.0.1:1/postgres")
+    monkeypatch.setattr(config, "DATABASE_WAIT_SECONDS", 0)
+    monkeypatch.setattr(bot_module, "SHARED_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(shared_state, "CONNECT_RETRY_DELAY", 0)
+    _mirror(tmp_path, {})
+    local_mirror.write(tmp_path, config.SHARED_STATE_KEY, NAMES, {}, {})
+    local_mirror.note_other_owner(tmp_path, config.SHARED_STATE_KEY)
+    bot = ScrimBot()
+
+    async def run():
+        from async_db import bounded_call
+        waiting = asyncio.create_task(
+            bot.acquire_shared(shared_state.SharedState, shared_state.SharedStateError, bounded_call))
+        await asyncio.sleep(0.5)
+        assert not waiting.done()  # резервный бот не запускается без базы: может работать владелец
+        waiting.cancel()
+
+    asyncio.run(run())
+    assert "Без неё не запускаюсь" in caplog.text
+
+
+def test_second_live_process_gets_no_persistent_id(tmp_path):
+    import fcntl
+    directory = tmp_path / "data"
+    directory.mkdir()
+    lock = os.open(directory / shared_state.INSTANCE_LOCK, os.O_RDWR | os.O_CREAT)
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # «другой живой процесс бота» держит замок
+    try:
+        # Без постоянного ID его живую сессию в базе никто не примет за свою оборванную и не закроет.
+        assert shared_state.local_instance_id(directory) is None
+    finally:
+        os.close(lock)
+    assert shared_state.local_instance_id(directory) is not None

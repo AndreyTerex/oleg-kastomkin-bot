@@ -90,9 +90,12 @@ class ScrimBot(commands.Bot):
         Занято другим экземпляром — ждём в резерве (а не падаем: Docker иначе перезапускает бота по кругу),
         и стоит владельцу остановиться, резервный бот подхватит работу сам. А вот если базы просто не видно
         (VPN не подключился, нет связи с облаком) дольше DATABASE_WAIT_SECONDS или подключение зависло —
-        бесконечно не ждём: бот запускается на своей локальной копии (local_mirror.py)."""
+        бесконечно не ждём: бот запускается на своей локальной копии (local_mirror.py). Но только если он и
+        был последним владельцем базы (local_mirror.may_run_offline): резервный бот ждёт дальше, иначе при
+        общем сбое базы в Discord оказались бы два Олега."""
         waited = 0
         unreachable_since: float | None = None
+        offline_refused_logged = 0.0
         while True:
             try:
                 tunnel = VPN_CLIENT.database_port()
@@ -103,19 +106,31 @@ class ScrimBot(commands.Bot):
                     discard=lambda late: late.close(),
                 )
             except SharedStateDeadline:
-                # Зависший поток не прервать, а новые попытки копили бы их — дальше без базы.
-                log.error("Подключение к общей базе зависло — работаю без неё")
-                return None
+                # Зависший поток не прервать, а новые попытки копили бы их — дальше без базы или с чистого листа.
+                if await self.offline_allowed():
+                    log.error("Подключение к общей базе зависло — работаю без неё")
+                    return None
+                raise
             except SharedStateError as error:
                 now = time.monotonic()
                 unreachable_since = unreachable_since if unreachable_since is not None else now
                 left = config.DATABASE_WAIT_SECONDS - (now - unreachable_since)
                 if left <= 0:
-                    log.warning("Общая база недоступна %d с (%s) — работаю без неё",
-                                config.DATABASE_WAIT_SECONDS, error)
-                    return None
+                    allowed, reason = await self.offline_allowed(explain=True)
+                    if allowed:
+                        log.warning("Общая база недоступна %d с (%s) — работаю без неё",
+                                    config.DATABASE_WAIT_SECONDS, error)
+                        return None
+                    if now - offline_refused_logged >= 300:
+                        offline_refused_logged = now
+                        log.warning("Общая база недоступна (%s). Без неё не запускаюсь: %s. Жду базу, "
+                                    "проверяю раз в %d с.", error, reason, SHARED_RETRY_SECONDS)
+                    await asyncio.sleep(SHARED_RETRY_SECONDS)
+                    waited += SHARED_RETRY_SECONDS
+                    continue
                 backend, message = None, (f"База недоступна ({error}). Пробую снова через {SHARED_RETRY_SECONDS} с; "
-                                          f"не появится за {left:.0f} с — начну работать без неё.")
+                                          f"не появится за {left:.0f} с — начну работать без неё, "
+                                          f"если этот компьютер — её последний владелец.")
             else:
                 unreachable_since = None
                 try:
@@ -127,10 +142,15 @@ class ScrimBot(commands.Bot):
                     holder = await backend.arun("lock_holder")
                 except SharedStateDeadline:
                     await backend.aclose()
-                    log.error("Общая база перестала отвечать посреди подключения — работаю без неё")
-                    return None
+                    if await self.offline_allowed():
+                        log.error("Общая база перестала отвечать посреди подключения — работаю без неё")
+                        return None
+                    raise
                 except SharedStateError as error:
                     holder = f"не удалось проверить ({error})"
+                else:
+                    # Базой владеет другой экземпляр: этот — резервный и без базы запускаться не должен.
+                    await self.note_other_owner()
                 message = (
                     f"Общей базой владеет другой экземпляр бота: {holder}. Жду в резерве, проверяю раз в "
                     f"{SHARED_RETRY_SECONDS} с. Если второго бота нет — это оборванное подключение, "
@@ -142,6 +162,20 @@ class ScrimBot(commands.Bot):
                 log.warning("%s", message)
             await asyncio.sleep(SHARED_RETRY_SECONDS)
             waited += SHARED_RETRY_SECONDS
+
+    async def offline_allowed(self, explain: bool = False):
+        try:
+            allowed, reason = await asyncio.to_thread(local_mirror.may_run_offline, config.DATA_DIR,
+                                                      config.SHARED_STATE_KEY)
+        except OSError as error:
+            allowed, reason = False, f"отметку не прочитать ({type(error).__name__})"
+        return (allowed, reason) if explain else allowed
+
+    async def note_other_owner(self) -> None:
+        try:
+            await asyncio.to_thread(local_mirror.note_other_owner, config.DATA_DIR, config.SHARED_STATE_KEY)
+        except OSError:
+            log.warning("Не удалось записать, что базой владеет другой экземпляр", exc_info=True)
 
     @staticmethod
     def route_name(backend) -> str:
@@ -168,8 +202,10 @@ class ScrimBot(commands.Bot):
             message = await bounded_call(backend.reconcile_offline, timeout=OPERATION_TIMEOUT * 3,
                                          invalidate=backend.invalidate)
         except SharedStateError as error:
-            log.error("Общая база подключилась, но работать с ней не вышло (%s) — работаю без неё", error)
             await backend.aclose()
+            if not await self.offline_allowed():
+                raise
+            log.error("Общая база подключилась, но работать с ней не вышло (%s) — работаю без неё", error)
             return False
         except BaseException:
             await backend.aclose()

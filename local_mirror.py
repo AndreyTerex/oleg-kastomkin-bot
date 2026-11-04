@@ -65,6 +65,31 @@ def write(directory, namespace: str, names, entries: dict, known: dict[str, str]
     return digests
 
 
+def note_other_owner(directory, namespace: str, now: float | None = None) -> None:
+    """Базой владеет другой экземпляр бота (этот — в резерве). Пока этот сам не станет владельцем
+    (write() пишет отметку заново), без базы он не запускается: иначе при общем сбое базы в Discord
+    оказались бы два Олега."""
+    marker = read_marker(directory) or {}
+    if marker.get("namespace") != namespace:
+        marker = {"namespace": namespace, "files": None}
+    if marker.get("other_owner_seen"):
+        return
+    marker["other_owner_seen"] = int(now or time.time())
+    _write_json(Path(directory) / MARKER, marker)
+
+
+def may_run_offline(directory, namespace: str) -> tuple[bool, str]:
+    """Можно ли работать без базы. Только тому, кто был её последним владельцем по нашим сведениям: есть
+    копия базы с этого компьютера и с тех пор он не видел, что базой владеет другой экземпляр. Резервный
+    бот и бот, ни разу не владевший базой, ждут её: другой экземпляр может работать прямо сейчас."""
+    marker = read_marker(directory)
+    if marker is None or marker.get("namespace") != namespace or marker.get("files") is None:
+        return False, "этот компьютер ещё ни разу не работал с этой базой"
+    if marker.get("other_owner_seen"):
+        return False, "последним базой владел другой экземпляр бота — он может работать и сейчас"
+    return True, ""
+
+
 def mark_offline(directory, namespace: str, now: float | None = None) -> dict:
     """Бот начинает работать без базы. Время ухода и отпечатки базы сохраняются до возвращения на неё
     (в том числе после перезапусков). Нет копии базы — files=None: перенести изменения назад не выйдет."""

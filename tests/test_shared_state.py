@@ -737,7 +737,7 @@ def test_unreachable_database_retries_instead_of_crashing(database, monkeypatch,
     assert "База недоступна" in caplog.text
 
 
-def test_hung_connection_attempt_goes_offline_instead_of_piling_threads(monkeypatch):
+def test_hung_connection_attempt_goes_offline_instead_of_piling_threads(monkeypatch, tmp_path):
     import threading
     import async_db
     import bot as bot_module
@@ -753,14 +753,21 @@ def test_hung_connection_attempt_goes_offline_instead_of_piling_threads(monkeypa
     async def short_call(action, **kwargs):
         return await async_db.bounded_call(action, timeout=0.2, **kwargs)
     bot = ScrimBot()
+    import local_mirror
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
     async def run():
-        # Зависшее подключение не роняет бота (Docker перезапускал бы его по кругу) — он работает без базы.
+        # Этот компьютер ни разу не владел базой — без неё не запускается (может работать другой экземпляр);
+        # процесс перезапустится с чистого листа, зависшие потоки не копятся.
+        with pytest.raises(shared_state.SharedStateDeadline):
+            await bot.acquire_shared(hanging, shared_state.SharedStateError, short_call)
+        # Последний владелец базы — работает без неё, а не падает.
+        local_mirror.write(tmp_path, config.SHARED_STATE_KEY, datasync.SYNC_FILES, {}, {})
         assert await bot.acquire_shared(hanging, shared_state.SharedStateError, short_call) is None
     try:
         asyncio.run(run())
     finally:
         release.set()
-    assert len(attempts) == 1
+    assert len(attempts) == 2
 
 
 def test_address_change_reclaims_own_stale_session_instead_of_stopping(database):

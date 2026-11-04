@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import socket
 import threading
 import time
@@ -51,13 +52,45 @@ IDLE_IN_TRANSACTION_TIMEOUT_MS = 30 * 1000
 # становится тяжёлым и упирается в лимит времени. Повторная доставка приходит в пределах минут.
 RECEIPT_TTL = 3600
 INSTANCE_FILE = ".shared-instance.json"
+INSTANCE_LOCK = ".shared-instance.lock"
 
 
-def local_instance_id(directory) -> str:
+_INSTANCE_LOCKS: dict[str, int] = {}
+
+
+def _hold_instance_lock(path: Path) -> bool:
+    """Замок файла на всё время жизни процесса: второй живой процесс бота с той же папкой на этой машине
+    его не получит. Процесс умер или перезапустился через exec — замок снят (дескриптор закрывается)."""
+    key = str(path.resolve())
+    if key in _INSTANCE_LOCKS:
+        return True
+    try:
+        import fcntl
+    except ImportError:
+        return False
+    fd = os.open(key, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    _INSTANCE_LOCKS[key] = fd
+    return True
+
+
+def local_instance_id(directory) -> str | None:
     """Постоянный ID бота на этой машине (контейнере). С ним при запуске бот узнаёт свою же сессию прошлого
     запуска (процесс упал или перезапустился, а сессия через VPN ещё висит и держит замок) и сразу закрывает
-    её, а не ждёт 3 минуты. Привязан к имени машины: скопированная папка data/ чужой ID не даст."""
-    path = Path(directory) / INSTANCE_FILE
+    её, а не ждёт 3 минуты. Привязан к имени машины: скопированная папка data/ чужой ID не даст.
+
+    Сессию с этим ID бот закрывает, только если она точно мертва: ID выдаётся лишь процессу, который держит
+    файловый замок INSTANCE_LOCK. Если на этой машине с той же папкой уже работает другой процесс бота,
+    замок у него — тогда None (без постоянного ID чужую живую сессию не тронем)."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    if not _hold_instance_lock(directory / INSTANCE_LOCK):
+        return None
+    path = directory / INSTANCE_FILE
     host = socket.gethostname()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -66,7 +99,6 @@ def local_instance_id(directory) -> str:
     except (OSError, ValueError, AttributeError):
         pass
     value = uuid.uuid4().hex[:12]
-    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"host": host, "id": value}), encoding="utf-8")
     return value
 
