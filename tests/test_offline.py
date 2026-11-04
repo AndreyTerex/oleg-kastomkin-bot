@@ -480,3 +480,37 @@ def test_second_live_process_gets_no_persistent_id(tmp_path):
     finally:
         os.close(lock)
     assert shared_state.local_instance_id(directory) is not None
+
+
+def test_database_stall_hint_points_to_missing_vpn(monkeypatch):
+    import bot as bot_module
+    monkeypatch.setattr(config, "VPN_SUBSCRIPTION", "")
+    monkeypatch.setattr(config, "VPN_URL", "")
+    assert "VPN_SUBSCRIPTION" in bot_module.database_hint()  # у друга без VPN база из России подвисает
+    monkeypatch.setattr(config, "VPN_SUBSCRIPTION", "https://example.invalid/sub")
+    monkeypatch.setattr(config, "VPN_FOR_DATABASE", False)
+    assert "VPN_FOR_DATABASE" in bot_module.database_hint()
+
+
+def test_database_stall_restarts_without_traceback(monkeypatch, caplog):
+    import bot as bot_module
+    restarted = []
+
+    class Crashing:
+        restart_requested = False
+
+        def run(self, *args, **kwargs):
+            raise shared_state.SharedStateDeadline("Database operation exceeded its deadline")
+
+    monkeypatch.setattr(config, "TOKEN", "token")
+    monkeypatch.setattr(config, "VPN_SUBSCRIPTION", "")
+    monkeypatch.setattr(config, "VPN_URL", "")
+    monkeypatch.setattr(bot_module, "ScrimBot", Crashing)
+    monkeypatch.setattr(bot_module.discord.utils, "setup_logging", lambda **kwargs: None)
+    monkeypatch.setattr(bot_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(bot_module, "restart", restarted.append)
+    monkeypatch.delenv(bot_module.RESTART_DELAY_ENV, raising=False)
+    bot_module.main()
+    assert restarted == [5]
+    assert "Общая база не ответила вовремя" in caplog.text and "VPN_SUBSCRIPTION" in caplog.text
+    assert "Traceback" not in caplog.text

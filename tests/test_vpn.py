@@ -517,3 +517,91 @@ def test_vpn_starts_without_database_tunnel_if_xray_rejects_it(monkeypatch):
     assert asyncio.run(client._run_with_db(lambda db: vpn.direct_config(10809, db)))
     assert started == [True, False] and client.db_tunnel_rejected
     assert client.database_port() is None
+
+
+# --- VPN этого компьютера ------------------------------------------------------------
+
+
+def test_pc_proxy_is_used_without_subscription(monkeypatch):
+    monkeypatch.setattr(vpn.config, "PC_PROXY", "auto")
+    candidates = vpn.pc_proxy_candidates()
+    assert ("socks", "host.docker.internal", 10808) in candidates and ("http", "host.docker.internal", 10809) in candidates
+    server = vpn.pc_server("socks", "host.docker.internal", 10808)
+    assert server.outbound == {"protocol": "socks", "settings": {"servers": [{"address": "host.docker.internal", "port": 10808}]}}
+    config = vpn.main_config(server, fragment=False, port=10809)
+    assert config["outbounds"][0]["protocol"] == "socks" and config["outbounds"][0]["tag"] == "proxy"
+    monkeypatch.setattr(vpn.config, "PC_PROXY", "http://192.168.1.5:7890")
+    assert vpn.pc_proxy_candidates() == [("http", "192.168.1.5", 7890)]
+    monkeypatch.setattr(vpn.config, "PC_PROXY", "nonsense:port")
+    assert vpn.pc_proxy_candidates() == []
+
+
+def test_pc_proxy_found_and_lost(monkeypatch, tmp_path):
+    import socket
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    monkeypatch.setattr(vpn.config, "PC_PROXY_ENABLED", True)
+    monkeypatch.setattr(vpn.config, "PC_PROXY", f"socks5://127.0.0.1:{port}")
+    monkeypatch.setattr(vpn.config, "VPN_SUBSCRIPTION", "")
+    monkeypatch.setattr(vpn.config, "VPN_URL", "")
+    client = vpn.VPN()
+    client.state = vpn.VpnState(tmp_path / "vpn.json")
+    client.state.load()
+    fp = f"pc-socks-127.0.0.1-{port}"
+    client.state.data["blacklist"][fp] = vpn.time.time()  # упал, пока VPN компьютера был выключен
+    assert client.enabled and not client.subscription
+    asyncio.run(client.refresh_servers(force=True))
+    assert list(client.servers) == [fp] and fp not in client.state.data["blacklist"]
+    listener.close()  # VPN на компьютере выключили
+    asyncio.run(client.refresh_servers())
+    assert client.servers == {}
+
+
+def test_direct_mode_checks_pc_vpn_as_soon_as_it_appears(monkeypatch, tmp_path):
+    client = vpn.VPN()
+    client.state = vpn.VpnState(tmp_path / "vpn.json")
+    client.state.load()
+    client.started = True
+    probed = []
+    server = vpn.pc_server("socks", "host.docker.internal", 10808)
+
+    async def appeared():
+        client.pc_found = (server.fingerprint,)
+        client.servers = {server.fingerprint: server}
+        return True
+
+    async def probe(servers):
+        probed.append([s.fingerprint for s in servers])
+        return {}
+
+    async def nothing(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(vpn.config, "VPN_CHECK_GEMINI", False)
+    monkeypatch.setattr(client, "refresh_pc_proxies", appeared)
+    monkeypatch.setattr(client, "refresh_servers", nothing)
+    monkeypatch.setattr(client, "probe", probe)
+    monkeypatch.setattr(client, "activate_direct", nothing)
+    monkeypatch.setattr(type(client), "ready", property(lambda self: True))
+    asyncio.run(client.recheck(full=False))  # лёгкая проверка в режиме «напрямую»
+    assert probed and probed[0] == [server.fingerprint]  # включённый VPN компьютера проверен сразу
+
+
+def test_auto_pc_vpn_not_found_is_not_an_outage(monkeypatch):
+    from cogs.ops import Ops
+    from cogs.vpn_admin import status_embed
+    monkeypatch.setattr(vpn.config, "VPN_SUBSCRIPTION", "")
+    monkeypatch.setattr(vpn.config, "VPN_URL", "")
+    monkeypatch.setattr(vpn.config, "PC_PROXY", "auto")
+    monkeypatch.setattr(vpn.config, "PC_PROXY_ENABLED", True)
+    client = vpn.VPN()
+    assert client.enabled and not client.required
+    status = client.status()
+    monkeypatch.setattr("cogs.ops.VPN_CLIENT", client)
+    # Автопоиск VPN компьютера ничего не нашёл — это обычный интернет, а не «VPN не работает».
+    assert not Ops.vpn_broken(object())
+    assert "не настроен" in status_embed(status).description
+    monkeypatch.setattr(vpn.config, "VPN_SUBSCRIPTION", "https://example.invalid/sub")
+    assert client.required and Ops.vpn_broken(object())  # подписка задана, а сервера нет — тревога

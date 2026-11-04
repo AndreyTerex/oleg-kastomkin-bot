@@ -380,6 +380,21 @@ def restart_delay(uptime: float) -> int:
     return min(RESTART_DELAY_MAX, max(RESTART_DELAY_MIN, previous * 2))
 
 
+def database_hint() -> str:
+    """Почему база может не отвечать и что сделать — для лога. Частая причина: бот в России без VPN, соединение
+    с облачной базой открывается, а чтение данных подвисает."""
+    if not (config.VPN_SUBSCRIPTION or config.VPN_URL) and VPN_CLIENT.current is None:
+        return ("Бот ходит обычным интернетом компьютера, а из России облачная база часто отвечает только через "
+                "VPN. Включите VPN на компьютере (v2rayN, Hiddify, Clash, NekoRay…) — бот сам найдёт его "
+                "(если не находит — в VPN-клиенте включите «Разрешить подключения из локальной сети»), "
+                "или впишите в .env ту же строку VPN_SUBSCRIPTION, что у владельца бота.")
+    if not config.VPN_FOR_DATABASE:
+        return "VPN_FOR_DATABASE=0 — база идёт мимо VPN бота; уберите эту строку из .env."
+    if VPN_CLIENT.current is None:
+        return "Рабочего VPN-сервера сейчас нет, база идёт напрямую — бот повторит, когда VPN найдёт сервер."
+    return "Возможно, база перегружена или засыпает — бот повторит сам."
+
+
 def network_error(error: BaseException) -> bool:
     """Нет связи (DNS, отказ соединения, Discord недоступен) — не ошибка в коде, трассировка не нужна."""
     import aiohttp
@@ -418,7 +433,10 @@ def main() -> None:
         # выходит, а перезапускается сам — всё реже, пока причина не пройдёт.
         delay = restart_delay(time.monotonic() - started)
         cause = getattr(error, "__cause__", None) or error
-        if network_error(error) or network_error(cause):
+        if isinstance(error, SharedStateDeadline):
+            # Без трассировки: это связь с базой, а не ошибка в коде. И подсказка, что сделать.
+            log.error("Общая база не ответила вовремя — перезапуск через %d с. %s", delay, database_hint())
+        elif network_error(error) or network_error(cause):
             log.error("Нет связи (%s: %s) — перезапуск через %d с", type(cause).__name__, cause, delay)
         else:
             log.exception("Бот упал — перезапуск через %d с", delay)
