@@ -450,6 +450,12 @@ class VPN:
         return bool(config.VPN_SUBSCRIPTION or config.VPN_URL)
 
     @property
+    def required(self) -> bool:
+        """VPN настроен явно (подписка, ключи или адрес прокси компьютера). Только автопоиск VPN компьютера —
+        не настройка: не нашёлся — это обычный интернет, а не сбой, и тревогу о нём не поднимаем."""
+        return self.subscription or (config.PC_PROXY_ENABLED and config.PC_PROXY.lower() != "auto")
+
+    @property
     def excluded(self) -> set[str]:
         return set(config.VPN_EXCLUDE_COUNTRIES)
 
@@ -992,6 +998,7 @@ class VPN:
             "enabled": self.enabled,
             "running": self.started and self.ready,
             "direct": self.started and self.ready and self.current is None,
+            "required": self.required,
             "server": (self.current.name if self.current else (selected or {}).get("name")),
             "country": (self.current.country if self.current else (selected or {}).get("country")),
             "latency_ms": (self.current.latency_ms if self.current else (selected or {}).get("latency_ms")),

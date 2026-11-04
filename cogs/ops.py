@@ -246,7 +246,9 @@ class Ops(commands.Cog):
 
     def vpn_broken(self) -> bool:
         status = VPN_CLIENT.status()
-        return bool(status["enabled"]) and not (status["running"] and VPN_CLIENT.current is not None)
+        # Только явно настроенный VPN: автопоиск VPN компьютера, не нашедший его, — обычный интернет, а не сбой.
+        return bool(status["enabled"] and status.get("required", True)) and not (
+            status["running"] and VPN_CLIENT.current is not None)
 
     @tasks.loop(seconds=60)
     async def checks(self) -> None:
@@ -354,6 +356,8 @@ class Ops(commands.Cog):
         status = VPN_CLIENT.status()
         if not status["enabled"]:
             vpn = "выключен"
+        elif not status.get("required", True) and VPN_CLIENT.current is None:
+            vpn = "не настроен, VPN на компьютере не найден — обычный интернет"
         elif self.vpn_broken():
             vpn = "⚠️ рабочего сервера нет — нейросети идут напрямую"
             embed.color = WARNING

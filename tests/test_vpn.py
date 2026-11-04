@@ -587,3 +587,21 @@ def test_direct_mode_checks_pc_vpn_as_soon_as_it_appears(monkeypatch, tmp_path):
     monkeypatch.setattr(type(client), "ready", property(lambda self: True))
     asyncio.run(client.recheck(full=False))  # лёгкая проверка в режиме «напрямую»
     assert probed and probed[0] == [server.fingerprint]  # включённый VPN компьютера проверен сразу
+
+
+def test_auto_pc_vpn_not_found_is_not_an_outage(monkeypatch):
+    from cogs.ops import Ops
+    from cogs.vpn_admin import status_embed
+    monkeypatch.setattr(vpn.config, "VPN_SUBSCRIPTION", "")
+    monkeypatch.setattr(vpn.config, "VPN_URL", "")
+    monkeypatch.setattr(vpn.config, "PC_PROXY", "auto")
+    monkeypatch.setattr(vpn.config, "PC_PROXY_ENABLED", True)
+    client = vpn.VPN()
+    assert client.enabled and not client.required
+    status = client.status()
+    monkeypatch.setattr("cogs.ops.VPN_CLIENT", client)
+    # Автопоиск VPN компьютера ничего не нашёл — это обычный интернет, а не «VPN не работает».
+    assert not Ops.vpn_broken(object())
+    assert "не настроен" in status_embed(status).description
+    monkeypatch.setattr(vpn.config, "VPN_SUBSCRIPTION", "https://example.invalid/sub")
+    assert client.required and Ops.vpn_broken(object())  # подписка задана, а сервера нет — тревога

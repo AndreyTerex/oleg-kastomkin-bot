@@ -28,13 +28,17 @@ def status_embed(status: dict) -> discord.Embed:
             color=WARNING,
         )
     working = status["server"] and status["running"]
-    embed = discord.Embed(title="VPN бота", color=NEUTRAL if working else WARNING)
+    optional = not status.get("required", True)
+    embed = discord.Embed(title="VPN бота", color=NEUTRAL if working or optional else WARNING)
     if status["server"]:
         latency = f"{status['latency_ms']:.0f} мс" if status["latency_ms"] is not None else "—"
         embed.add_field(name="Сервер", value=status["server"], inline=False)
         embed.add_field(name="Страна выхода", value=status["country"] or "—")
         embed.add_field(name="Задержка", value=latency)
         embed.add_field(name="Фрагментация", value="да" if status["fragment"] else "нет")
+    elif optional:
+        embed.description = ("VPN в `.env` не настроен, VPN на этом компьютере не найден — бот ходит обычным "
+                             "интернетом. Включите VPN на компьютере (v2rayN, Hiddify, Clash…) — бот найдёт его сам.")
     else:
         embed.description = (
             "Рабочий сервер пока не найден — Discord и нейросети идут напрямую, поиск продолжается."
