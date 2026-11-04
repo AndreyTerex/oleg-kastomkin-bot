@@ -21,12 +21,32 @@ from sync import Sync
 from storage import recover_transactions, configure_shared
 from shared_state import IDLE_SESSION_TIMEOUT_MS, SharedStateDeadline
 from vpn import VPN_CLIENT
-from utils import WARNING, respond
+from utils import WARNING, interaction_expired, respond
 
 log = logging.getLogger("scrimbot")
 
 # Как часто резервный экземпляр проверяет, не освободилась ли общая база.
 SHARED_RETRY_SECONDS = 15
+# Бот упал (нет интернета, Discord недоступен, сбой библиотеки) — перезапуск в том же процессе с паузой:
+# 5 с, 10 с, 20 с … до 5 минут. Проработал дольше 10 минут — снова с 5 с. Пауза переживает перезапуск.
+RESTART_DELAY_ENV = "OLEG_RESTART_DELAY"
+RESTART_DELAY_MIN = 5
+RESTART_DELAY_MAX = 300
+RESTART_RESET_AFTER = 600
+
+
+def _expired_view_error(original):
+    """Кнопки и меню: «Discord не дождался ответа» — одна строка в логе, а не трассировка."""
+    async def on_error(self, interaction, error, item):
+        if interaction_expired(error):
+            log.warning("Нажатие «%s» не успело получить ответ: %s", getattr(item, "label", None) or
+                        getattr(item, "placeholder", None) or type(item).__name__, getattr(error, "text", error))
+            return
+        await original(self, interaction, error, item)
+    return on_error
+
+
+discord.ui.View.on_error = _expired_view_error(discord.ui.View.on_error)
 
 EXTENSIONS = ("cogs.roles", "cogs.scrim", "cogs.stats", "cogs.lobby", "cogs.extras", "cogs.chat", "cogs.vpn_admin", "cogs.ops", "cogs.matchday", "cogs.sync", "cogs.profile", "cogs.quiz", "cogs.patchnotes")
 
@@ -53,6 +73,8 @@ class ScrimBot(commands.Bot):
         # После закрытия запустить процесс заново (main): база вернулась или пропала посреди работы.
         self.restart_requested = False
         self.database_watch: asyncio.Task | None = None
+        # Постоянный ID этого бота в базе (shared_state.local_instance_id).
+        self.shared_instance: str | None = None
 
     async def login(self, token: str) -> None:
         # VPN поднимаем до входа в Discord: через него ходят и Discord, и нейросети.
@@ -74,9 +96,10 @@ class ScrimBot(commands.Bot):
         while True:
             try:
                 tunnel = VPN_CLIENT.database_port()
+                instance = self.shared_instance
                 backend = await bounded_call(
                     lambda: SharedState(config.DATABASE_URL, config.SHARED_STATE_KEY, config.DATA_DIR,
-                                        datasync.SYNC_FILES, tunnel_port=tunnel),
+                                        datasync.SYNC_FILES, tunnel_port=tunnel, instance_id=instance),
                     discard=lambda late: late.close(),
                 )
             except SharedStateDeadline:
@@ -97,8 +120,7 @@ class ScrimBot(commands.Bot):
                 unreachable_since = None
                 try:
                     if await backend.arun("acquire"):
-                        log.info("Общая база: подключение %s",
-                                 "через VPN бота" if backend.via_tunnel else "напрямую")
+                        log.info("Общая база: подключение %s", self.route_name(backend))
                         if waited:
                             log.info("Общая база освободилась после %d с ожидания", waited)
                         return backend
@@ -121,10 +143,22 @@ class ScrimBot(commands.Bot):
             await asyncio.sleep(SHARED_RETRY_SECONDS)
             waited += SHARED_RETRY_SECONDS
 
+    @staticmethod
+    def route_name(backend) -> str:
+        if not backend.via_tunnel:
+            return "напрямую"
+        if VPN_CLIENT.current is None:
+            return "через туннель Xray (рабочего VPN-сервера нет — по сути напрямую)"
+        return f"через VPN бота ({VPN_CLIENT.current.name})"
+
     async def connect_shared(self) -> bool:
         """Подключить общую базу: True — работаем с ней, False — она недоступна, бот на локальных файлах."""
-        from shared_state import SharedState, SharedStateError
+        from shared_state import SharedState, SharedStateError, local_instance_id
         from async_db import bounded_call, OPERATION_TIMEOUT
+        try:
+            self.shared_instance = await asyncio.to_thread(local_instance_id, config.DATA_DIR)
+        except OSError:
+            self.shared_instance = None  # без постоянного ID: свою оборванную сессию прошлого запуска подождём
         backend = await self.acquire_shared(SharedState, SharedStateError, bounded_call)
         if backend is None:
             return False
@@ -183,10 +217,10 @@ class ScrimBot(commands.Bot):
                 continue  # прошлая проверка ещё висит в своём потоке — новую не добавляем
             done = pending = threading.Event()
             tunnel = VPN_CLIENT.database_port()
-            def probe(done=done, tunnel=tunnel):
+            def probe(done=done, tunnel=tunnel, instance=self.shared_instance):
                 try:
                     return database_ready(config.DATABASE_URL, config.SHARED_STATE_KEY, config.DATA_DIR,
-                                          datasync.SYNC_FILES, tunnel)
+                                          datasync.SYNC_FILES, tunnel, instance)
                 finally:
                     done.set()
             try:
@@ -270,6 +304,11 @@ class ScrimBot(commands.Bot):
         if isinstance(error, (app_commands.MissingPermissions, app_commands.CheckFailure)):
             await respond(interaction, "⛔ У вас недостаточно прав для этой команды.")
             return
+        if interaction_expired(error):
+            # Discord не дождался ответа (3 секунды) — ответить уже нельзя, это не ошибка команды.
+            log.warning("Команда /%s не успела ответить: %s", getattr(interaction.command, "name", "?"),
+                        getattr(getattr(error, "original", error), "text", error))
+            return
         if isinstance(error, app_commands.CommandInvokeError) and isinstance(
             error.original, discord.Forbidden
         ):
@@ -285,12 +324,32 @@ class ScrimBot(commands.Bot):
         await respond(interaction, embed=embed)
 
 
-def restart() -> None:
+def restart(delay: int = 0) -> None:
     """Запустить бота заново в том же процессе (и в Docker, и без него): потоки, зависшие на сети,
-    исчезают вместе со старым образом процесса."""
+    исчезают вместе со старым образом процесса. delay — пауза перед этим запуском (для следующей)."""
     log.warning("Перезапуск бота")
+    os.environ[RESTART_DELAY_ENV] = str(delay)
     logging.shutdown()
     os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+
+
+def restart_delay(uptime: float) -> int:
+    """Пауза перед перезапуском после падения: удваивается, пока бот падает сразу после старта."""
+    try:
+        previous = int(os.environ.get(RESTART_DELAY_ENV, "0"))
+    except ValueError:
+        previous = 0
+    if uptime >= RESTART_RESET_AFTER:
+        previous = 0
+    return min(RESTART_DELAY_MAX, max(RESTART_DELAY_MIN, previous * 2))
+
+
+def network_error(error: BaseException) -> bool:
+    """Нет связи (DNS, отказ соединения, Discord недоступен) — не ошибка в коде, трассировка не нужна."""
+    import aiohttp
+    if isinstance(error, (aiohttp.ClientError, OSError, TimeoutError, discord.GatewayNotFound, discord.ConnectionClosed)):
+        return True
+    return isinstance(error, discord.DiscordServerError)
 
 
 def main() -> None:
@@ -304,6 +363,7 @@ def main() -> None:
         sys.exit(1)
 
     bot = ScrimBot()
+    started = time.monotonic()
     try:
         bot.run(config.TOKEN, log_handler=None)
         if bot.restart_requested:
@@ -317,6 +377,17 @@ def main() -> None:
             "и Message Content Intent (второй нужен болтовне Олега, если задан GROQ_API_KEY)."
         )
         sys.exit(1)
+    except Exception as error:
+        # Безотказность: что бы ни уронило бота (нет интернета, Discord лежит, сбой библиотеки), он не
+        # выходит, а перезапускается сам — всё реже, пока причина не пройдёт.
+        delay = restart_delay(time.monotonic() - started)
+        cause = getattr(error, "__cause__", None) or error
+        if network_error(error) or network_error(cause):
+            log.error("Нет связи (%s: %s) — перезапуск через %d с", type(cause).__name__, cause, delay)
+        else:
+            log.exception("Бот упал — перезапуск через %d с", delay)
+        time.sleep(delay)
+        restart(delay)
 
 
 if __name__ == "__main__":

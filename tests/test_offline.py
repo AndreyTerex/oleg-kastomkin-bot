@@ -332,3 +332,82 @@ def test_bot_restarts_when_database_comes_back(tmp_path, monkeypatch):
     asyncio.run(asyncio.wait_for(bot.watch_database(), 5))
     assert len(checks) == 2 and closed and bot.restart_requested
     assert bot_module.restart  # main() перезапускает процесс через os.execv
+
+
+# --- быстрые ответы Discord и свои оборванные сессии -------------------------------------
+
+
+def test_claim_is_one_round_trip_and_old_receipts_expire(dsn, namespace, tmp_path, monkeypatch):
+    owner = _owner(dsn, namespace, tmp_path)
+    try:
+        statements = []
+        original = owner.connection.execute
+        monkeypatch.setattr(owner.connection, "execute", lambda *a, **k: statements.append(a[0]) or original(*a, **k))
+        assert owner.claim_event("INTERACTION_CREATE:1")
+        assert len(statements) == 1  # владение, квитанция и ревизия — одним запросом
+        assert not owner.claim_event("INTERACTION_CREATE:1")
+        monkeypatch.undo()
+        # Квитанции не копятся вечно: старше RECEIPT_TTL выбрасываются при следующей записи.
+        owner.connection.execute("""UPDATE oleg_state SET data = jsonb_set(data, '{receipts,old}', '1')
+            WHERE namespace=%s AND name='_schema'""", (namespace,))
+        assert owner.claim_event("INTERACTION_CREATE:2")
+        receipts = owner.connection.execute(
+            "SELECT data->'receipts' FROM oleg_state WHERE namespace=%s AND name='_schema'", (namespace,)).fetchone()[0]
+        assert set(receipts) == {"INTERACTION_CREATE:1", "INTERACTION_CREATE:2"}
+        # И не читаются вместе с данными.
+        assert "receipts" not in owner._read_state()[1]
+    finally:
+        owner.close()
+
+
+def test_restart_reclaims_own_dead_session_instead_of_waiting(dsn, namespace, tmp_path, monkeypatch):
+    monkeypatch.setattr(shared_state, "CONNECT_RETRY_DELAY", 0)
+    me = shared_state.local_instance_id(tmp_path)
+    assert shared_state.local_instance_id(tmp_path) == me  # тот же ID после перезапуска
+    zombie = shared_state.SharedState(dsn, namespace, tmp_path, NAMES, instance_id=me)
+    assert zombie.acquire()  # процесс «упал», а сессия через VPN-сервер ещё держит замок
+    try:
+        # Чужой бот замок не отнимает.
+        assert not shared_state.SharedState(dsn, namespace, tmp_path, NAMES).acquire()
+        restarted = shared_state.SharedState(dsn, namespace, tmp_path, NAMES, instance_id=me)
+        assert restarted.acquire()  # свой прошлый запуск — забираем сразу, без 3 минут ожидания
+        restarted.close()
+    finally:
+        zombie.connection.close()
+    # На другой машине (скопированная папка data/) ID другой.
+    monkeypatch.setattr(shared_state.socket, "gethostname", lambda: "friend-pc")
+    assert shared_state.local_instance_id(tmp_path) != me
+
+
+def test_interaction_callback_skips_extra_owner_check():
+    from types import SimpleNamespace as NS
+    from shared_discord import OwnedWebhookAdapter, needs_owner_check
+    callback = NS(method="POST", path="/interactions/{webhook_id}/{webhook_token}/callback")
+    assert not needs_owner_check(callback)  # событие уже принято через claim_event, у Discord лимит 3 с
+    assert needs_owner_check(NS(method="POST", path="/webhooks/{webhook_id}/{webhook_token}"))
+    assert not needs_owner_check(NS(method="GET", path="/webhooks/{webhook_id}/{webhook_token}"))
+    assert OwnedWebhookAdapter
+
+
+def test_crash_restart_backs_off_and_resets_after_long_uptime(monkeypatch):
+    import bot as bot_module
+    monkeypatch.delenv(bot_module.RESTART_DELAY_ENV, raising=False)
+    delays = []
+    for _ in range(8):
+        delay = bot_module.restart_delay(uptime=5)
+        monkeypatch.setenv(bot_module.RESTART_DELAY_ENV, str(delay))
+        delays.append(delay)
+    assert delays == [5, 10, 20, 40, 80, 160, 300, 300]
+    assert bot_module.restart_delay(uptime=3600) == 5  # долго проработал — снова быстро
+
+
+def test_expired_interaction_is_not_an_error():
+    import discord
+    from types import SimpleNamespace as NS
+    from utils import interaction_expired
+    expired = discord.NotFound(NS(status=404, reason="Not Found"), {"code": 10062, "message": "Unknown interaction"})
+    acked = discord.HTTPException(NS(status=400, reason="Bad Request"),
+                                  {"code": 40060, "message": "Interaction has already been acknowledged."})
+    other = discord.NotFound(NS(status=404, reason="Not Found"), {"code": 10008, "message": "Unknown Message"})
+    assert interaction_expired(expired) and interaction_expired(acked) and not interaction_expired(other)
+    assert interaction_expired(discord.app_commands.CommandInvokeError(NS(name="x", qualified_name="x"), expired))

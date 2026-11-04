@@ -460,7 +460,8 @@ def test_uncertain_event_admission_does_not_dispatch_twice(database, monkeypatch
     monkeypatch.setattr(owner, "_commit", lose_ack)
     assert owner.claim_event("INTERACTION_CREATE:one")
     assert not owner.claim_event("INTERACTION_CREATE:one")
-    assert calls == ["INTERACTION_CREATE:one"]
+    # Дубль распознаётся тем же запросом, что и запись квитанции (один обмен с базой), и не проходит.
+    assert calls == ["INTERACTION_CREATE:one", "INTERACTION_CREATE:one"]
 
 
 def test_same_token_gateway_and_outgoing_effects_are_fenced(database, monkeypatch):
