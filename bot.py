@@ -95,7 +95,7 @@ class ScrimBot(commands.Bot):
         общем сбое базы в Discord оказались бы два Олега."""
         waited = 0
         unreachable_since: float | None = None
-        offline_refused_logged = 0.0
+        offline_refused_logged: float | None = None  # monotonic() считает от загрузки системы — не 0
         while True:
             try:
                 tunnel = VPN_CLIENT.database_port()
@@ -121,7 +121,7 @@ class ScrimBot(commands.Bot):
                         log.warning("Общая база недоступна %d с (%s) — работаю без неё",
                                     config.DATABASE_WAIT_SECONDS, error)
                         return None
-                    if now - offline_refused_logged >= 300:
+                    if offline_refused_logged is None or now - offline_refused_logged >= 300:
                         offline_refused_logged = now
                         log.warning("Общая база недоступна (%s). Без неё не запускаюсь: %s. Жду базу, "
                                     "проверяю раз в %d с.", error, reason, SHARED_RETRY_SECONDS)
