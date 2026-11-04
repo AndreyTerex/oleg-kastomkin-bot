@@ -207,8 +207,22 @@ def _owner(dsn, name, directory, **kwargs):
     return backend
 
 
+def test_direct_fallback_keeps_certificate_verification():
+    state = shared_state.SharedState.__new__(shared_state.SharedState)
+    state._dsn = "postgresql://u:p@db.example.com/x?sslmode=require"
+    state._tunnel_port = 15432
+    routes = state._routes()
+    assert [("hostaddr" in route) for route in routes] == [True, False, True]
+    # Сломанный туннель не понижает защиту до sslmode=require из DSN: и напрямую — только verify-full.
+    assert all(route["sslmode"] == "verify-full" and route["sslrootcert"] for route in routes)
+    state._tunnel_port = None
+    assert state._routes() == [{}] * shared_state.CONNECT_ATTEMPTS  # VPN для базы выключен — как в DSN
+
+
 def test_dead_vpn_tunnel_falls_back_to_direct_connection(dsn, namespace, tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(shared_state, "CONNECT_RETRY_DELAY", 0)
+    # Тестовая база без TLS: проверку сертификата на прямом пути проверяет тест выше.
+    monkeypatch.setattr(shared_state.SharedState, "_fallback_params", lambda self: {})
     backend = shared_state.SharedState(dsn, namespace, tmp_path, NAMES, tunnel_port=_closed_port())
     try:
         assert not backend.via_tunnel and backend.acquire()

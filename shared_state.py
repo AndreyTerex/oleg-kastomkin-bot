@@ -189,9 +189,10 @@ class SharedState:
                     raise
                 time.sleep(CONNECT_RETRY_DELAY)
                 continue
-            if self._tunnel_port and not route and (self.via_tunnel or attempt):
+            direct = "hostaddr" not in route
+            if self._tunnel_port and direct and (self.via_tunnel or attempt):
                 log.warning("Общая база: туннель VPN бота не отвечает — подключился напрямую")
-            self.via_tunnel = bool(route)
+            self.via_tunnel = not direct
             return connection
 
     def _routes(self) -> list[dict]:
@@ -199,7 +200,16 @@ class SharedState:
         tunnel = self._tunnel_params()
         if not tunnel:
             return [{}] * CONNECT_ATTEMPTS
-        return ([tunnel, {}] * CONNECT_ATTEMPTS)[:CONNECT_ATTEMPTS]
+        return ([tunnel, self._fallback_params()] * CONNECT_ATTEMPTS)[:CONNECT_ATTEMPTS]
+
+    def _fallback_params(self) -> dict:
+        """Напрямую вместо туннеля — с той же проверкой сертификата (verify-full), что и в туннеле.
+        Иначе подменный узел мог бы нарочно сломать туннель, чтобы бот перешёл на sslmode=require из DSN
+        (шифрование без проверки, с кем говорим), и выдать себя за базу."""
+        params = {"sslmode": "verify-full"}
+        if not psycopg.conninfo.conninfo_to_dict(self._dsn).get("sslrootcert"):
+            params["sslrootcert"] = ca_bundle()
+        return params
 
     def _tunnel_params(self) -> dict:
         """Через туннель VPN бота трафик проходит через сервер из чужой подписки. sslmode=require только
