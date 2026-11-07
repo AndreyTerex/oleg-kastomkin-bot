@@ -897,6 +897,10 @@ async def report_result(
     if bet_line:
         lines.append(bet_line)
     lines += extra_lines
+    try:
+        lines += stats_cog.sweat_jabs(interaction.guild, list(winners), list(losers))
+    except Exception:
+        log.exception("Не удалось подобрать реплику про потных — результат объявляю без неё")
     announce = await interaction.followup.send(
         "\n".join(lines), wait=True, allowed_mentions=discord.AllowedMentions.none(),
     )

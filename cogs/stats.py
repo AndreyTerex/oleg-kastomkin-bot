@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 import config
+import persona
+import sweat
 from bets import BetError, Wallets
 from stats import Stats, main_rivalry, plural, rivals, week_highlights, week_lines
 from storage import JsonStore
@@ -27,6 +30,7 @@ RECAP_MIN_GAMES = 3
 RECENT_GAMES = 5
 WEEK = 7 * 86400
 DUEL_ACCEPT_SECONDS = 10 * 60
+SWEATY_OF_WEEK = "🥵 Потный недели"
 
 
 class DuelView(discord.ui.View):
@@ -107,15 +111,19 @@ def recap_due(now: datetime, posted: str | None) -> bool:
     return now.weekday() == config.RECAP_WEEKDAY and now.hour >= config.RECAP_HOUR and posted != week_key(now)
 
 
-def recap_fields(highlights: dict, name) -> list[tuple[str, str]]:
-    """Номинации недели строками для embed; name(user_id) → имя."""
+def recap_fields(highlights: dict, name, skip=frozenset()) -> list[tuple[str, str]]:
+    """Номинации недели строками для embed; name(user_id) → имя, skip — кого не подкалывать."""
     fields = []
     if "most_games" in highlights:
         user_id, line = highlights["most_games"]
         fields.append(("🎮 Больше всех каток", f"**{name(user_id)}** — {line.games}"))
     if "best_winrate" in highlights:
         user_id, line = highlights["best_winrate"]
-        fields.append(("📈 Лучший винрейт", f"**{name(user_id)}** — {line.wins}/{line.games} ({line.wins / line.games:.0%})"))
+        score = f"{line.wins}/{line.games} ({line.wins / line.games:.0%})"
+        if config.SWEAT_WINRATE > 0 and user_id not in skip:
+            fields.append((SWEATY_OF_WEEK, f"**{name(user_id)}** — {score}, играть по кайфу так и не научился"))
+        else:
+            fields.append(("📈 Лучший винрейт", f"**{name(user_id)}** — {score}"))
     if "streak" in highlights:
         user_id, line = highlights["streak"]
         fields.append(("🔥 Серия побед", f"**{name(user_id)}** — {line.best_streak} подряд"))
@@ -188,7 +196,7 @@ class StatsCog(commands.Cog, name="Stats"):
             return player_name(member) if member else "кто-то ушедший"
 
         highlights = week_highlights(week_lines(games), RECAP_MIN_GAMES)
-        fields = recap_fields(highlights, name)
+        fields = recap_fields(highlights, name, self.optout_ids())
         rivalry = main_rivalry(games)
         if rivalry:
             a, b, wins_a, wins_b = rivalry
@@ -207,6 +215,11 @@ class StatsCog(commands.Cog, name="Stats"):
                 "Подведи итоги недели на кастомках сервера для всех в канале: за неделю " + count + ". "
                 "Номинации:\n" + facts + "\nПоздравь победителей номинаций по именам, подколи по-доброму, "
                 "позови на кастомки на выходных. 2–4 предложения, цифры не выдумывай — только эти."
+                + (
+                    f" Номинанта «{SWEATY_OF_WEEK}» не поздравляй: жёстко, с матом обосри его за трайхард "
+                    "в кастомках и напомни, что играть надо по кайфу, а не на мать."
+                    if any(title == SWEATY_OF_WEEK for title, _value in fields) else ""
+                )
             )
         embed.description = comment or f"Неделя пролетела: {count}. Вот кто отличился 👇"
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
@@ -238,6 +251,9 @@ class StatsCog(commands.Cog, name="Stats"):
             rival_text = self.rivals_text(interaction.guild, member.id)
             if rival_text:
                 embed.add_field(name=rival_text[0], value=rival_text[1], inline=False)
+            jab = self.sweat_line(member.id, record)
+            if jab:
+                embed.description = f"**Олежка:** {jab}"
             place = self.place_of(interaction.guild.id, member.id)
             if place:
                 embed.set_footer(text=f"{place} место на сервере по рейтингу")
@@ -259,6 +275,45 @@ class StatsCog(commands.Cog, name="Stats"):
             if lines:
                 return title, "\n".join(lines)
         return None
+
+    def optout_ids(self) -> set[int]:
+        """Кто попросил Олежку не подкалывать (/oleg-ignore-me)."""
+        bot = getattr(self, "bot", None)
+        chat = bot.get_cog("Chat") if bot is not None else None
+        return set(chat.store.data.get("optout", [])) if chat is not None else set()
+
+    def sweat_line(self, user_id: int, record) -> str | None:
+        """Реплика Олежки в /stats: потного — уничтожить, заечку — похвалить."""
+        if user_id in self.optout_ids():
+            return None
+        found = sweat.title(record)
+        if found:
+            return random.choice(persona.SWEAT_STATS).format(
+                winrate=f"{record.winrate:.0%}", games=record.games, title=found,
+            )
+        if sweat.is_chill(record):
+            return random.choice(persona.CHILL_STATS)
+        return None
+
+    def sweat_badge(self, user_id: int, record, skip: set[int]) -> str:
+        """Метка в строке таблицы лидеров."""
+        if user_id in skip:
+            return ""
+        found = sweat.title(record)
+        if found:
+            return f" · 🥵 *{found}*"
+        return " · 🐰" if sweat.is_chill(record) else ""
+
+    def sweat_jabs(self, guild: discord.Guild, winners: list[int], losers: list[int]) -> list[str]:
+        """Реплики под результатом катки (уже записанной): серии потных и их падения."""
+        def name(user_id: int) -> str:
+            member = guild.get_member(user_id)
+            return player_name(member) if member else "кто-то"
+
+        return sweat.game_jabs(
+            self.stats.games_since(guild.id, 0), winners, losers, self.stats.all_players(guild.id), name,
+            self.optout_ids(),
+        )
 
     def ranking(self, guild_id: int) -> list[tuple[int, object]]:
         players = [
@@ -355,20 +410,32 @@ class StatsCog(commands.Cog, name="Stats"):
             )
             return
         lines = []
+        skip = self.optout_ids()
+        badges = set()
         for index, (user_id, record) in enumerate(ranking[:LEADERBOARD_SIZE], start=1):
             member = interaction.guild.get_member(user_id)
             name = player_name(member) if member else f"<@{user_id}>"
             prefix = MEDALS[index - 1] if index <= len(MEDALS) else f"`{index}.`"
             mvp = f" · ⭐{record.mvp}" if record.mvp else ""
+            badge = self.sweat_badge(user_id, record, skip)
+            if badge:
+                badges.add("🥵" if "🥵" in badge else "🐰")
             lines.append(
-                f"{prefix} **{name}** — **{record.elo:.0f}** Elo · {record.wins}/{record.games} ({record.winrate:.0%}){mvp}"
+                f"{prefix} **{name}** — **{record.elo:.0f}** Elo · {record.wins}/{record.games} ({record.winrate:.0%})"
+                f"{mvp}{badge}"
             )
         if len(ranking) > LEADERBOARD_SIZE:
             lines.append(f"…и ещё {len(ranking) - LEADERBOARD_SIZE} — их место видно в `/stats`")
         if not lines:
             lines.append(f"В таблице пока никого: нужно от {LEADERBOARD_MIN_GAMES} каток.")
+        legend = [text for mark, text in (("🥵", persona.SWEAT_LEADERBOARD), ("🐰", persona.CHILL_LEADERBOARD))
+                  if mark in badges]
+        # Легенда — после обрезки таблицы, чтобы длинная таблица её не съела.
+        tail = "\n\n" + "\n".join(legend) if legend else ""
         games = self.stats.games_count(interaction.guild.id)
-        embed = discord.Embed(title="🏆 Таблица лидеров", description="\n".join(lines)[:4000], color=NEUTRAL)
+        embed = discord.Embed(
+            title="🏆 Таблица лидеров", description="\n".join(lines)[:4000 - len(tail)] + tail, color=NEUTRAL,
+        )
         if newcomers:
             names = []
             for user_id, record in newcomers:

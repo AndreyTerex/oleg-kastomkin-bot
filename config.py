@@ -236,6 +236,12 @@ BET_MINUTES: int = max(1, _env_int("BET_MINUTES", 10))
 DUEL_HOURS: int = max(1, _env_int("DUEL_HOURS", 24))
 # Охота на голову: столько коинов каждому, кто обыграл лидера таблицы по Elo. 0 — выключить.
 BOUNTY_COINS: int = max(0, _env_int("BOUNTY_COINS", 100))
+# Потные: с какого винрейта (в процентах) и скольких каток Олежка презирает игрока за потение в кастомках.
+# SWEAT_WINRATE=0 — выключить и потных, и заечек.
+SWEAT_WINRATE: float = max(0, _env_int("SWEAT_WINRATE", 60)) / 100
+SWEAT_MIN_GAMES: int = max(1, _env_int("SWEAT_MIN_GAMES", 10))
+# Заечки: винрейт не выше этого (в процентах) при SWEAT_MIN_GAMES катках — играют по кайфу, Олежка их хвалит.
+CHILL_WINRATE: float = max(0, _env_int("CHILL_WINRATE", 50)) / 100
 # Сколько минут идёт голосование за MVP после отмеченной катки (до 14 — дольше Discord не даёт
 # обновить сообщение). 0 — не голосовать.
 MVP_VOTE_MINUTES: int = min(14, max(0, _env_int("MVP_VOTE_MINUTES", 10)))

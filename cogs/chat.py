@@ -39,6 +39,7 @@ from lobby_state import RosterError
 import llm_actions
 import lobby_requests
 import role_requests
+import sweat
 from llm import LLMClient, LLMUnavailable, build_providers
 from memory import Memory
 from storage import JsonStore
@@ -225,6 +226,12 @@ class Chat(commands.Cog):
 
     def opted_out(self, user_id: int) -> bool:
         return user_id in self.store.data.get("optout", [])
+
+    def sweat_note(self, user_id: int, record) -> str:
+        """Пометка «потный» / «заечка» к статистике; тех, кто попросил не подкалывать, не помечаем."""
+        store = getattr(self, "store", None)
+        optout = store.data.get("optout", []) if store is not None else []
+        return "" if user_id in optout else sweat.context_note(record)
 
     def state(self, channel_id: int) -> ChannelState:
         return self.channels.setdefault(channel_id, ChannelState())
@@ -541,7 +548,7 @@ class Chat(commands.Cog):
             line = f"- {one_line(member.display_name)}: {lanes}"
             record = self.player_stats(message.guild.id, member.id)
             if record is not None and record.games >= STATS_MIN_GAMES:
-                line += f"; статистика кастомок: {record.describe()}"
+                line += f"; статистика кастомок: {record.describe()}{self.sweat_note(member.id, record)}"
             people.append(line)
         if people:
             facts.append("Кто в разговоре, какие линии отметил и как играет на кастомках:\n" + "\n".join(people))
@@ -949,7 +956,10 @@ class Chat(commands.Cog):
         lines = []
         for place, (user_id, record) in enumerate(ranking[:40], start=1):
             member = guild.get_member(user_id)
-            lines.append(f"{place}. {one_line(member.display_name) if member else user_id} — {record.describe()}")
+            lines.append(
+                f"{place}. {one_line(member.display_name) if member else user_id} — {record.describe()}"
+                f"{self.sweat_note(user_id, record)}"
+            )
         text = (
             f"Таблица лидеров кастомок, все места (всего отмечено каток: {games}; "
             f"/leaderboard показывает всех, кто сыграл от 3 каток):\n" + "\n".join(lines)
@@ -981,7 +991,7 @@ class Chat(commands.Cog):
                 note += "; " + rivals[0].lower() + ": " + "; ".join(
                     re.sub(r"^\W+\s*", "", line).replace("**", "") for line in rivals[1].splitlines()
                 )
-            lines.append(f"- {one_line(member.display_name)}: {record.describe()}{note}")
+            lines.append(f"- {one_line(member.display_name)}: {record.describe()}{self.sweat_note(member.id, record)}{note}")
         return (
             "Статистика тех, о ком спрашивают (отвечай про человека по его строке, "
             "не бери цифры других из таблицы лидеров):\n" + "\n".join(lines)
@@ -1058,7 +1068,7 @@ class Chat(commands.Cog):
         record = self.player_stats(guild.id, target.id)
         # Пара каток — не статистика: «ноль каток» у того, кто просто ещё не отмечал, звучит как враньё.
         if record is not None and record.games >= STATS_MIN_GAMES:
-            about.append(f"Статистика кастомок: {record.describe()}.")
+            about.append(f"Статистика кастомок: {record.describe()}{sweat.context_note(record)}.")
         facts = self.memory.about(guild.id, target.id)
         memory = "\n".join(f"- {fact}" for fact in facts[-6:])
 
