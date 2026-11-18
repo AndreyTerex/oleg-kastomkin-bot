@@ -73,13 +73,13 @@ PUTER_MODELS: list[str] = [
     if model.strip()
 ]
 
-# Ключ AgentRouter (agentrouter.org → Console → API Tokens): платный баланс, Claude, GPT, GLM и DeepSeek
-# через OpenAI-совместимый API. Модели по порядку; если AgentRouter не пускает (неверный ключ или «unauthorized
-# client»), бот откладывает его на несколько часов и отвечает другими моделями.
+# Ключ AgentRouter (agentrouter.org → Console → API Tokens): платный баланс, модели GPT через OpenAI-совместимый
+# API (доступные модели — в консоли → Личные настройки). Модели по порядку; если AgentRouter не пускает (неверный
+# ключ или «unauthorized client»), бот откладывает его на несколько часов и отвечает другими моделями.
 AGENTROUTER_API_KEY: str = os.getenv("AGENTROUTER_API_KEY", "").strip()
 AGENTROUTER_MODELS: list[str] = [
     model.strip()
-    for model in os.getenv("AGENTROUTER_MODELS", "claude-opus-4-8,glm-5.3,deepseek-v4-flash").split(",")
+    for model in os.getenv("AGENTROUTER_MODELS", "gpt-6.1-sol,gpt-5.6-sol").split(",")
     if model.strip()
 ]
 
