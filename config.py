@@ -73,6 +73,16 @@ PUTER_MODELS: list[str] = [
     if model.strip()
 ]
 
+# Ключ AgentRouter (agentrouter.org → Console → API Tokens): платный баланс, Claude, GPT, GLM и DeepSeek
+# через OpenAI-совместимый API. Модели по порядку; если AgentRouter не пускает (неверный ключ или «unauthorized
+# client»), бот откладывает его на несколько часов и отвечает другими моделями.
+AGENTROUTER_API_KEY: str = os.getenv("AGENTROUTER_API_KEY", "").strip()
+AGENTROUTER_MODELS: list[str] = [
+    model.strip()
+    for model in os.getenv("AGENTROUTER_MODELS", "claude-opus-4-8,glm-5.3,deepseek-v4-flash").split(",")
+    if model.strip()
+]
+
 # Ключ Z.ai (z.ai, регистрация по почте → профиль → API Keys): бесплатные модели GLM Flash, около запроса в секунду.
 ZAI_API_KEY: str = os.getenv("ZAI_API_KEY", "").strip()
 ZAI_MODELS: list[str] = [
@@ -179,12 +189,15 @@ VPN_FOR_DISCORD: bool = os.getenv("VPN_FOR_DISCORD", "0").strip().lower() not in
 VPN_FOR_DATABASE: bool = os.getenv("VPN_FOR_DATABASE", "1").strip().lower() not in ("0", "false", "no", "off", "нет")
 VPN_DB_PORT: int = _env_int("VPN_DB_PORT", VPN_PORT - 1)
 
-# Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Первым — Gemini (самые сильные
-# бесплатные модели), за ним Puter и Z.ai (если заданы ключи), TokenHarbor и OpenRouter. Groq отвечает
-# быстро, но слабее — он почти в самом конце, только когда остальные на лимите.
+# Порядок провайдеров: первым отвечает первый, после его лимита — следующий. Первым — AgentRouter (платный
+# баланс, если задан ключ), за ним Gemini (самые сильные бесплатные модели), Puter и Z.ai (если заданы ключи),
+# TokenHarbor и OpenRouter. Groq отвечает быстро, но слабее — он почти в самом конце, только когда остальные
+# на лимите.
 LLM_ORDER: list[str] = [
     name.strip().lower()
-    for name in os.getenv("LLM_ORDER", "gemini,puter,openrouter,tokenharbor,zai,groq,huggingface").split(",")
+    for name in os.getenv(
+        "LLM_ORDER", "agentrouter,gemini,puter,openrouter,tokenharbor,zai,groq,huggingface"
+    ).split(",")
     if name.strip()
 ]
 

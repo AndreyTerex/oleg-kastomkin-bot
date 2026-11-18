@@ -20,7 +20,8 @@ def test_order_providers_follows_llm_order_and_keeps_model_order():
 def test_default_chain_starts_with_gemini_then_groq():
     import config
 
-    assert config.LLM_ORDER[:3] == ["gemini", "puter", "openrouter"] and config.LLM_ORDER[-2:] == ["groq", "huggingface"]
+    assert config.LLM_ORDER[:4] == ["agentrouter", "gemini", "puter", "openrouter"]
+    assert config.LLM_ORDER[-2:] == ["groq", "huggingface"]
     assert config.GEMINI_MODELS[0].startswith("gemini-") and "flash" in config.GEMINI_MODELS[0]
     assert config.GROQ_MODELS[0] == "openai/gpt-oss-120b"
     assert not hasattr(config, "MISTRAL_API_KEY")
@@ -455,3 +456,89 @@ def test_slow_provider_leaves_time_for_fallback(monkeypatch):
         finally:
             await client.close()
     asyncio.run(run())
+
+
+def test_agentrouter_joins_the_chain_first_only_with_a_key(monkeypatch):
+    import config
+    import llm
+
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "g")
+    monkeypatch.setattr(config, "AGENTROUTER_API_KEY", "")
+    assert not [p for p in llm.build_providers() if p.name == "agentrouter"]
+    monkeypatch.setattr(config, "AGENTROUTER_API_KEY", "a")
+    chain = llm.build_providers()
+    assert chain[0].name == "agentrouter" and chain[0].url == llm.AGENTROUTER_URL
+    assert [p.model for p in chain if p.name == "agentrouter"] == config.AGENTROUTER_MODELS
+
+
+def test_rejected_key_pauses_the_whole_provider_for_hours(monkeypatch):
+    import asyncio
+    import time
+
+    import llm
+
+    chain = [
+        Provider(name="agentrouter", url="u", api_key="a", model="claude"),
+        Provider(name="agentrouter", url="u", api_key="a", model="glm"),
+        Provider(name="groq", url="u", api_key="k", model="oss"),
+    ]
+    client = llm.LLMClient(chain)
+    denied = (401, {"error": {"message": "unauthorized client detected"}, "type": "unauthorized_client_error"})
+    client._session = _FakeSession([denied, _ok("groq")])
+    assert asyncio.run(client.complete("s", "u")).text == "groq"
+    assert client._session.calls == ["claude", "oss"]  # второй моделью AgentRouter не дёргаем
+    assert client._blocked_until["agentrouter:glm"] > time.time() + 3600
+
+    # Следующая реплика сразу идёт к рабочему провайдеру.
+    client._session = _FakeSession([_ok("снова groq")])
+    assert asyncio.run(client.complete("s", "u")).text == "снова groq"
+    assert client._session.calls == ["oss"]
+
+
+def test_budget_pool_waits_for_next_batch_but_other_models_still_answer(monkeypatch):
+    import asyncio
+    import time
+
+    import llm
+
+    chain = [
+        Provider(name="agentrouter", url="u", api_key="a", model="claude"),
+        Provider(name="agentrouter", url="u", api_key="a", model="glm"),
+    ]
+    client = llm.LLMClient(chain)
+    pool = (402, {"error": {"message": "Budget pool quota has been exhausted, please try again later"}})
+    client._session = _FakeSession([pool, _ok("glm")])
+    assert asyncio.run(client.complete("s", "u")).text == "glm"
+    wait = client._blocked_until["agentrouter:claude"] - time.time()
+    assert 0 < wait <= 12 * 3600 + 300
+    assert "agentrouter:glm" not in client._blocked_until
+
+
+def test_seconds_until_agentrouter_batch():
+    from datetime import datetime, timezone
+
+    from llm import seconds_until_agentrouter_batch
+
+    noon = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc).timestamp()
+    assert seconds_until_agentrouter_batch(noon) == 11 * 3600 + 120  # до 23:02 UTC
+    late = datetime(2026, 11, 18, 23, 30, tzinfo=timezone.utc).timestamp()
+    assert seconds_until_agentrouter_batch(late) == 11.5 * 3600 + 120  # до 11:02 UTC следующего дня
+
+
+def test_unknown_model_is_skipped_for_hours():
+    import asyncio
+    import time
+
+    import llm
+
+    chain = [
+        Provider(name="agentrouter", url="u", api_key="a", model="claude-old"),
+        Provider(name="agentrouter", url="u", api_key="a", model="glm"),
+    ]
+    client = llm.LLMClient(chain)
+    missing = (400, {"error": {"message": "model claude-old not found"}})
+    client._session = _FakeSession([missing, _ok("glm")])
+    assert asyncio.run(client.complete("s", "u")).text == "glm"
+    assert client._blocked_until["agentrouter:claude-old"] > time.time() + 3600
+    assert not llm.is_unknown_model(400, "Invalid image format")
+    assert not llm.is_auth_error(403, "User location is not supported")

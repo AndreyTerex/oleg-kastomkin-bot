@@ -27,6 +27,7 @@ TOKENHARBOR_URL = "https://tokenharbor.ai/v1/chat/completions"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 PUTER_URL = "https://api.puter.com/puterai/openai/v1/chat/completions"
 ZAI_URL = "https://api.z.ai/api/paas/v4/chat/completions"
+AGENTROUTER_URL = "https://agentrouter.org/v1/chat/completions"
 
 # Если модель зависла или недоступна, какое-то время сразу идём к следующей,
 # чтобы чат не ждал по минуте на каждом сообщении.
@@ -79,6 +80,46 @@ def is_out_of_credits(text: str) -> bool:
         r"|exceeded your (monthly |free )?(usage|allowance)|upgrade (your plan|to continue)",
         text or "", re.IGNORECASE,
     ))
+
+
+def is_auth_error(status: int, text: str) -> bool:
+    """Ключ не принят: неверный или отозванный ключ, у AgentRouter — «unauthorized client detected».
+    Повтор через минуту ничего не изменит, а каждый такой запрос задерживает ответ Олега."""
+    if status == 401:
+        return True
+    return status == 403 and bool(re.search(
+        r"unauthori[sz]ed|unauthenticated|invalid[ _-]?(api[ _-]?)?(key|token)|incorrect api key",
+        text or "", re.IGNORECASE,
+    ))
+
+
+def is_unknown_model(status: int, text: str) -> bool:
+    """Модели с таким названием у провайдера нет (переименовали или убрали) — она не появится через минуту."""
+    return status in (400, 404) and bool(re.search(
+        r"model[^.]{0,80}(not found|does not exist|not exist|is not supported|unavailable)|no such model"
+        r"|unknown model|invalid model",
+        text or "", re.IGNORECASE,
+    ))
+
+
+def is_budget_pool_exhausted(text: str) -> bool:
+    """AgentRouter: дневной общий пул Claude и GPT разобрали («Budget pool quota has been exhausted»).
+    Модели GLM и DeepSeek при этом работают, а пул пополняют дважды в сутки."""
+    return bool(re.search(r"budget pool", text or "", re.IGNORECASE))
+
+
+# AgentRouter выдаёт пул Claude и GPT партиями в 07:00 и 19:00 по Пекину (23:00 и 11:00 UTC).
+AGENTROUTER_BATCH_HOURS_UTC = (11, 23)
+
+
+def seconds_until_agentrouter_batch(now: float | None = None) -> float:
+    """Секунды до ближайшей раздачи пула AgentRouter (плюс пара минут запаса)."""
+    current = datetime.fromtimestamp(time.time() if now is None else now, timezone.utc)
+    candidates = [
+        (current + timedelta(days=day)).replace(hour=hour, minute=2, second=0, microsecond=0)
+        for day in (0, 1) for hour in AGENTROUTER_BATCH_HOURS_UTC
+    ]
+    return max(min((c - current).total_seconds() for c in candidates if c > current), 60.0)
 
 
 def is_region_block(status: int, text: str) -> bool:
@@ -142,6 +183,15 @@ def build_providers() -> list[Provider]:
             # Flash отвечает за несколько секунд; дольше — почти всегда тормозит VPN, ждать 25 с незачем.
             timeout=18.0,
             scarce=is_scarce_gemini(model),
+        ))
+    for model in config.AGENTROUTER_MODELS:
+        providers.append(Provider(
+            name="agentrouter",
+            url=AGENTROUTER_URL,
+            api_key=config.AGENTROUTER_API_KEY,
+            model=model,
+            max_tokens=1200,
+            timeout=25.0,
         ))
     for model in config.PUTER_MODELS:
         providers.append(Provider(
@@ -478,6 +528,15 @@ class LLMClient:
                     self._blocked_until[provider.label] = time.time() + wait
                     self._blocked_daily[provider.label] = daily
                     return f"{provider.label}: лимит"
+                if response.status in (402, 429) and is_budget_pool_exhausted(str(payload)):
+                    # Общий дневной пул AgentRouter пуст — ждём следующую раздачу, а не 6 часов.
+                    wait = seconds_until_agentrouter_batch()
+                    self._blocked_until[provider.label] = time.time() + wait
+                    self._blocked_daily[provider.label] = True
+                    log.warning(
+                        "%s: дневной пул разобран, пауза до следующей раздачи (%.1f ч)", provider.label, wait / 3600,
+                    )
+                    return f"{provider.label}: дневной пул разобран"
                 if response.status >= 400 and is_out_of_credits(str(payload)):
                     # Кончился баланс (у Puter — бесплатная месячная квота): не дёргаем провайдера часами.
                     for other in self.providers:
@@ -518,6 +577,27 @@ class LLMClient:
                         provider.name, str(payload)[:120], pause / 3600,
                     )
                     return error_text
+                if is_auth_error(response.status, str(payload)):
+                    # Ключ не принят — отключаем все модели провайдера надолго, иначе каждая реплика Олега
+                    # сначала ждала бы отказа от него.
+                    until = time.time() + QUOTA_PAUSE
+                    for other in self.providers:
+                        if other.name == provider.name:
+                            self._blocked_until[other.label] = until
+                            self._blocked_daily[other.label] = True
+                    log.warning(
+                        "%s не принял ключ (HTTP %s): %s. Пропускаем его %.0f ч — проверьте ключ в .env.",
+                        provider.name, response.status, str(payload)[:200], QUOTA_PAUSE / 3600,
+                    )
+                    return f"{provider.name}: ключ не принят"
+                if is_unknown_model(response.status, str(payload)):
+                    self._blocked_until[provider.label] = time.time() + QUOTA_PAUSE
+                    self._blocked_daily[provider.label] = True
+                    log.warning(
+                        "%s: такой модели нет (%s) — пропускаем её %.0f ч, поправьте список моделей в .env",
+                        provider.label, str(payload)[:160], QUOTA_PAUSE / 3600,
+                    )
+                    return f"{provider.label}: нет такой модели"
                 if response.status in (500, 502, 503, 504):
                     return _OVERLOADED  # паузы и повторы решает _ask_with_retries
                 if response.status >= 400:
